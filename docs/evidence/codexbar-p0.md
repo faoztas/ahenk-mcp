@@ -1,0 +1,8 @@
+# G-004 CodexBar account and quota evidence
+
+The pilot verified the pinned, signed CodexBar 0.83.0 binary before calling `probe-codexbar`. Ahenk compared each provider's account binding independently. Email values were used only in memory. The public record omits local account bindings and quota balances.
+
+- **Codex.** The local App Server provided account metadata through `account/read` with `refreshToken:false`. The account digest matched the effective CodexBar `oauth` source. The App Server and CodexBar agreed on the observed weekly usage window and reset time. The account metadata did not distinguish workspaces sharing the same email. [App Server account endpoints](https://learn.chatgpt.com/docs/app-server#auth-endpoints) · [CodexBar Codex source mapping](https://github.com/steipete/CodexBar/blob/v0.83.0/docs/codex.md)
+- **AGY.** The signed AGY 1.5.3 status line reported account metadata that matched the effective CodexBar `app` source, although the requested source was `cli`. The status line was enabled for that session without sending a prompt. A separate CodexBar query reported five `KNOWN` and `MATCHED` windows across Gemini, Claude/GPT, and Gemini 4 Argon. [AGY status line](https://antigravity.google/docs/cli/statusline) · [CodexBar Antigravity sources](https://github.com/steipete/CodexBar/blob/v0.83.0/docs/antigravity.md)
+
+The router uses fresh, matched measurements with a future reset time. The historical Go suite passed and covered mismatched and missing account identities, unverified sources, `usageKnown:false`, placeholders, stale observations, and provider family separation.
