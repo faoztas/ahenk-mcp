@@ -19,6 +19,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const readOnlyStateQuery = "mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(3000)"
+
 var ErrBusy = errors.New("state already has a scheduler")
 var ErrConflict = errors.New("request ID already has different arguments")
 
@@ -92,7 +94,7 @@ func ReadEvidence(ctx context.Context, dir string) (string, []JobEvidence, error
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || int(info.Sys().(*syscall.Stat_t).Uid) != os.Geteuid() {
 		return "", nil, errors.New("unsafe state database")
 	}
-	uri := url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(3000)"}
+	uri := url.URL{Scheme: "file", Path: path, RawQuery: readOnlyStateQuery}
 	db, err := sql.Open("sqlite", uri.String())
 	if err != nil {
 		return "", nil, err

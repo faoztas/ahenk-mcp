@@ -133,19 +133,9 @@ func withOpenCodeWorkspace(ctx context.Context, dir, cwd, config string, catalog
 			return err
 		}
 	}
-	lease, err := os.OpenFile(filepath.Join(dir, ".worker.lock"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-	if err != nil {
-		return err
-	}
-	defer lease.Close()
-	if err = syscall.Flock(int(lease.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return err
-	}
-
 	cmd := exec.Command(openCodePath, "serve", "--stdio", "--hostname", "127.0.0.1", "--port", "0", "--log-level", "error")
 	cmd.Dir = cwd
 	cmd.Env = env
-	cmd.ExtraFiles = []*os.File{lease}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -160,10 +150,16 @@ func withOpenCodeWorkspace(ctx context.Context, dir, cwd, config string, catalog
 	defer writer.Close()
 	cmd.Stdout = writer
 	if err = ctx.Err(); err != nil {
-		return errors.Join(err, execution.Save(dir, ".worker.cleaned", nil))
+		return err
 	}
+	lease, err := execution.OpenWorkerLease(dir)
+	if err != nil {
+		return err
+	}
+	defer lease.Close()
+	cmd.ExtraFiles = []*os.File{lease}
 	if err = cmd.Start(); err != nil {
-		return errors.Join(err, execution.Save(dir, ".worker.cleaned", nil))
+		return errors.Join(err, execution.MarkWorkerCleaned(dir, lease))
 	}
 	writer.Close()
 	done := make(chan struct{})
@@ -186,8 +182,8 @@ func withOpenCodeWorkspace(ctx context.Context, dir, cwd, config string, catalog
 			result = errors.Join(execution.ErrCleanup, result)
 			return
 		}
-		if err := execution.Save(dir, ".worker.cleaned", nil); err != nil {
-			result = errors.Join(execution.ErrCleanup, result)
+		if err := execution.MarkWorkerCleaned(dir, lease); err != nil {
+			result = errors.Join(err, result)
 		}
 	}()
 

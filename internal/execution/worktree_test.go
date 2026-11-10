@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 
 	"github.com/faoztas/ahenk-mcp/internal/model"
@@ -122,12 +121,8 @@ func TestPrivateWorktreeRejectsInvalidOutput(t *testing.T) {
 func TestPrivateWorktreeQuarantinesUnconfirmedCleanup(t *testing.T) {
 	_, attempt, snapshot, task := worktreeFixture(t)
 	w := newTestWorktree(t, attempt, snapshot, task)
-	lease, err := os.OpenFile(filepath.Join(attempt, ".worker.lock"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	lease, err := OpenWorkerLease(attempt)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := syscall.Flock(int(lease.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		lease.Close()
 		t.Fatal(err)
 	}
 	if err := w.Close(); !errors.Is(err, ErrCleanup) {
@@ -158,6 +153,60 @@ func TestPrivateWorktreeQuarantinesUnconfirmedCleanup(t *testing.T) {
 	}
 }
 
+func TestPrivateWorktreeQuarantinesAnUnlinkedWorkerLease(t *testing.T) {
+	_, attempt, snapshot, task := worktreeFixture(t)
+	w, err := PrepareWorktree(t.Context(), attempt, snapshot, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := OpenWorkerLease(attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	if err := os.Remove(filepath.Join(attempt, workerLock)); err != nil {
+		t.Fatal(err)
+	}
+	if LeaseReleased(attempt) || !errors.Is(RecoverWorktree(attempt), ErrCleanup) {
+		t.Fatal("an unlinked live worker lease allowed recovery")
+	}
+	if _, err := os.Stat(w.Dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := MarkWorkerCleaned(attempt, lease); !errors.Is(err, ErrCleanup) {
+		t.Fatalf("cleanup was accepted for an unlinked lease: %v", err)
+	}
+}
+
+func TestWorkerLeaseCanBeReusedAfterCleanup(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "attempt")
+	if err := NewAttemptDir(dir); err != nil || !LeaseReleased(dir) {
+		t.Fatalf("never-started attempt is not recoverable: %v", err)
+	}
+	before, err := os.Stat(filepath.Join(dir, workerLock))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		lease, err := OpenWorkerLease(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if LeaseReleased(dir) {
+			lease.Close()
+			t.Fatal("a held lease was released")
+		}
+		markErr := MarkWorkerCleaned(dir, lease)
+		if err := errors.Join(markErr, lease.Close()); err != nil || !LeaseReleased(dir) {
+			t.Fatalf("confirmed cleanup did not release the lease: %v", err)
+		}
+	}
+	after, err := os.Stat(filepath.Join(dir, workerLock))
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("lease inode changed between workers: %v", err)
+	}
+}
+
 func worktreeFixture(t *testing.T) (string, string, Snapshot, model.Task) {
 	t.Helper()
 	temp, err := filepath.EvalSymlinks(t.TempDir())
@@ -165,10 +214,11 @@ func worktreeFixture(t *testing.T) (string, string, Snapshot, model.Task) {
 		t.Fatal(err)
 	}
 	source, attempt := filepath.Join(temp, "source"), filepath.Join(temp, "attempt")
-	for _, path := range []string{filepath.Join(source, "code"), attempt} {
-		if err := os.MkdirAll(path, 0700); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.MkdirAll(filepath.Join(source, "code"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewAttemptDir(attempt); err != nil {
+		t.Fatal(err)
 	}
 	fixtureGit(t, source, "init", "--template=")
 	testWrite(t, source, "code/a.go", "base\n")

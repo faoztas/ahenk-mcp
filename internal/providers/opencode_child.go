@@ -7,8 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -47,11 +45,6 @@ func runOpenCodeChild(ctx context.Context, dir, id, objective string, background
 	// can still detect an uncertain cleanup from either server.
 	if !execution.LeaseReleased(dir) {
 		return out, execution.ErrCleanup
-	}
-	for _, name := range []string{".worker.cleaned", ".worker.lock"} {
-		if err := os.Remove(filepath.Join(dir, name)); err != nil {
-			return out, err
-		}
 	}
 	rules := []openCodeNativeRule{{Action: "*", Resource: "*", Effect: "deny"},
 		{Action: "subagent", Resource: openCodeChildAgent, Effect: "allow"}}

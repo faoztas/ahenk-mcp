@@ -18,7 +18,10 @@ import (
 	"github.com/faoztas/ahenk-mcp/internal/model"
 )
 
-const goCheckDir = ".go-check"
+const (
+	goCheckDir    = ".go-check"
+	goCheckIntent = ".go-check.intent"
+)
 
 type goCheckRequest struct {
 	Tool     string
@@ -41,7 +44,10 @@ func RunGoChecks(ctx context.Context, attemptDir, work, tool string, checks []mo
 		return nil, model.Error("POLICY_DENIED", "Go verification requires a released, bounded private worktree")
 	}
 	dir := filepath.Join(attemptDir, goCheckDir)
-	if err := os.Mkdir(dir, 0700); err != nil {
+	if err := NewAttemptDir(dir); err != nil {
+		return nil, err
+	}
+	if err := Save(attemptDir, goCheckIntent, nil); err != nil {
 		return nil, err
 	}
 	var out []model.CheckEvidence

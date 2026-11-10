@@ -94,6 +94,9 @@ func PrepareWorktree(ctx context.Context, attemptDir string, s Snapshot, t model
 		before[file.Path] = &Version{Mode: v.Mode, Hash: v.Hash, Bytes: slices.Clone(v.Bytes)}
 	}
 
+	if !worktreeLeaseReleased(real) {
+		return nil, ErrCleanup
+	}
 	private := filepath.Join(real, privateWorkspace)
 	if err := os.Mkdir(private, 0700); err != nil {
 		return nil, err
@@ -519,5 +522,14 @@ func RecoverWorktree(attemptDir string) error {
 }
 
 func worktreeLeaseReleased(attemptDir string) bool {
-	return LeaseReleased(attemptDir) && LeaseReleased(filepath.Join(attemptDir, goCheckDir))
+	if !LeaseReleased(attemptDir) {
+		return false
+	}
+	check := filepath.Join(attemptDir, goCheckDir)
+	info, err := os.Lstat(check)
+	if errors.Is(err, fs.ErrNotExist) {
+		_, err := os.Lstat(filepath.Join(attemptDir, goCheckIntent))
+		return errors.Is(err, fs.ErrNotExist)
+	}
+	return err == nil && info.IsDir() && LeaseReleased(check)
 }

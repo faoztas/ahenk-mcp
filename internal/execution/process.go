@@ -11,12 +11,13 @@ import (
 	"errors"
 	"io"
 
-	"github.com/faoztas/ahenk-mcp/internal/model"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/faoztas/ahenk-mcp/internal/model"
 )
 
 type FixtureInput struct {
@@ -47,16 +48,7 @@ func RunSupervised(ctx context.Context, dir, command string, env []string, in, o
 	if err != nil {
 		return err
 	}
-	lease, err := os.OpenFile(filepath.Join(dir, ".worker.lock"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-	if err != nil {
-		return err
-	}
-	defer lease.Close()
-	if err := syscall.Flock(int(lease.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return err
-	}
 	cmd := exec.Command(self, command)
-	cmd.ExtraFiles = []*os.File{lease}
 	cmd.Env = env
 	cmd.Dir = dir
 	// Pass ownership of the watchdog pipe to the controller only.
@@ -68,19 +60,28 @@ func RunSupervised(ctx context.Context, dir, command string, env []string, in, o
 	defer p.Close()
 	buf := &Limited{Limit: MaxArtifact * 2}
 	cmd.Stdout = buf
-	if err = cmd.Start(); err != nil {
+	lease, err := OpenWorkerLease(dir)
+	if err != nil {
 		return err
+	}
+	defer lease.Close()
+	cmd.ExtraFiles = []*os.File{lease}
+	if err = cmd.Start(); err != nil {
+		return errors.Join(err, MarkWorkerCleaned(dir, lease))
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	if err = json.NewEncoder(p).Encode(in); err != nil {
 		p.Close()
 		<-done
+		if !workerCleanupConfirmed(dir, lease) {
+			return errors.Join(ErrCleanup, err)
+		}
 		return err
 	}
 	select {
 	case err = <-done:
-		if _, markerErr := os.Stat(filepath.Join(dir, ".worker.cleaned")); markerErr != nil {
+		if !workerCleanupConfirmed(dir, lease) {
 			return ErrCleanup
 		}
 		if err != nil {
@@ -91,7 +92,7 @@ func RunSupervised(ctx context.Context, dir, command string, env []string, in, o
 		p.Close()
 		select {
 		case err = <-done:
-			if _, markerErr := os.Stat(filepath.Join(dir, ".worker.cleaned")); markerErr != nil {
+			if !workerCleanupConfirmed(dir, lease) {
 				return ErrCleanup
 			}
 			if err != nil {
@@ -108,24 +109,111 @@ func RunSupervised(ctx context.Context, dir, command string, env []string, in, o
 
 var ErrCleanup = errors.New("worker cleanup could not be confirmed")
 
-func LeaseReleased(dir string) bool {
-	f, err := os.OpenFile(filepath.Join(dir, ".worker.lock"), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if os.IsNotExist(err) {
-		return true
+const (
+	workerLock    = ".worker.lock"
+	workerCleaned = ".worker.cleaned"
+)
+
+// NewAttemptDir persists an unlocked lease and cleanup marker before the
+// scheduler records an attempt. Together they also represent a never-started worker.
+func NewAttemptDir(dir string) error {
+	if err := os.Mkdir(dir, 0700); err != nil {
+		return err
 	}
+	if err := Save(dir, workerLock, nil); err != nil {
+		return err
+	}
+	return Save(dir, workerCleaned, nil)
+}
+
+// OpenWorkerLease holds the same inode across sequential workers. Removing
+// the cleanup marker durably before launch fences a crash even if the lock
+// becomes unlocked or unlinked.
+func OpenWorkerLease(dir string) (*os.File, error) {
+	path := filepath.Join(dir, workerLock)
+	const flags = os.O_RDWR | syscall.O_NOFOLLOW | syscall.O_NONBLOCK
+	f, err := os.OpenFile(path, flags, 0)
+	fresh := os.IsNotExist(err)
+	if fresh {
+		// Provider probes also use fresh temporary directories outside the scheduler.
+		if _, err := os.Lstat(filepath.Join(dir, workerCleaned)); !os.IsNotExist(err) {
+			return nil, ErrCleanup
+		}
+		f, err = os.OpenFile(path, flags|os.O_CREATE|os.O_EXCL, 0600)
+	}
+	if err != nil {
+		return nil, errors.Join(ErrCleanup, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, errors.Join(ErrCleanup, err)
+	}
+	if !fresh && !workerCleanupConfirmed(dir, f) {
+		f.Close()
+		return nil, ErrCleanup
+	}
+	if !fresh {
+		if err := os.Remove(filepath.Join(dir, workerCleaned)); err != nil {
+			f.Close()
+			return nil, errors.Join(ErrCleanup, err)
+		}
+	}
+	d, err := os.Open(dir)
+	if err == nil {
+		err = errors.Join(d.Sync(), d.Close())
+	}
+	if err != nil {
+		f.Close()
+		return nil, errors.Join(ErrCleanup, err)
+	}
+	return f, nil
+}
+
+func privateLeaseFile(info os.FileInfo) bool {
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
+		return false
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	return stat.Nlink == 1 && int(stat.Uid) == os.Geteuid()
+}
+
+func workerLeaseIntact(dir string, lease *os.File) bool {
+	held, err := lease.Stat()
+	if err != nil || !privateLeaseFile(held) {
+		return false
+	}
+	current, err := os.Lstat(filepath.Join(dir, workerLock))
+	return err == nil && os.SameFile(held, current)
+}
+
+func workerCleanupConfirmed(dir string, lease *os.File) bool {
+	if !workerLeaseIntact(dir, lease) {
+		return false
+	}
+	marker, err := os.Lstat(filepath.Join(dir, workerCleaned))
+	return err == nil && privateLeaseFile(marker)
+}
+
+func MarkWorkerCleaned(dir string, lease *os.File) error {
+	if !workerLeaseIntact(dir, lease) {
+		return ErrCleanup
+	}
+	if err := Save(dir, workerCleaned, nil); err != nil {
+		return errors.Join(ErrCleanup, err)
+	}
+	if !workerCleanupConfirmed(dir, lease) {
+		return ErrCleanup
+	}
+	return nil
+}
+
+func LeaseReleased(dir string) bool {
+	f, err := os.OpenFile(filepath.Join(dir, workerLock), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return false
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Sys().(*syscall.Stat_t).Nlink != 1 {
-		return false
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return false
-	}
-	marker, err := os.Lstat(filepath.Join(dir, ".worker.cleaned"))
-	return err == nil && marker.Mode().IsRegular() && marker.Sys().(*syscall.Stat_t).Nlink == 1
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil && workerCleanupConfirmed(dir, f)
 }
 
 func SuperviseFixture() error {
@@ -162,13 +250,13 @@ func SuperviseFixture() error {
 		if stopErr := StopProcessGroup(cmd.Process.Pid); stopErr != nil {
 			return stopErr
 		}
-		return errors.Join(err, Save(".", ".worker.cleaned", nil))
+		return errors.Join(err, MarkWorkerCleaned(".", lease))
 	case <-eof:
 		if err := StopProcessGroup(cmd.Process.Pid); err != nil {
 			return err
 		}
 		<-done
-		return Save(".", ".worker.cleaned", nil)
+		return MarkWorkerCleaned(".", lease)
 	}
 }
 
@@ -192,7 +280,7 @@ func Supervise(request any, run func(context.Context) (any, error)) error {
 	if errors.Is(err, ErrCleanup) {
 		return err
 	}
-	if marker := Save(".", ".worker.cleaned", nil); marker != nil {
+	if marker := MarkWorkerCleaned(".", lease); marker != nil {
 		return marker
 	}
 	if err != nil {

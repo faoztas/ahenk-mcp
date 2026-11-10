@@ -54,7 +54,11 @@ func TestCheckpointRestoresOnlyVerifiedWorktree(t *testing.T) {
 	}
 	prepare := func(name string) *execution.Worktree {
 		t.Helper()
-		w, err := execution.PrepareWorktree(ctx, dir(name), s, task)
+		attempt := filepath.Join(base, name)
+		if err := execution.NewAttemptDir(attempt); err != nil {
+			t.Fatal(err)
+		}
+		w, err := execution.PrepareWorktree(ctx, attempt, s, task)
 		if err != nil {
 			t.Fatal(err)
 		}

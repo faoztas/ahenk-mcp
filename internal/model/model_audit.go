@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -69,15 +70,25 @@ func (m ModelInventory) Fresh(now time.Time) bool {
 }
 
 func LoadModelInventory(path string) (*ModelInventory, error) {
-	f, err := os.Open(path)
+	const maxSize = 512 << 10
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, fmt.Errorf("model audit inventory is unavailable")
+		return nil, fmt.Errorf("model audit inventory is unavailable or unsafe")
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > maxSize {
+		return nil, fmt.Errorf("model audit inventory must be a private regular file")
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	if int(stat.Uid) != os.Geteuid() || stat.Nlink != 1 {
+		return nil, fmt.Errorf("model audit inventory must be owned by the current user and have no other links")
+	}
 	var inventory ModelInventory
-	d := json.NewDecoder(io.LimitReader(f, 512<<10))
+	input := &io.LimitedReader{R: f, N: maxSize + 1}
+	d := json.NewDecoder(input)
 	d.DisallowUnknownFields()
-	if d.Decode(&inventory) != nil || d.Decode(new(any)) != io.EOF ||
+	if d.Decode(&inventory) != nil || d.Decode(new(any)) != io.EOF || input.N == 0 ||
 		inventory.Fixture != ModelAuditFixture || len(inventory.Models) > 256 || inventory.ObservedAt.IsZero() {
 		return nil, fmt.Errorf("invalid model audit inventory")
 	}

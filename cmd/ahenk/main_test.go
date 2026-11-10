@@ -330,6 +330,16 @@ func TestStdioSnapshotAndLifecycle(t *testing.T) {
 		verdict["deterministic_check_status"] != model.NotRun || len(verdict["findings"].([]any)) == 0 {
 		t.Fatalf("review was not bound to the artifact and check status: %v", verdict)
 	}
+	if got := call(s, "delegate_task", model.Submission{RepoID: "demo", RequestID: "standalone-review", Task: reviewTask}); got["code"] != "INVALID_INPUT" {
+		t.Fatalf("standalone review without a diff: %v", got)
+	}
+	unboundReview := reviewBatch
+	unboundReview.RequestID = "unbound-review"
+	unboundReview.Items = slices.Clone(reviewBatch.Items)
+	unboundReview.Items[1].HandoffFrom = nil
+	if got := call(s, "delegate_batch", unboundReview); got["code"] != "INVALID_INPUT" {
+		t.Fatalf("batch review without a diff: %v", got)
+	}
 	reviewBatch.RequestID = "review-without-independence"
 	reviewBatch.Independence = ""
 	if got := call(s, "delegate_batch", reviewBatch)["code"]; got != "INVALID_INPUT" {

@@ -171,6 +171,9 @@ func (e *Engine) Submit(s model.Submission) (model.Job, error) {
 	if !model.ValidID(s.RequestID) {
 		return model.Job{}, model.Error("INVALID_INPUT", "invalid request ID")
 	}
+	if s.ExecutionProfile == "review" {
+		return model.Job{}, model.Error("INVALID_INPUT", "artifact review requires a batch with an independent verified diff handoff; use analysis for standalone reading")
+	}
 	role, mode := routingRole(s.Task), routingMode(s.Strategy, e.cfg.CapacityPolicy)
 	if s.Decompose {
 		role = "planning"
@@ -819,6 +822,10 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 		return
 	}
 	handoffs, err := e.resolveHandoffs(j)
+	if err == nil && j.Task.ExecutionProfile == "review" &&
+		(len(handoffs) != 1 || handoffs[0].Review == nil) {
+		err = model.Error("HANDOFF_INVALID", "artifact review requires one independent verified diff handoff")
+	}
 	if err != nil {
 		e.finish(ctx, j, err)
 		e.mu.Unlock()
@@ -857,7 +864,7 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 	n := len(j.Attempts) + 1
 	at := time.Now().UTC()
 	dir := e.attemptDir(j.ID, n)
-	if err = os.Mkdir(dir, 0700); err != nil {
+	if err = execution.NewAttemptDir(dir); err != nil {
 		e.finish(ctx, j, err)
 		e.mu.Unlock()
 		return

@@ -47,8 +47,7 @@ type OpenCodeCooldownImport struct {
 }
 
 // ReadOpenCodeRateLimits projects only cooldown fields from an idle source DB.
-// The source scheduler lock is opened read-only, and immutable mode avoids WAL
-// housekeeping writes by SQLite.
+// Hold the source scheduler lock while reading the database and its WAL.
 func ReadOpenCodeRateLimits(ctx context.Context, dir string) ([]OpenCodeCooldownImport, error) {
 	actual, err := stateDirectory(dir)
 	if err != nil {
@@ -70,7 +69,7 @@ func ReadOpenCodeRateLimits(ctx context.Context, dir string) ([]OpenCodeCooldown
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || int(info.Sys().(*syscall.Stat_t).Uid) != os.Geteuid() {
 		return nil, errors.New("unsafe source state database")
 	}
-	uri := url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&immutable=1"}
+	uri := url.URL{Scheme: "file", Path: path, RawQuery: readOnlyStateQuery}
 	db, err := sql.Open("sqlite", uri.String())
 	if err != nil {
 		return nil, err

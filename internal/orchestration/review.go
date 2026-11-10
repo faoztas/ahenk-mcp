@@ -13,7 +13,7 @@ import (
 
 func validateReviews(batch model.Batch, keys map[string]int) error {
 	for _, item := range batch.Items {
-		if item.ExecutionProfile != "review" || len(item.HandoffFrom) == 0 {
+		if item.ExecutionProfile != "review" {
 			continue
 		}
 		if batch.Independence != "distinct_provider" || item.Mode != "read_only" ||
