@@ -1,0 +1,73 @@
+# Go build outputs
+/bin/
+/build/
+/dist/
+/ahenk-mcp
+/ahenk
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test and coverage outputs
+*.test
+/coverage/
+coverage.out
+coverage.html
+*.coverprofile
+
+# Local workspace and state files
+/.ahenk/
+/.local/
+/.codex/config.toml
+/ahenk.json
+/ahenk.local.json
+/state/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Temporary worker outputs
+/.tmp/
+/tmp/
+/worker-output/
+/transcripts/
+
+# Logs
+/logs/
+*.log
+
+# Local environment and credentials
+.env
+.env.*
+!/.env.example
+.envrc
+*.local.env
+/secrets/
+credentials.json
+auth.json
+.netrc
+.npmrc
+.ssh/
+.aws/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDEs and editors
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~

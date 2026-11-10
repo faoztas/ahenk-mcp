@@ -1,0 +1,12 @@
+{
+  "state_dir": "/absolute/path/to/ahenk-state",
+  "enable_fixture": true,
+  "repositories": {
+    "demo": {
+      "root": "/absolute/path/to/fixture-repo",
+      "allowed_paths": ["fixture.txt"],
+      "providers": ["fixture-a", "fixture-b"]
+    }
+  },
+  "providers": []
+}
