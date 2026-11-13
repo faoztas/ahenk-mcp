@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -23,6 +24,20 @@ import (
 type Registry struct {
 	Candidates []model.Capability
 	agy        model.ProviderConfig
+	codex      model.ProviderConfig
+	claude     model.ProviderConfig
+}
+
+var defaultCodexModels = []string{
+	"gpt-6.1-sol",
+	"gpt-6.1-terra",
+	"gpt-6-astra",
+	"gpt-6-luna",
+}
+
+var defaultClaudeModels = []string{
+	"claude-opus-5-5",
+	"claude-sonnet-5-5",
 }
 
 func New(c model.Config) Registry {
@@ -32,9 +47,149 @@ func New(c model.Config) Registry {
 		{Provider: "opencode", Status: "unverified", Reason: "PERMISSION_AND_FREE_MODEL_SMOKE_REQUIRED", Mode: "tool_free"},
 		{Provider: "copilot", Status: "disabled", Reason: "CLAUDE_ONLY_UNAVAILABLE"},
 	}}
+	for _, m := range defaultCodexModels {
+		r.Candidates = append(r.Candidates, model.Capability{
+			Provider: "codex",
+			Model:    m,
+			Status:   "disabled",
+			Reason:   "BINARY_UNAVAILABLE",
+			Mode:     "cli",
+			Speed:    "fast",
+		})
+	}
+	for _, m := range defaultClaudeModels {
+		r.Candidates = append(r.Candidates, model.Capability{
+			Provider: "claude",
+			Model:    m,
+			Status:   "disabled",
+			Reason:   "BINARY_UNAVAILABLE",
+			Mode:     "cli",
+			Speed:    "fast",
+		})
+	}
 	for _, p := range c.Providers {
 		i := slices.IndexFunc(r.Candidates, func(m model.Capability) bool { return m.Provider == p.ID })
 		if i < 0 || p.ID == "copilot" {
+			continue
+		}
+		if p.ID == "codex" {
+			r.codex = p
+			canonicalPath := p.Path
+			if canonicalPath == "" {
+				if lp, err := exec.LookPath("codex"); err == nil {
+					canonicalPath = lp
+				}
+			}
+			if canonicalPath != "" {
+				if abs, err := filepath.Abs(canonicalPath); err == nil {
+					if real, err := filepath.EvalSymlinks(abs); err == nil && filepath.IsAbs(real) {
+						canonicalPath = real
+					}
+				}
+			}
+			fp, err := Fingerprint(canonicalPath)
+			if err == nil {
+				r.codex.Path = canonicalPath
+				for idx := range r.Candidates {
+					if r.Candidates[idx].Provider == "codex" {
+						r.Candidates[idx].Status = "available"
+						r.Candidates[idx].Reason = "CODEX_CLI_AVAILABLE"
+						r.Candidates[idx].Fingerprint = fp
+						if p.Speed != "" {
+							r.Candidates[idx].Speed = p.Speed
+						}
+					}
+				}
+				if p.Model != "" && !slices.Contains(defaultCodexModels, p.Model) {
+					if match := slices.IndexFunc(r.Candidates, func(other model.Capability) bool {
+						return other.Provider == "codex" && other.Model == p.Model
+					}); match >= 0 {
+						r.Candidates[match].Status = "available"
+						r.Candidates[match].Reason = "CODEX_CLI_AVAILABLE"
+						r.Candidates[match].Fingerprint = fp
+						if p.Speed != "" {
+							r.Candidates[match].Speed = p.Speed
+						}
+					} else {
+						r.Candidates = append(r.Candidates, model.Capability{
+							Provider:    "codex",
+							Model:       p.Model,
+							Status:      "available",
+							Reason:      "CODEX_CLI_AVAILABLE",
+							Fingerprint: fp,
+							Mode:        "cli",
+							Speed:       p.Speed,
+						})
+					}
+				}
+			} else {
+				for idx := range r.Candidates {
+					if r.Candidates[idx].Provider == "codex" {
+						r.Candidates[idx].Status = "disabled"
+						r.Candidates[idx].Reason = "BINARY_UNAVAILABLE"
+					}
+				}
+			}
+			continue
+		}
+		if p.ID == "claude" {
+			r.claude = p
+			canonicalPath := p.Path
+			if canonicalPath == "" {
+				if lp, err := exec.LookPath("claude"); err == nil {
+					canonicalPath = lp
+				}
+			}
+			if canonicalPath != "" {
+				if abs, err := filepath.Abs(canonicalPath); err == nil {
+					if real, err := filepath.EvalSymlinks(abs); err == nil && filepath.IsAbs(real) {
+						canonicalPath = real
+					}
+				}
+			}
+			fp, err := Fingerprint(canonicalPath)
+			if err == nil {
+				r.claude.Path = canonicalPath
+				for idx := range r.Candidates {
+					if r.Candidates[idx].Provider == "claude" {
+						r.Candidates[idx].Status = "available"
+						r.Candidates[idx].Reason = "CLAUDE_CLI_AVAILABLE"
+						r.Candidates[idx].Fingerprint = fp
+						if p.Speed != "" {
+							r.Candidates[idx].Speed = p.Speed
+						}
+					}
+				}
+				if p.Model != "" && !slices.Contains(defaultClaudeModels, p.Model) {
+					if match := slices.IndexFunc(r.Candidates, func(other model.Capability) bool {
+						return other.Provider == "claude" && other.Model == p.Model
+					}); match >= 0 {
+						r.Candidates[match].Status = "available"
+						r.Candidates[match].Reason = "CLAUDE_CLI_AVAILABLE"
+						r.Candidates[match].Fingerprint = fp
+						if p.Speed != "" {
+							r.Candidates[match].Speed = p.Speed
+						}
+					} else {
+						r.Candidates = append(r.Candidates, model.Capability{
+							Provider:    "claude",
+							Model:       p.Model,
+							Status:      "available",
+							Reason:      "CLAUDE_CLI_AVAILABLE",
+							Fingerprint: fp,
+							Mode:        "cli",
+							Speed:       p.Speed,
+						})
+					}
+				}
+			} else {
+				for idx := range r.Candidates {
+					if r.Candidates[idx].Provider == "claude" {
+						r.Candidates[idx].Status = "disabled"
+						r.Candidates[idx].Reason = "BINARY_UNAVAILABLE"
+					}
+				}
+			}
 			continue
 		}
 		if p.ID == "opencode" {
@@ -58,6 +213,8 @@ func New(c model.Config) Registry {
 		m := &r.Candidates[i]
 		m.Model = p.Model
 		m.Speed = p.Speed
+		m.AttestedAccount = p.AttestedAccount
+		m.AttestedAccountSHA256 = p.AttestedAccountSHA256
 		if p.Path == "" {
 			continue
 		}
@@ -88,6 +245,52 @@ func New(c model.Config) Registry {
 			}
 			for _, i := range profiles {
 				m.Profiles[i].Status, m.Profiles[i].Reason = "preflight_required", "SCOPED_SNAPSHOT_ONLY"
+			}
+		}
+	}
+	if r.codex.Path == "" {
+		hasExplicitCodex := slices.ContainsFunc(c.Providers, func(p model.ProviderConfig) bool { return p.ID == "codex" })
+		if !hasExplicitCodex {
+			if lp, err := exec.LookPath("codex"); err == nil {
+				canonicalPath := lp
+				if abs, err := filepath.Abs(canonicalPath); err == nil {
+					if real, err := filepath.EvalSymlinks(abs); err == nil && filepath.IsAbs(real) {
+						canonicalPath = real
+					}
+				}
+				if fp, err := Fingerprint(canonicalPath); err == nil {
+					r.codex = model.ProviderConfig{ID: "codex", Path: canonicalPath}
+					for idx := range r.Candidates {
+						if r.Candidates[idx].Provider == "codex" {
+							r.Candidates[idx].Status = "available"
+							r.Candidates[idx].Reason = "CODEX_CLI_AVAILABLE"
+							r.Candidates[idx].Fingerprint = fp
+						}
+					}
+				}
+			}
+		}
+	}
+	if r.claude.Path == "" {
+		hasExplicitClaude := slices.ContainsFunc(c.Providers, func(p model.ProviderConfig) bool { return p.ID == "claude" })
+		if !hasExplicitClaude {
+			if lp, err := exec.LookPath("claude"); err == nil {
+				canonicalPath := lp
+				if abs, err := filepath.Abs(canonicalPath); err == nil {
+					if real, err := filepath.EvalSymlinks(abs); err == nil && filepath.IsAbs(real) {
+						canonicalPath = real
+					}
+				}
+				if fp, err := Fingerprint(canonicalPath); err == nil {
+					r.claude = model.ProviderConfig{ID: "claude", Path: canonicalPath}
+					for idx := range r.Candidates {
+						if r.Candidates[idx].Provider == "claude" {
+							r.Candidates[idx].Status = "available"
+							r.Candidates[idx].Reason = "CLAUDE_CLI_AVAILABLE"
+							r.Candidates[idx].Fingerprint = fp
+						}
+					}
+				}
 			}
 		}
 	}
@@ -127,8 +330,17 @@ func New(c model.Config) Registry {
 		}
 	}
 	if c.EnableFixture {
+		selfFP := execution.SelfBinarySHA256()
 		for _, p := range []string{"fixture-a", "fixture-b", "fixture-c"} {
-			r.Candidates = append(r.Candidates, model.Capability{Provider: p, Model: "synthetic", Status: "available", Mode: "fixture", Speed: "fixture"})
+			candidate := model.Capability{Provider: p, Model: "synthetic", Status: "available", Mode: "fixture", Speed: "fixture", Fingerprint: selfFP}
+			for _, cfgP := range c.Providers {
+				if cfgP.ID == p {
+					candidate.AttestedAccount = cfgP.AttestedAccount
+					candidate.AttestedAccountSHA256 = cfgP.AttestedAccountSHA256
+					break
+				}
+			}
+			r.Candidates = append(r.Candidates, candidate)
 		}
 	}
 	return r
@@ -136,7 +348,11 @@ func New(c model.Config) Registry {
 
 func openCodeCapability(p model.ProviderConfig) model.Capability {
 	c := model.Capability{Provider: "opencode", Model: p.Model, OpenCodeAccount: model.OpenCodeAnonymous, Speed: p.Speed, Status: "unverified",
-		OpenCodeTransport: p.OpenCodeTransport, Reason: "PERMISSION_AND_FREE_MODEL_SMOKE_REQUIRED", Mode: "tool_free"}
+		OpenCodeTransport: p.OpenCodeTransport, Reason: "PERMISSION_AND_FREE_MODEL_SMOKE_REQUIRED", Mode: "tool_free",
+		AttestedAccount: p.AttestedAccount, AttestedAccountSHA256: p.AttestedAccountSHA256}
+	if p.AttestedAccount != "" {
+		c.OpenCodeAccount = p.AttestedAccount
+	}
 	if !openCodeTransportMatches(c.Model, c.OpenCodeTransport) {
 		c.Reason = "OPENCODE_TRANSPORT_UNVERIFIED"
 		return c
@@ -198,7 +414,7 @@ func Estimate(c model.Capability, t model.Task) time.Duration {
 	switch {
 	case c.Speed == "fixture":
 		secs = 5
-		if t.Objective == "fixture:slow" {
+		if t.Objective == "fixture:slow" || slices.ContainsFunc(t.Acceptance, func(ch model.Check) bool { return ch.CheckID != "" }) {
 			secs = 25
 		}
 	case t.Risk == "critical":
@@ -236,8 +452,10 @@ func AllowsTrustedLocal(c model.Capability) bool {
 		return false
 	}
 	switch c.Provider {
+	case "codex", "claude":
+		return true
 	case "agy":
-		return AGYWorkerIdentityMatches(c.Model, c.Fingerprint)
+		return c.AuditValidUntil == nil && AGYWorkerIdentityMatches(c.Model, c.Fingerprint)
 	case "opencode":
 		return c.OpenCodeTransport == model.OpenCodeNativeReadAsk && c.Model == openCodeNativeModel &&
 			OpenCodeIdentityMatches(c.Model, c.Fingerprint)
@@ -251,10 +469,36 @@ func (r Registry) RunTrustedLocal(ctx context.Context, dir, work string, c model
 		t.DataClass != "synthetic" || len(writePaths) == 0 {
 		return execution.FixtureInput{}, model.Error("POLICY_DENIED", "invalid trusted-local provider or task")
 	}
-	if c.Provider == "agy" {
+	switch c.Provider {
+	case "codex":
+		modelID := c.Model
+		if modelID == "" {
+			modelID = r.codex.Model
+		}
+		effort := t.TargetEffort
+		if effort == "" {
+			effort = "medium"
+		}
+		res, err := RunCodexCLI(ctx, work, modelID, effort, t.Objective, SandboxModeWorkspaceWrite, r.codex.Path)
+		if err != nil {
+			return execution.FixtureInput{}, err
+		}
+		return execution.FixtureInput{Codex: &res.Evidence, Summary: res.Output}, nil
+	case "claude":
+		modelID := c.Model
+		if modelID == "" {
+			modelID = r.claude.Model
+		}
+		res, err := RunClaudeCLI(ctx, work, modelID, t.Objective, SandboxModeWorkspaceWrite, r.claude.Path)
+		if err != nil {
+			return execution.FixtureInput{}, err
+		}
+		return execution.FixtureInput{Claude: &res.Evidence, Summary: res.Output}, nil
+	case "agy":
 		return superviseAGY(ctx, dir, agyRequest{Config: r.agy, Task: t, Worktree: work, WritePaths: writePaths})
+	default:
+		return runOpenCodeTrusted(ctx, dir, work, c, t, writePaths)
 	}
-	return runOpenCodeTrusted(ctx, dir, work, c, t, writePaths)
 }
 
 func AllowsNativeChild(c model.Capability, t model.Task) bool {
@@ -266,7 +510,35 @@ func AllowsContinuation(c model.Capability, t model.Task) bool {
 	return t.FollowUp == "" || c.Provider == "agy" || c.Provider == "opencode" && c.OpenCodeTransport == model.OpenCodeNativeReadAsk
 }
 
+// RunPrivate accepts only the exact audited routes approved by the local operator.
+func (r Registry) RunPrivate(ctx context.Context, dir string, c model.Capability, t model.Task, files map[string]string, handoffs []model.Handoff, grant *model.PrivateSourcePolicy) (execution.FixtureInput, error) {
+	if c.Status != "available" {
+		return execution.FixtureInput{}, model.GateError("PRIVATE_SOURCE_ROUTE_DENIED", "PROVIDER_UNAVAILABLE", "provider is not available for private source execution", "verify_provider_availability")
+	}
+	if ok, gate := grant.RouteDecision(c, t, time.Now()); !ok {
+		return execution.FixtureInput{}, model.GateError("PRIVATE_SOURCE_ROUTE_DENIED", gate, "no active private source grant for this route", "verify_private_source_route_and_account_attestation")
+	}
+	if fault := grant.CheckRequest(t, time.Now()); fault != nil {
+		return execution.FixtureInput{}, fault
+	}
+	if fault := grant.CheckContext(t.AllowedPaths, files); fault != nil {
+		return execution.FixtureInput{}, fault
+	}
+	ctx, cancel := context.WithDeadline(ctx, grant.ExpiresAt)
+	defer cancel()
+	if c.Mode == "fixture" {
+		return r.runFixture(ctx, dir, c, t, files, handoffs)
+	}
+	if !OpenCodeIdentityMatches(c.Model, c.Fingerprint) || !openCodeTransportMatches(c.Model, c.OpenCodeTransport) {
+		return execution.FixtureInput{}, model.GateError("PRIVATE_SOURCE_ROUTE_DENIED", "BINARY_CHANGED", "OpenCode private route did not match the approved worker", "reverify_opencode_binary_sha256")
+	}
+	return runOpenCode(ctx, dir, c, t, files, handoffs, grant)
+}
+
 func (r Registry) Run(ctx context.Context, dir string, c model.Capability, t model.Task, contextFiles map[string]string, handoffs []model.Handoff) (execution.FixtureInput, error) {
+	if t.DataClass == model.PrivateSourceData {
+		return execution.FixtureInput{}, model.Error("PRIVATE_SOURCE_ROUTE_DENIED", "private source requires an operator grant")
+	}
 	if !AllowsNativeChild(c, t) || !AllowsContinuation(c, t) || (t.FollowUp != "" || t.NativeChild) && len(handoffs) != 0 {
 		return execution.FixtureInput{}, model.Error("POLICY_DENIED", "continuation requires an owned native read-only session")
 	}
@@ -278,6 +550,40 @@ func (r Registry) Run(ctx context.Context, dir string, c model.Capability, t mod
 	}
 	if len(handoffs) != 0 && !AllowsHandoff(c, t) {
 		return execution.FixtureInput{}, model.Error("POLICY_DENIED", "provider is not approved for this handoff")
+	}
+	if c.Provider == "codex" && c.Status == "available" {
+		sb := SandboxModeWorkspaceWrite
+		if t.Mode == "read_only" || t.Mode == "analysis" || t.Mode == "review" {
+			sb = SandboxModeReadOnly
+		}
+		modelID := c.Model
+		if modelID == "" {
+			modelID = r.codex.Model
+		}
+		effort := t.TargetEffort
+		if effort == "" {
+			effort = "medium"
+		}
+		res, err := RunCodexCLI(ctx, dir, modelID, effort, t.Objective, sb, r.codex.Path)
+		if err != nil {
+			return execution.FixtureInput{}, err
+		}
+		return execution.FixtureInput{Codex: &res.Evidence, Summary: res.Output}, nil
+	}
+	if c.Provider == "claude" && c.Status == "available" {
+		sb := SandboxModeWorkspaceWrite
+		if t.Mode == "read_only" || t.Mode == "analysis" || t.Mode == "review" {
+			sb = SandboxModeReadOnly
+		}
+		modelID := c.Model
+		if modelID == "" {
+			modelID = r.claude.Model
+		}
+		res, err := RunClaudeCLI(ctx, dir, modelID, t.Objective, sb, r.claude.Path)
+		if err != nil {
+			return execution.FixtureInput{}, err
+		}
+		return execution.FixtureInput{Claude: &res.Evidence, Summary: res.Output}, nil
 	}
 	if c.Provider == "agy" {
 		if c.Status != "available" || !r.agy.EnableSynthetic {
@@ -296,11 +602,15 @@ func (r Registry) Run(ctx context.Context, dir string, c model.Capability, t mod
 	if c.Provider == "opencode" && c.Status == "available" && c.Mode == "tool_free" &&
 		(c.OpenCodeAccount == "" || c.OpenCodeAccount == model.OpenCodeAnonymous) && OpenCodeIdentityMatches(c.Model, c.Fingerprint) &&
 		(openCodeTransportMatches(c.Model, c.OpenCodeTransport) || c.AuditValidUntil != nil && c.OpenCodeTransport == model.OpenCodeNativeReadAsk) {
-		return runOpenCode(ctx, dir, c, t, contextFiles, handoffs)
+		return runOpenCode(ctx, dir, c, t, contextFiles, handoffs, nil)
 	}
 	if c.Mode != "fixture" || c.Status != "available" {
 		return execution.FixtureInput{}, model.Error("POLICY_DENIED", "live execution requires verified permission and cost evidence")
 	}
+	return r.runFixture(ctx, dir, c, t, contextFiles, handoffs)
+}
+
+func (r Registry) runFixture(ctx context.Context, dir string, c model.Capability, t model.Task, contextFiles map[string]string, handoffs []model.Handoff) (execution.FixtureInput, error) {
 	in := execution.FixtureInput{Summary: "Synthetic adapter completed the offline fixture."}
 	// The fixture is explicitly enabled and never interprets the objective as a command.
 	if t.Objective == "fixture:slow" {
@@ -325,11 +635,28 @@ func (r Registry) Run(ctx context.Context, dir string, c model.Capability, t mod
 	if t.Mode == "patch" {
 		for _, name := range t.AllowedPaths {
 			body, ok := contextFiles[name]
-			if !ok || body != "before\n" || strings.ContainsAny(name, " \"") {
+			if !ok || strings.ContainsAny(name, " \"") {
 				continue
 			}
-			in.Patch = fmt.Sprintf("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1 +1 @@\n-before\n+after\n", name, name, name, name)
-			break
+			if body == "before\n" {
+				in.Patch = fmt.Sprintf("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1 +1 @@\n-before\n+after\n", name, name, name, name)
+				break
+			}
+			if strings.Contains(body, `"before"`) {
+				oldLines := strings.Split(strings.TrimSuffix(body, "\n"), "\n")
+				newBody := strings.Replace(body, `"before"`, `"after"`, 1)
+				newLines := strings.Split(strings.TrimSuffix(newBody, "\n"), "\n")
+				var b strings.Builder
+				fmt.Fprintf(&b, "diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1,%d +1,%d @@\n", name, name, name, name, len(oldLines), len(newLines))
+				for _, l := range oldLines {
+					b.WriteString("-" + l + "\n")
+				}
+				for _, l := range newLines {
+					b.WriteString("+" + l + "\n")
+				}
+				in.Patch = b.String()
+				break
+			}
 		}
 	}
 	return execution.RunFixture(ctx, dir, in)
