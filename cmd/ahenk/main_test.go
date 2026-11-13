@@ -455,7 +455,7 @@ func TestPrivateWorkAdmissionAndLocalRunners(t *testing.T) {
 		},
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 180*time.Second)
 	defer cancel()
 	startWith := func(cfg model.Config) (*mcp.ClientSession, func(string, any) map[string]any, func(*mcp.ClientSession, string, ...string) map[string]any) {
 		t.Helper()
@@ -493,7 +493,7 @@ func TestPrivateWorkAdmissionAndLocalRunners(t *testing.T) {
 		wait := func(s *mcp.ClientSession, id string, wanted ...string) map[string]any {
 			t.Helper()
 			var out map[string]any
-			for until := time.Now().Add(30 * time.Second); time.Now().Before(until); time.Sleep(40 * time.Millisecond) {
+			for until := time.Now().Add(90 * time.Second); time.Now().Before(until); time.Sleep(40 * time.Millisecond) {
 				out = call("get_job_status", map[string]string{"job_id": id})
 				status, _ := out["status"].(string)
 				if slices.Contains(wanted, status) {

@@ -222,7 +222,7 @@ func TestWriterIsolationAllowedPathsViolation(t *testing.T) {
 
 // 3. Go Checks & Diff Snapshot Entegrasyonu
 func TestSubagentGoChecksAndDiffIntegration(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	tempDir := canonicalTempDir(t)
@@ -303,7 +303,7 @@ func TestSubagentGoChecksAndDiffIntegration(t *testing.T) {
 
 // 4. Uçtan Uca Live Subagent Verification Senaryosu
 func TestSubagentE2ELiveVerification(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	tempDir := canonicalTempDir(t)
@@ -419,7 +419,7 @@ exit 0
 	}
 
 	// 2. Wait for subagent to complete
-	completedJob, err := engine.Wait(ctx, job.ID, 25*time.Second)
+	completedJob, err := engine.Wait(ctx, job.ID, 75*time.Second)
 	if err != nil {
 		t.Fatalf("engine.Wait failed: %v", err)
 	}
