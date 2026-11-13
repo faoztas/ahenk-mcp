@@ -71,11 +71,17 @@ func qualityFor(c model.Capability, role string) model.QualityEvidence {
 		c.Mode == "" && role == "inference" && len(c.Quality) == 0 {
 		return model.QualityEvidence{Role: role, Tier: 1, Source: "OFFLINE_FIXTURE"}
 	}
+	if (c.Provider == "codex" || c.Provider == "claude") && len(c.Quality) == 0 {
+		return model.QualityEvidence{Role: role, Tier: 1, Source: "CLI_RUNNER"}
+	}
 	return best
 }
 
 func workerCostAllowed(c model.Capability) bool {
 	if c.Mode == "fixture" || c.Mode == "" && c.Cost == nil {
+		return true
+	}
+	if c.Provider == "codex" || c.Provider == "claude" {
 		return true
 	}
 	if c.Cost == nil {

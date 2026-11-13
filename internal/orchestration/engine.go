@@ -1072,21 +1072,33 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 		return
 	}
 	trusted := !planning && j.Task.ExecutionProfile == model.TrustedLocalProfile
-	implementation := !planning && j.Task.ExecutionProfile == "implementation"
+	implementation := !planning && (j.Task.ExecutionProfile == "implementation" || (j.Task.Mode == "patch" && (j.Task.PreferredProvider == "codex" || j.Task.PreferredProvider == "claude")))
 	privateWrite := !planning && j.Task.DataClass == model.PrivateSourceData && j.Task.Mode == "patch"
+	subagent := implementation || (!trusted && !privateWrite && j.Task.Mode == "patch" && slices.ContainsFunc(e.reg.Candidates, func(c model.Capability) bool {
+		return (c.Provider == "codex" || c.Provider == "claude") && c.Status == "available"
+	}))
 	if implementation && !privateWrite && !slices.ContainsFunc(e.reg.Candidates, func(c model.Capability) bool {
-		return c.Mode == "fixture" && c.Provider == j.Task.PreferredProvider
+		if c.Mode == "fixture" && (j.Task.PreferredProvider == "" || c.Provider == j.Task.PreferredProvider) {
+			return true
+		}
+		if (c.Provider == "codex" || c.Provider == "claude") && c.Status == "available" && (j.Task.PreferredProvider == "" || c.Provider == j.Task.PreferredProvider) {
+			return true
+		}
+		return false
 	}) {
 		j.Status, j.Reason = model.Blocked, "WRITER_ISOLATION_UNVERIFIED"
 		e.persist(j)
 		e.mu.Unlock()
 		return
 	}
-	if !planning && !trusted && !privateWrite && (j.Task.Risk == "critical" || slices.ContainsFunc(j.Task.Acceptance, func(c model.Check) bool { return c.CheckID != "" })) {
-		j.Status, j.Reason = model.Blocked, "DETERMINISTIC_CHECK_NOT_CONFIGURED"
-		e.persist(j)
-		e.mu.Unlock()
-		return
+	hasCheck := slices.ContainsFunc(j.Task.Acceptance, func(c model.Check) bool { return c.CheckID != "" })
+	if !planning && !trusted && !privateWrite {
+		if (j.Task.Risk == "critical" && !hasCheck) || (hasCheck && !subagent) {
+			j.Status, j.Reason = model.Blocked, "DETERMINISTIC_CHECK_NOT_CONFIGURED"
+			e.persist(j)
+			e.mu.Unlock()
+			return
+		}
 	}
 	if trusted && (repo.TrustedLocal == nil || len(j.HandoffFrom) != 0 || j.Task.Risk == "critical" && !e.independentReviewRequested(j)) {
 		j.Status, j.Reason = model.Blocked, "TRUSTED_LOCAL_POLICY_REQUIRED"
@@ -1191,8 +1203,12 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 			out, worktree, checks, err = e.runTrustedImplementation(runCtx, dir, c, j.Task, s, files, repo.TrustedLocal, checkpoint)
 		} else if privateWrite {
 			out, worktree, checks, err = e.runPrivateWriteImplementation(runCtx, dir, c, j.Task, s, files, handoffs, repo.PrivateSource)
-		} else if implementation {
-			out, worktree, err = e.runFixtureImplementation(runCtx, dir, c, j.Task, s, files, handoffs)
+		} else if implementation || (j.Task.Mode == "patch" && (c.Provider == "codex" || c.Provider == "claude")) {
+			if c.Provider == "codex" || c.Provider == "claude" {
+				out, worktree, checks, err = e.runSubagentImplementation(runCtx, dir, c, j.Task, s, files, repo)
+			} else {
+				out, worktree, err = e.runFixtureImplementation(runCtx, dir, c, j.Task, s, files, handoffs)
+			}
 		} else if providerTask.DataClass == model.PrivateSourceData {
 			out, err = e.reg.RunPrivate(runCtx, dir, c, providerTask, files, handoffs, repo.PrivateSource)
 		} else {
@@ -1295,7 +1311,11 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 				} else if privateWrite {
 					result.Verification = append(result.Verification, "DETERMINISTIC_CHECK_PASSED")
 				} else {
-					result.Verification = append(result.Verification, "DETERMINISTIC_CHECK_NOT_RUN")
+					if len(checks) > 0 {
+						result.Verification = append(result.Verification, "DETERMINISTIC_CHECK_PASSED")
+					} else {
+						result.Verification = append(result.Verification, "DETERMINISTIC_CHECK_NOT_RUN")
+					}
 				}
 			} else {
 				result.Preimages, err = execution.VerifyPatch(ctx, e.scratch, s, j.Task, []byte(out.Patch))
@@ -1316,6 +1336,13 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 	j = e.jobs[j.ID]
 	if err == nil && ctx.Err() == nil && j.Status != model.Cancelling && result.ArtifactID != "" {
 		err = e.saveArtifact(result.ArtifactID, []byte(out.Patch))
+		if err == nil {
+			j.Diff = out.Patch
+			if j.Artifacts == nil {
+				j.Artifacts = make(map[string]string)
+			}
+			j.Artifacts[result.ArtifactID] = out.Patch
+		}
 	}
 	j.Attempts = slices.Clone(j.Attempts)
 	a := &j.Attempts[len(j.Attempts)-1]
@@ -1336,6 +1363,12 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 		}
 	}
 	a.OpenCode = out.OpenCode
+	if out.Codex != nil {
+		a.Codex = out.Codex
+	}
+	if out.Claude != nil {
+		a.Claude = out.Claude
+	}
 	if out.AGY != nil {
 		a.AGY, a.Cost = out.AGY, out.AGY.Cost
 	}
@@ -1395,6 +1428,15 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 			return
 		}
 		j.Result = result
+		if out.Patch != "" && j.Diff == "" {
+			j.Diff = out.Patch
+			if j.Artifacts == nil {
+				j.Artifacts = make(map[string]string)
+			}
+			if result.ArtifactID != "" {
+				j.Artifacts[result.ArtifactID] = out.Patch
+			}
+		}
 		j.Status, j.Reason = model.Completed, ""
 		e.persist(j)
 	} else {
@@ -1486,7 +1528,9 @@ func (e *Engine) route(j *model.Job, now time.Time) (model.Capability, time.Dura
 		case j.Task.ExecutionProfile == model.TrustedLocalProfile && (repo.TrustedLocal == nil || !providers.AllowsTrustedLocal(c) ||
 			repo.TrustedLocal.Provider != "" && c.Provider != repo.TrustedLocal.Provider):
 			reason = "TRUSTED_LOCAL_PROVIDER_UNAVAILABLE"
-		case j.Task.ExecutionProfile == "implementation" && j.Task.DataClass != model.PrivateSourceData && (c.Mode != "fixture" || c.Provider != j.Task.PreferredProvider):
+		case j.Task.ExecutionProfile == "implementation" && j.Task.DataClass != model.PrivateSourceData &&
+			!(c.Mode == "fixture" && (j.Task.PreferredProvider == "" || c.Provider == j.Task.PreferredProvider)) &&
+			!((c.Provider == "codex" || c.Provider == "claude") && c.Status == "available" && (j.Task.PreferredProvider == "" || c.Provider == j.Task.PreferredProvider)):
 			reason = "WRITER_ISOLATION_UNVERIFIED"
 		case c.Provider == "agy" && !providers.AllowsAGYProfile(c, j.Task):
 			reason = "AGY_PROFILE_UNVERIFIED"

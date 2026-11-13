@@ -48,6 +48,162 @@ func (e *Engine) runFixtureImplementation(ctx context.Context, dir string, c mod
 	return out, &result, nil
 }
 
+func (e *Engine) runSubagentImplementation(ctx context.Context, dir string, c model.Capability, t model.Task,
+	snapshot execution.Snapshot, files map[string]string, repo model.Repo,
+) (out execution.FixtureInput, collected *execution.WorktreeResult, checks []model.CheckEvidence, err error) {
+	w, err := execution.PrepareWorktree(ctx, dir, snapshot, t)
+	if err != nil {
+		return out, nil, checks, err
+	}
+	defer func() {
+		if cleanupErr := w.Close(); cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
+		}
+	}()
+
+	runDir := dir
+	if c.Provider == "codex" || c.Provider == "claude" {
+		runDir = w.Dir
+	}
+	out, err = e.reg.Run(ctx, runDir, c, t, files, nil)
+	if err != nil || out.Failure != "" {
+		return out, nil, checks, err
+	}
+	if out.Patch != "" && (c.Mode == "fixture" || (c.Provider != "codex" && c.Provider != "claude")) {
+		if err = w.ApplyPatch(ctx, []byte(out.Patch)); err != nil {
+			return out, nil, checks, err
+		}
+	}
+	result, err := w.Collect(ctx, e.scratch)
+	if err != nil {
+		return out, nil, checks, err
+	}
+	if !result.SourceUnchanged {
+		return out, nil, checks, model.Error("SNAPSHOT_CHANGED", "source changed during subagent execution")
+	}
+	for name := range result.Preimages {
+		if !model.InScope(name, t.AllowedPaths) {
+			return out, nil, checks, model.Error("POLICY_DENIED", "native edit changed a protected file")
+		}
+	}
+	for name := range result.Postimages {
+		if !model.InScope(name, t.AllowedPaths) {
+			return out, nil, checks, model.Error("POLICY_DENIED", "native edit changed a protected file")
+		}
+	}
+
+	for _, criterion := range t.Acceptance {
+		id := criterion.CheckID
+		if id != "" && !slices.ContainsFunc(checks, func(check model.CheckEvidence) bool { return check.ID == id }) {
+			testName := id
+			if repo.PrivateSource != nil && repo.PrivateSource.GoChecks != nil && repo.PrivateSource.GoChecks[id] != "" {
+				testName = repo.PrivateSource.GoChecks[id]
+			} else if repo.TrustedLocal != nil && repo.TrustedLocal.GoChecks != nil && repo.TrustedLocal.GoChecks[id] != "" {
+				testName = repo.TrustedLocal.GoChecks[id]
+			}
+			checks = append(checks, model.CheckEvidence{ID: id, Test: testName, Status: model.NotRun, ExitStatus: -1})
+		}
+	}
+
+	if len(checks) > 0 {
+		tool, checkErr := execution.GoCheckTool()
+		if checkErr != nil {
+			return out, nil, checks, checkErr
+		}
+		verifiedChecks, checkErr := execution.RunGoChecks(ctx, dir, w.Dir, tool, checks)
+		if checkErr != nil {
+			return out, nil, checks, checkErr
+		}
+		if len(verifiedChecks) != len(checks) {
+			return out, nil, checks, model.Error("CHECK_FAILED", "registered Go check evidence is incomplete")
+		}
+		for i, check := range verifiedChecks {
+			if check.ID != checks[i].ID || check.Test != checks[i].Test || check.Status != "PASSED" || check.ExitStatus != 0 {
+				return out, nil, verifiedChecks, model.Error("CHECK_FAILED", "a registered Go check did not pass")
+			}
+		}
+		checks = verifiedChecks
+
+		after, err := w.Collect(ctx, e.scratch)
+		if err != nil {
+			return out, nil, verifiedChecks, err
+		}
+		if after.ArtifactSHA256 != result.ArtifactSHA256 || !after.SourceUnchanged {
+			return out, nil, verifiedChecks, model.Error("SNAPSHOT_CHANGED", "Go verification changed the worktree or source")
+		}
+		result = after
+	}
+
+	out.Patch = string(result.Patch)
+	return out, &result, checks, nil
+}
+
+func (e *Engine) runPrivateWriteImplementation(ctx context.Context, dir string, c model.Capability, t model.Task,
+	snapshot execution.Snapshot, files map[string]string, handoffs []model.Handoff, policy *model.PrivateSourcePolicy,
+) (out execution.FixtureInput, collected *execution.WorktreeResult, checks []model.CheckEvidence, err error) {
+	writerVerified := policy != nil && (policy.WriterIsolationVerified || c.Provider == "codex" || c.Provider == "claude")
+	if policy == nil || !writerVerified || !policy.AllowWrite || len(policy.GoChecks) == 0 {
+		return out, nil, nil, model.GateError("POLICY_DENIED", "WRITER_ISOLATION_UNVERIFIED", "private write requires verified writer isolation and registered Go checks", "verify_writer_isolation_and_enable_allow_write")
+	}
+	for _, criterion := range t.Acceptance {
+		id := criterion.CheckID
+		if id != "" && !slices.ContainsFunc(checks, func(check model.CheckEvidence) bool { return check.ID == id }) {
+			checks = append(checks, model.CheckEvidence{ID: id, Test: policy.GoChecks[id], Status: model.NotRun, ExitStatus: -1})
+		}
+	}
+	if len(checks) == 0 {
+		return out, nil, nil, model.GateError("POLICY_DENIED", "DETERMINISTIC_CHECK_NOT_CONFIGURED", "private write requires a registered Go check", "configure_registered_go_check_for_private_patch")
+	}
+	tool, err := execution.GoCheckTool()
+	if err != nil {
+		return out, nil, checks, err
+	}
+	w, err := execution.PrepareWorktree(ctx, dir, snapshot, t)
+	if err != nil {
+		return out, nil, checks, err
+	}
+	defer func() {
+		if cleanupErr := w.Close(); cleanupErr != nil {
+			err = cleanupErr
+		}
+	}()
+	out, err = e.reg.RunPrivate(ctx, dir, c, t, files, handoffs, policy)
+	if err != nil || out.Failure != "" {
+		return out, nil, checks, err
+	}
+	if err = w.ApplyPatch(ctx, []byte(out.Patch)); err != nil {
+		return out, nil, checks, err
+	}
+	result, err := w.Collect(ctx, e.scratch)
+	if err != nil {
+		return out, nil, checks, err
+	}
+	if !result.SourceUnchanged {
+		return out, nil, checks, model.Error("SNAPSHOT_CHANGED", "source changed during the private worktree attempt")
+	}
+	verifiedChecks, err := execution.RunGoChecks(ctx, dir, w.Dir, tool, checks)
+	if err != nil {
+		return out, nil, checks, err
+	}
+	if len(verifiedChecks) != len(checks) {
+		return out, nil, checks, model.Error("CHECK_FAILED", "registered Go check evidence is incomplete")
+	}
+	for i, check := range verifiedChecks {
+		if check.ID != checks[i].ID || check.Test != checks[i].Test || check.Status != "PASSED" || check.ExitStatus != 0 {
+			return out, nil, verifiedChecks, model.Error("CHECK_FAILED", "a registered Go check did not pass")
+		}
+	}
+	after, err := w.Collect(ctx, e.scratch)
+	if err != nil {
+		return out, nil, verifiedChecks, err
+	}
+	if after.ArtifactSHA256 != result.ArtifactSHA256 || !after.SourceUnchanged {
+		return out, nil, verifiedChecks, model.Error("SNAPSHOT_CHANGED", "Go verification changed the worktree or source")
+	}
+	out.Patch = string(after.Patch)
+	return out, &after, verifiedChecks, nil
+}
+
 func (e *Engine) runTrustedImplementation(ctx context.Context, dir string, c model.Capability, t model.Task,
 	snapshot execution.Snapshot, files map[string]string, policy *model.TrustedLocalPolicy, checkpoint *model.Checkpoint,
 ) (out execution.FixtureInput, collected *execution.WorktreeResult, checks []model.CheckEvidence, err error) {

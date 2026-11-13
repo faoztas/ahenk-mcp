@@ -325,6 +325,11 @@ func New(c model.Config) Registry {
 				}
 			}
 		}
+		if c.Provider == "codex" || c.Provider == "claude" {
+			for _, role := range []string{"implementation", "review", "planning", "architecture", "reasoning", "research"} {
+				c.Quality = append(c.Quality, model.QualityEvidence{Role: role, Tier: 2, Source: "CLI_RUNNER"})
+			}
+		}
 		if c.Provider == "agy" && c.Cost == nil {
 			c.Cost = agyUnverifiedCost()
 		}
