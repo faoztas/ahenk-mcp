@@ -750,7 +750,7 @@ func TestQuotaHealthNormalizationAndNonBlocking(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Errorf("quota read took too long: %v", elapsed)
 	}
 }

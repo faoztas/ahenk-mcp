@@ -419,8 +419,10 @@ func Estimate(c model.Capability, t model.Task) time.Duration {
 	switch {
 	case c.Speed == "fixture":
 		secs = 5
-		if t.Objective == "fixture:slow" || slices.ContainsFunc(t.Acceptance, func(ch model.Check) bool { return ch.CheckID != "" }) {
+		if t.Objective == "fixture:slow" {
 			secs = 25
+		} else if slices.ContainsFunc(t.Acceptance, func(ch model.Check) bool { return ch.CheckID != "" }) {
+			secs = 90
 		}
 	case t.Risk == "critical":
 		secs = 480
