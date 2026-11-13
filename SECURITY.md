@@ -4,7 +4,7 @@ Report suspected vulnerabilities through [GitHub private vulnerability reporting
 
 Include the Ahenk revision, affected provider and transport, and reproduction steps using a synthetic repository. Keep credentials, account identifiers, prompts, raw provider output, state databases, and private diffs out of reports. If a credential was exposed, revoke or rotate it through its issuer.
 
-Run Ahenk as a local stdio service in a trusted project. Scope each repository to the files and providers it needs. Review returned diffs before applying them. The current live provider pilots are limited to synthetic workloads. Temporary workspaces and application policy checks do not provide general subprocess containment.
+Run Ahenk as a local stdio service in a trusted project. Scope each repository to the files and providers it needs. Review returned diffs before applying them. The default live provider pilots accept synthetic workloads. [Private source analysis](docs/private-source-policy.md) has a separate expiring grant and a dedicated local state boundary. Temporary workspaces and application policy checks do not provide general subprocess containment.
 
 ## Trusted-local execution
 

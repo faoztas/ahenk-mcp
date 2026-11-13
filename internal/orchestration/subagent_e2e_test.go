@@ -59,12 +59,21 @@ func setupTestGitRepo(t *testing.T, dir string) {
 	runGit("commit", "-m", "Initial commit")
 }
 
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to evaluate symlinks for temp dir: %v", err)
+	}
+	return dir
+}
+
 // 1. Pre/Post Image SHA-256 Immutability Test
 func TestWriterIsolationPrePostSha256Immutability(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	tempDir := t.TempDir()
+	tempDir := canonicalTempDir(t)
 	sourceRepo := filepath.Join(tempDir, "source")
 	if err := os.MkdirAll(sourceRepo, 0700); err != nil {
 		t.Fatal(err)
@@ -156,7 +165,7 @@ func TestWriterIsolationAllowedPathsViolation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	tempDir := t.TempDir()
+	tempDir := canonicalTempDir(t)
 	sourceRepo := filepath.Join(tempDir, "source_viol")
 	if err := os.MkdirAll(sourceRepo, 0700); err != nil {
 		t.Fatal(err)
@@ -216,7 +225,7 @@ func TestSubagentGoChecksAndDiffIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	tempDir := t.TempDir()
+	tempDir := canonicalTempDir(t)
 	sourceRepo := filepath.Join(tempDir, "source_checks")
 	if err := os.MkdirAll(sourceRepo, 0700); err != nil {
 		t.Fatal(err)
@@ -297,7 +306,7 @@ func TestSubagentE2ELiveVerification(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	tempDir := t.TempDir()
+	tempDir := canonicalTempDir(t)
 	sourceRepo := filepath.Join(tempDir, "source_e2e")
 	if err := os.MkdirAll(sourceRepo, 0700); err != nil {
 		t.Fatal(err)

@@ -75,8 +75,17 @@ type openCodeNativeRef struct {
 	Variant  string `json:"variant,omitempty"`
 }
 
-func (m openCodeNativeRef) matches(id string) bool {
-	return m.Provider == "opencode" && m.ID == id && (m.Variant == "" || m.Variant == "default")
+func (m openCodeNativeRef) matches(id, expectedVariant string) bool {
+	if m.Provider != "opencode" || m.ID != id {
+		return false
+	}
+	if expectedVariant == "" {
+		expectedVariant = "default"
+	}
+	if m.Variant == "" {
+		m.Variant = "default"
+	}
+	return m.Variant == expectedVariant || expectedVariant == "default" && (m.Variant == "" || m.Variant == "default")
 }
 
 type openCodeNativeLocation struct {
@@ -247,7 +256,7 @@ func (o openCodeRuntime) startNativeSession(ctx context.Context, id string, rule
 	}
 	session := created.Data
 	if !openCodeSessionID.MatchString(session.ID) || session.Title != title || session.Agent != openCodeNativeAgent ||
-		!session.Model.matches(id) || session.Location != location || !slices.Equal(session.Permissions, rules) || session.Parent != "" {
+		!session.Model.matches(id, "") || session.Location != location || !slices.Equal(session.Permissions, rules) || session.Parent != "" {
 		return openCodeNativeSession{}, model.Error("POLICY_DENIED", "OpenCode native session did not confirm its isolation and permissions")
 	}
 	return session, nil
@@ -501,14 +510,14 @@ func nativeTextCompletion(messages []openCodeNativeMessage, messageID, id, promp
 		switch {
 		case m.Type == "user" && input == nil && m.ID == messageID && m.Text == prompt:
 			input = m
-		case m.Type == "assistant" && !m.Model.matches(id):
+		case m.Type == "assistant" && !m.Model.matches(id, ""):
 			if m.Model.Provider == "opencode" && model.ValidID(m.Model.ID) {
 				evidence.Model = "opencode/" + m.Model.ID
 			}
 			fault := model.Error("POLICY_DENIED", "OpenCode native returned a different model or variant")
 			fault.ProviderReason = "MODEL_ID_MISMATCH"
 			return "", fault
-		case m.Type == "assistant" && answer == nil && m.Agent == agent && m.Model.matches(id):
+		case m.Type == "assistant" && answer == nil && m.Agent == agent && m.Model.matches(id, ""):
 			answer = m
 		case m.Type == "idle" && idle == nil:
 			idle = m

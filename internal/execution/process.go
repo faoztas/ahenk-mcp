@@ -7,13 +7,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
-
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +25,10 @@ import (
 type FixtureInput struct {
 	AGY         *model.AGYRunEvidence      `json:"agy,omitempty"`
 	OpenCode    *model.OpenCodeRunEvidence `json:"opencode,omitempty"`
+	Codex       *model.CLIRunEvidence      `json:"codex,omitempty"`
+	Claude      *model.CLIRunEvidence      `json:"claude,omitempty"`
+	ACP         *model.ACPRunEvidence      `json:"acp,omitempty"`
+	Local       *model.LocalRunEvidence    `json:"local,omitempty"`
 	Summary     string                     `json:"summary"`
 	Patch       string                     `json:"patch,omitempty"`
 	DelayMillis int                        `json:"delay_ms,omitempty"`
@@ -44,6 +50,10 @@ func RunFixture(ctx context.Context, dir string, in FixtureInput) (FixtureInput,
 // RunSupervised leases a worker to this process. The supervisor owns cleanup
 // when its controller exits or cancels.
 func RunSupervised(ctx context.Context, dir, command string, env []string, in, out any) error {
+	return runSupervised(ctx, dir, command, env, in, out, 7*time.Second)
+}
+
+func runSupervised(ctx context.Context, dir, command string, env []string, in, out any, cleanupWait time.Duration) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -99,7 +109,7 @@ func RunSupervised(ctx context.Context, dir, command string, env []string, in, o
 				return err
 			}
 			return ctx.Err()
-		case <-time.After(7 * time.Second):
+		case <-time.After(cleanupWait):
 			// The worker group may differ from the supervisor group.
 			// Keep the attempt quarantined when the watchdog did not report cleanup.
 			return ErrCleanup
@@ -322,4 +332,32 @@ func FixtureWorker() error {
 	}
 	time.Sleep(time.Duration(in.DelayMillis) * time.Millisecond)
 	return json.NewEncoder(os.Stdout).Encode(in)
+}
+
+var (
+	selfBinaryOnce   sync.Once
+	selfBinarySHA256 string
+)
+
+func SelfBinarySHA256() string {
+	selfBinaryOnce.Do(func() {
+		exe, err := os.Executable()
+		if err != nil {
+			return
+		}
+		real, err := filepath.EvalSymlinks(exe)
+		if err != nil {
+			real = exe
+		}
+		f, err := os.Open(real)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err == nil {
+			selfBinarySHA256 = hex.EncodeToString(h.Sum(nil))
+		}
+	})
+	return selfBinarySHA256
 }

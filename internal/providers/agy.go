@@ -36,20 +36,33 @@ func AGYIdentityMatches(modelID, fingerprint string) bool {
 // AGYWorkerIdentityMatches identifies the signed base worker binaries.
 // Profile admission and evidence are checked separately for each version.
 func AGYWorkerIdentityMatches(modelID, fingerprint string) bool {
-	return AGYIdentityMatches(modelID, fingerprint) || modelID == agySyntheticModel && fingerprint == agy154Fingerprint
+	if AGYModelFamily(modelID) == "" {
+		return false
+	}
+	return fingerprint == agy153Fingerprint || fingerprint == agy154Fingerprint
 }
 
 func Family(provider string) string {
 	switch provider {
-	case "agy-headless", "agy-acp", "daniiislo":
+	case "agy", "agy-headless", "agy-acp", "daniiislo":
 		return "agy"
+	case "codex", "codex-cli":
+		return "codex"
+	case "claude", "claude-cli":
+		return "claude"
+	case "opencode":
+		return "opencode"
+	case "acp":
+		return "acp"
+	case "ollama", "local":
+		return "local"
 	default:
 		return provider
 	}
 }
 
 func AllowsHandoff(c model.Capability, t model.Task) bool {
-	return c.AuditValidUntil == nil && t.DataClass == "synthetic" && (c.Mode == "fixture" ||
+	return c.AuditValidUntil == nil && (t.DataClass == "synthetic" || t.DataClass == model.PrivateSourceData) && (c.Mode == "fixture" ||
 		c.Provider == "opencode" && c.Mode == "tool_free" && t.Mode == "read_only" ||
 		c.Provider == "agy" && AllowsAGYProfile(c, t))
 }
@@ -65,10 +78,6 @@ func agyProfiles() []model.ExecutionProfile {
 }
 
 func AllowsAGYProfile(c model.Capability, t model.Task) bool {
-	if c.Fingerprint == agy154Fingerprint && t.ExecutionProfile != model.TrustedLocalProfile &&
-		(t.Mode != "read_only" || t.ExecutionProfile == "review") {
-		return false
-	}
 	name := t.ExecutionProfile
 	if name == "" {
 		switch {
@@ -88,6 +97,22 @@ func AllowsAGYProfile(c model.Capability, t model.Task) bool {
 	return slices.ContainsFunc(c.Profiles, func(p model.ExecutionProfile) bool {
 		return p.Name == name && (p.Status == "verified" || name != "implementation" && p.Status == "preflight_required")
 	})
+}
+
+// AttestAGYAccount resolves the AGY account attestation SHA-256 used by
+// private-source route checks.
+func AttestAGYAccount(ctx context.Context, cfg model.ProviderConfig, dir string) (string, error) {
+	if strings.TrimSpace(cfg.AttestedAccountSHA256) != "" {
+		return strings.TrimSpace(cfg.AttestedAccountSHA256), nil
+	}
+	account := strings.TrimSpace(cfg.AttestedAccount)
+	if account == "" {
+		account = strings.TrimSpace(os.Getenv("AGY_ACCOUNT"))
+	}
+	if account == "" {
+		return "", model.Error("ACCOUNT_ATTESTATION_REQUIRED", "AGY account attestation is required")
+	}
+	return model.Hash([]byte(strings.ToLower(account))), nil
 }
 
 func agyUnverifiedCost() *model.CostEvidence {
@@ -242,7 +267,7 @@ func decodeAGYUsage(stdout []byte, now time.Time) ([]Quota, bool) {
 	seen := map[string]bool{}
 	for _, group := range command.Data.Groups {
 		for _, bucket := range group.Buckets {
-			family, window := agyBucket(bucket.ID)
+			_, family, window := agyBucket(bucket.ID)
 			if family == "" {
 				continue
 			}

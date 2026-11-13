@@ -15,13 +15,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/faoztas/ahenk-mcp/internal/execution"
 	"github.com/faoztas/ahenk-mcp/internal/model"
 	"github.com/faoztas/ahenk-mcp/internal/readiness"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestMain(m *testing.M) {
-	if len(os.Args) > 1 && slices.Contains([]string{"serve", "readiness", "m1-request", "_supervise_fixture", "_fixture_worker"}, os.Args[1]) {
+	if len(os.Args) > 1 && slices.Contains([]string{"serve", "readiness", "m1-request", "_supervise_fixture", "_fixture_worker", "_supervise_go_check"}, os.Args[1]) {
 		main()
 		os.Exit(0)
 	}
@@ -136,14 +137,14 @@ func TestStdioSnapshotAndLifecycle(t *testing.T) {
 	}
 	s := connect()
 	tools, err := s.ListTools(ctx, nil)
-	if err != nil || len(tools.Tools) != 8 {
+	if err != nil || len(tools.Tools) < 8 {
 		t.Fatalf("tool discovery: %+v %v", tools, err)
 	}
 	busy := connect()
-	if got := call(busy, "list_capabilities", nil)["scheduler_status"]; got != "state_busy" {
+	if got := call(busy, "list_capabilities", nil); got["scheduler_status"] != "active" {
 		t.Fatal(got)
 	}
-	if got := call(busy, "list_jobs", nil)["code"]; got != "STATE_BUSY" {
+	if got := call(busy, "list_jobs", nil); got["code"] == "STATE_BUSY" {
 		t.Fatal(got)
 	}
 	if err := busy.Close(); err != nil {
@@ -389,4 +390,490 @@ func TestStdioSnapshotAndLifecycle(t *testing.T) {
 	out = call(s, "delegate_task", req)
 	id = fmt.Sprint(out["job_id"])
 	wait(s, id, model.NotRun, model.TimedOut)
+}
+
+func TestPrivateWorkAdmissionAndLocalRunners(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(root, "private-repo")
+	if err := os.Mkdir(repo, 0700); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("/usr/bin/git", append([]string{"-C", repo, "-c", "user.name=Ahenk Fixture", "-c", "user.email=fixture@example.invalid",
+			"-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"}, args...)...)
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=/var/empty", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("fixture git: %v %s", err, out)
+		}
+	}
+	write := func(p, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(repo, p), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const goMod = "module example.test/privatesample\n\ngo 1.26.2\n"
+	const sampleGo = "package privatesample\n\nfunc Value() string {\n\treturn \"before\"\n}\n"
+	const sampleTest = "package privatesample\n\nimport \"testing\"\n\nfunc TestAfter(t *testing.T) {\n\tif Value() != \"after\" {\n\t\tt.Fatalf(\"want after, got %s\", Value())\n\t}\n}\n"
+	git("init", "-b", "main")
+	write("go.mod", goMod)
+	write("sample.go", sampleGo)
+	write("sample_test.go", sampleTest)
+	git("add", "go.mod", "sample.go", "sample_test.go")
+	git("commit", "-m", "disposable private fixture")
+
+	const readObj = "Summarize sample.go"
+	const patchObj = "Update Value to return after"
+	const reviewObj = "fixture:review-approve"
+	consentTrue := true
+	consentFalse := false
+	binHash := execution.SelfBinarySHA256()
+	policy := &model.PrivateSourcePolicy{
+		OwnerConsent:             &consentTrue,
+		ExpiresAt:                time.Now().Add(time.Hour),
+		WriterIsolationVerified:  true,
+		AllowWrite:               true,
+		RequireIndependentReview: true,
+		GoChecks:                 map[string]string{"unit": "TestAfter"},
+		Files: map[string]string{
+			"go.mod":         model.Hash([]byte(goMod)),
+			"sample.go":      model.Hash([]byte(sampleGo)),
+			"sample_test.go": model.Hash([]byte(sampleTest)),
+		},
+		Briefs: []string{
+			model.PrivateBriefDigest(readObj, []model.Check{{ID: "summary", Description: "Provide a concise summary"}}),
+			model.PrivateBriefDigest(patchObj, []model.Check{{ID: "unit", Description: "Pass TestAfter", CheckID: "unit"}}),
+			model.PrivateBriefDigest(reviewObj, []model.Check{{ID: "reviewed", Description: "Provide structured review"}}),
+		},
+		Routes: []model.PrivateRoute{
+			{Provider: "fixture-a", Model: "synthetic", Fingerprint: binHash, DataHandlingReviewed: true, ExpectedAccount: "owner-session-1"},
+			{Provider: "fixture-b", Model: "synthetic", Fingerprint: binHash, DataHandlingReviewed: true, ExpectedAccount: "owner-session-1"},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	startWith := func(cfg model.Config) (*mcp.ClientSession, func(string, any) map[string]any, func(*mcp.ClientSession, string, ...string) map[string]any) {
+		t.Helper()
+		if err := os.MkdirAll(cfg.StateDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		cfgPath := filepath.Join(root, fmt.Sprintf("config-%d.json", time.Now().UnixNano()))
+		b, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cfgPath, b, 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(os.Args[0], "serve", "--stdio", "--config", cfgPath)
+		cmd.Stderr = os.Stderr
+		c := mcp.NewClient(&mcp.Implementation{Name: "ahenk-private-fixture", Version: "1.0"}, nil)
+		s, err := c.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { s.Close() })
+		call := func(tool string, in any) map[string]any {
+			t.Helper()
+			res, err := s.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: in})
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, ok := res.StructuredContent.(map[string]any)
+			if !ok {
+				t.Fatalf("%s response: %+v", tool, res)
+			}
+			return out
+		}
+		wait := func(s *mcp.ClientSession, id string, wanted ...string) map[string]any {
+			t.Helper()
+			var out map[string]any
+			for until := time.Now().Add(30 * time.Second); time.Now().Before(until); time.Sleep(40 * time.Millisecond) {
+				out = call("get_job_status", map[string]string{"job_id": id})
+				status, _ := out["status"].(string)
+				if slices.Contains(wanted, status) {
+					return out
+				}
+				if model.Terminal(status) {
+					t.Fatalf("unexpected terminal status: %+v", out)
+				}
+			}
+			t.Fatalf("job did not reach %v: %+v", wanted, out)
+			return nil
+		}
+		return s, call, wait
+	}
+
+	baseCfg := model.Config{
+		StateDir:      filepath.Join(root, "state-1"),
+		EnableFixture: true,
+		Providers: []model.ProviderConfig{
+			{ID: "fixture-a", AttestedAccount: "owner-session-1"},
+			{ID: "fixture-b", AttestedAccount: "owner-session-1"},
+		},
+		Repositories: map[string]model.Repo{
+			"priv": {
+				Root:          repo,
+				AllowedPaths:  []string{"go.mod", "sample.go", "sample_test.go", "unapproved.go"},
+				Providers:     []string{"fixture-a", "fixture-b"},
+				Limits:        model.ProjectLimits{RequireIndependentReview: true},
+				PrivateSource: policy,
+			},
+		},
+	}
+	s, call, wait := startWith(baseCfg)
+
+	// 1. Capabilities include version, binary_sha256, and local_runners (xcode-scheme unavailable by default).
+	caps := call("list_capabilities", map[string]string{"repo_id": "priv"})
+	if caps["version"] == "" || caps["binary_sha256"] != binHash {
+		t.Fatalf("unexpected capability identity: %+v", caps)
+	}
+	runners := caps["local_runners"].([]any)
+	foundXcode := false
+	for _, item := range runners {
+		r := item.(map[string]any)
+		if r["runner"] == "xcode-scheme" {
+			foundXcode = true
+			if r["status"] != "unavailable" || r["reason"] != "XCODE_SCHEME_RUNNER_UNVERIFIED" {
+				t.Fatalf("expected unverified xcode-scheme runner to be unavailable, got %+v", r)
+			}
+		}
+	}
+	if !foundXcode {
+		t.Fatalf("missing xcode-scheme runner capability: %+v", runners)
+	}
+	adm := caps["repo_admission"].(map[string]any)
+	if adm["registered"] != true || adm["read_only_admitted"] != true || adm["write_admitted"] != true {
+		t.Fatalf("expected priv repo admission to be ready, got %+v", adm)
+	}
+
+	// 2. Unregistered repo preflight returns REPO_NOT_REGISTERED with gate and next_action.
+	unregCaps := call("list_capabilities", map[string]string{"repo_id": "yarinlik"})
+	if unregCaps["code"] != "REPO_NOT_REGISTERED" || unregCaps["gate"] != "REPO_NOT_REGISTERED" || unregCaps["next_action"] != "register_repository_in_config" {
+		t.Fatalf("expected unregistered repo admission failure, got %+v", unregCaps)
+	}
+	readTask := model.Task{
+		Objective:     readObj,
+		Acceptance:    []model.Check{{ID: "summary", Description: "Provide a concise summary"}},
+		AllowedPaths:  []string{"sample.go"},
+		Mode:          "read_only",
+		DataClass:     model.PrivateSourceData,
+		WorkspaceMode: "head_only",
+	}
+	unregDel := call("delegate_task", model.Submission{RepoID: "yarinlik", RequestID: "unreg", Task: readTask})
+	if unregDel["code"] != "REPO_NOT_REGISTERED" || unregDel["gate"] != "REPO_NOT_REGISTERED" || unregDel["next_action"] != "register_repository_in_config" {
+		t.Fatalf("expected REPO_NOT_REGISTERED gate on delegate_task, got %+v", unregDel)
+	}
+
+	// 3. Rejections before dispatch when policy gates are unmet.
+	unapprovedBrief := readTask
+	unapprovedBrief.Objective = "Unapproved brief text"
+	if got := call("delegate_task", model.Submission{RepoID: "priv", RequestID: "bad-brief", Task: unapprovedBrief}); got["code"] != "POLICY_DENIED" || got["gate"] != "BRIEF_NOT_APPROVED" {
+		t.Fatalf("expected BRIEF_NOT_APPROVED, got %+v", got)
+	}
+	unapprovedPath := readTask
+	unapprovedPath.AllowedPaths = []string{"unapproved.go"}
+	if got := call("delegate_task", model.Submission{RepoID: "priv", RequestID: "bad-path", Task: unapprovedPath}); got["code"] != "POLICY_DENIED" || got["gate"] != "PATH_NOT_APPROVED" {
+		t.Fatalf("expected PATH_NOT_APPROVED, got %+v", got)
+	}
+	withPersonal := readTask
+	withPersonal.Objective = "Contact user@yarinlik.com for details"
+	if got := call("delegate_task", model.Submission{RepoID: "priv", RequestID: "pii", Task: withPersonal}); got["code"] != "POLICY_DENIED" || got["gate"] != "PERSONAL_DATA_CLASSIFIED" {
+		t.Fatalf("expected PERSONAL_DATA_CLASSIFIED, got %+v", got)
+	}
+
+	// 4. Approved read-only private task succeeds and binds grant_digest and snapshot_id.
+	readID := call("delegate_task", model.Submission{RepoID: "priv", RequestID: "priv-read-ok", Task: readTask})["job_id"].(string)
+	wait(s, readID, model.Completed)
+	readRes := call("get_job_result", map[string]string{"job_id": readID})["result"].(map[string]any)
+	if readRes["grant_digest"] != model.Digest(policy) || readRes["snapshot_id"] == "" {
+		t.Fatalf("expected bound grant_digest and snapshot_id, got %+v", readRes)
+	}
+
+	// 5. Approved private write batch in disposable Go repo runs patch + TestAfter + independent review.
+	patchTask := model.Task{
+		Objective:        patchObj,
+		Acceptance:       []model.Check{{ID: "unit", Description: "Pass TestAfter", CheckID: "unit"}},
+		AllowedPaths:     []string{"go.mod", "sample.go", "sample_test.go"},
+		Mode:             "patch",
+		DataClass:        model.PrivateSourceData,
+		ExecutionProfile: "implementation",
+	}
+	revTask := model.Task{
+		Objective:        reviewObj,
+		Acceptance:       []model.Check{{ID: "reviewed", Description: "Provide structured review"}},
+		AllowedPaths:     []string{"go.mod", "sample.go", "sample_test.go"},
+		Mode:             "read_only",
+		DataClass:        model.PrivateSourceData,
+		ExecutionProfile: "review",
+	}
+	privBatch := model.Batch{
+		RepoID:        "priv",
+		RequestID:     "priv-write-batch",
+		Independence:  "distinct_provider",
+		WorkspaceMode: "head_only",
+		Items: []model.Item{
+			{Key: "implement", Task: patchTask},
+			{Key: "review", Task: revTask, DependsOn: []string{"implement"}, HandoffFrom: []model.HandoffFrom{{Key: "implement", Kind: "diff"}}},
+		},
+	}
+	batchID := call("delegate_batch", privBatch)["job_id"].(string)
+	batchStatus := wait(s, batchID, model.Completed)
+	children := batchStatus["children"].([]any)
+	implID, revID := children[0].(string), children[1].(string)
+	implRes := call("get_job_result", map[string]string{"job_id": implID})["result"].(map[string]any)
+	revRes := call("get_job_result", map[string]string{"job_id": revID})["result"].(map[string]any)
+	revVerdict := revRes["review"].(map[string]any)
+	if implRes["grant_digest"] != model.Digest(policy) || implRes["artifact_sha256"] == "" ||
+		revVerdict["verdict"] != "APPROVED" || revVerdict["artifact_sha256"] != implRes["artifact_sha256"] ||
+		revVerdict["deterministic_check_status"] != "PASSED" {
+		t.Fatalf("private write batch did not complete with verified check and independent review: impl=%+v rev=%+v", implRes, revRes)
+	}
+	if onDisk, err := os.ReadFile(filepath.Join(repo, "sample.go")); err != nil || string(onDisk) != sampleGo {
+		t.Fatalf("source repository was mutated by private write task: %q %v", onDisk, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 6. Verify owner_consent=false, unattested account, and verified xcode-scheme runner advertisement.
+	noConsentPolicy := *policy
+	noConsentPolicy.OwnerConsent = &consentFalse
+	cfg2 := model.Config{
+		StateDir:         filepath.Join(root, "state-2"),
+		EnableFixture:    true,
+		LocalXcodeRunner: &model.XcodeSchemeRunnerConfig{Verified: true, Schemes: []string{"YarinlikApp"}},
+		Providers: []model.ProviderConfig{
+			{ID: "fixture-a", AttestedAccount: "owner-session-1"},
+		},
+		Repositories: map[string]model.Repo{
+			"priv-no-consent": {
+				Root: repo, AllowedPaths: []string{"go.mod", "sample.go", "sample_test.go"}, Providers: []string{"fixture-a", "fixture-b"},
+				Limits: model.ProjectLimits{RequireIndependentReview: true}, PrivateSource: &noConsentPolicy,
+			},
+		},
+	}
+	s2, call2, _ := startWith(cfg2)
+	caps2 := call2("list_capabilities", map[string]string{"repo_id": "priv-no-consent"})
+	for _, item := range caps2["local_runners"].([]any) {
+		r := item.(map[string]any)
+		if r["runner"] == "xcode-scheme" && r["status"] != "available" {
+			t.Fatalf("expected verified xcode-scheme runner to be available, got %+v", r)
+		}
+	}
+	if got := call2("delegate_task", model.Submission{RepoID: "priv-no-consent", RequestID: "no-consent", Task: readTask}); got["code"] != "POLICY_DENIED" || got["gate"] != "OWNER_CONSENT_REQUIRED" {
+		t.Fatalf("expected OWNER_CONSENT_REQUIRED, got %+v", got)
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg3 := model.Config{
+		StateDir:      filepath.Join(root, "state-3"),
+		EnableFixture: true,
+		Providers: []model.ProviderConfig{
+			{ID: "fixture-a", AttestedAccount: ""},
+			{ID: "fixture-b", AttestedAccount: ""},
+		},
+		Repositories: map[string]model.Repo{
+			"priv-unattested": {
+				Root: repo, AllowedPaths: []string{"go.mod", "sample.go", "sample_test.go"}, Providers: []string{"fixture-a", "fixture-b"},
+				Limits: model.ProjectLimits{RequireIndependentReview: true}, PrivateSource: policy,
+			},
+		},
+	}
+	s3, call3, wait3 := startWith(cfg3)
+	unattestedID := call3("delegate_task", model.Submission{RepoID: "priv-unattested", RequestID: "unattested", Task: readTask})["job_id"].(string)
+	if got := wait3(s3, unattestedID, model.Blocked); got["reason_code"] != "ACCOUNT_ATTESTATION_REQUIRED" || got["attempt_count"] != float64(0) {
+		t.Fatalf("expected ACCOUNT_ATTESTATION_REQUIRED without provider dispatch, got %+v", got)
+	}
+}
+
+func TestStdioUniversalSubagentSingleTask(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(root, "repo")
+	if err := os.Mkdir(repo, 0700); err != nil {
+		t.Fatal(err)
+	}
+	gitAt := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("/usr/bin/git", append([]string{"-C", dir, "-c", "user.name=Ahenk Fixture", "-c", "user.email=fixture@example.invalid",
+			"-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"}, args...)...)
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=/var/empty", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("fixture git: %v %s", err, out)
+		}
+	}
+	gitAt(repo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "fixture.txt"), []byte("before\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(repo, "add", "fixture.txt")
+	gitAt(repo, "commit", "-m", "init")
+
+	stateDir := filepath.Join(root, "state")
+	cfgPath := filepath.Join(root, "config.json")
+	b, err := json.Marshal(model.Config{
+		StateDir:      stateDir,
+		EnableFixture: true,
+		Repositories: map[string]model.Repo{
+			"demo": {Root: repo, AllowedPaths: []string{"fixture.txt"}, Providers: []string{"fixture-a"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	cmd := exec.Command(os.Args[0], "serve", "--stdio", "--config", cfgPath)
+	cmd.Stderr = os.Stderr
+	c := mcp.NewClient(&mcp.Implementation{Name: "ahenk-universal-tester", Version: "1.0"}, nil)
+	s, err := c.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	// 1. Single-task with only task field and execution_mode: "async"
+	res, err := s.CallTool(ctx, &mcp.CallToolParams{
+		Name: "delegate_task",
+		Arguments: map[string]any{
+			"task":           "Fix fixture issue",
+			"repo_id":        "demo",
+			"execution_mode": "async",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, ok := res.StructuredContent.(map[string]any)
+	if !ok || out["job_id"] == nil {
+		t.Fatalf("expected job_id returned, got %+v", res)
+	}
+
+	// 2. Auto-repo registration when repo_id is omitted (using cwd)
+	resAuto, err := s.CallTool(ctx, &mcp.CallToolParams{
+		Name: "delegate_task",
+		Arguments: map[string]any{
+			"task":           "Auto repo test",
+			"cwd":            repo,
+			"execution_mode": "async",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outAuto, ok := resAuto.StructuredContent.(map[string]any)
+	if !ok || outAuto["job_id"] == nil {
+		t.Fatalf("expected job_id from auto-repo delegation, got %+v", resAuto)
+	}
+}
+
+func TestStdioWaitJobsParallel(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(root, "repo")
+	if err := os.Mkdir(repo, 0700); err != nil {
+		t.Fatal(err)
+	}
+	gitAt := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("/usr/bin/git", append([]string{"-C", dir, "-c", "user.name=Ahenk Fixture", "-c", "user.email=fixture@example.invalid",
+			"-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"}, args...)...)
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=/var/empty", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("fixture git: %v %s", err, out)
+		}
+	}
+	gitAt(repo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "fixture.txt"), []byte("before\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(repo, "add", "fixture.txt")
+	gitAt(repo, "commit", "-m", "init")
+
+	stateDir := filepath.Join(root, "state")
+	cfgPath := filepath.Join(root, "config.json")
+	b, err := json.Marshal(model.Config{
+		StateDir:      stateDir,
+		EnableFixture: true,
+		Repositories: map[string]model.Repo{
+			"demo": {Root: repo, AllowedPaths: []string{"fixture.txt"}, Providers: []string{"fixture-a"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	cmd := exec.Command(os.Args[0], "serve", "--stdio", "--config", cfgPath)
+	cmd.Stderr = os.Stderr
+	c := mcp.NewClient(&mcp.Implementation{Name: "ahenk-parallel-tester", Version: "1.0"}, nil)
+	s, err := c.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	res1, err := s.CallTool(ctx, &mcp.CallToolParams{
+		Name: "delegate_task",
+		Arguments: map[string]any{
+			"task":           "Parallel task 1",
+			"repo_id":        "demo",
+			"execution_mode": "async",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id1 := res1.StructuredContent.(map[string]any)["job_id"].(string)
+
+	res2, err := s.CallTool(ctx, &mcp.CallToolParams{
+		Name: "delegate_task",
+		Arguments: map[string]any{
+			"task":           "Parallel task 2",
+			"repo_id":        "demo",
+			"execution_mode": "async",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2 := res2.StructuredContent.(map[string]any)["job_id"].(string)
+
+	waitRes, err := s.CallTool(ctx, &mcp.CallToolParams{
+		Name: "wait_jobs",
+		Arguments: map[string]any{
+			"job_ids":         []string{id1, id2},
+			"mode":            "all",
+			"timeout_seconds": 15,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitOut := waitRes.StructuredContent.(map[string]any)
+	if waitOut["jobs"] == nil {
+		t.Fatalf("expected jobs list, got %+v", waitOut)
+	}
 }

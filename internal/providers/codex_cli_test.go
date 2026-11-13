@@ -51,6 +51,41 @@ func TestCodexCLIArgs_SandboxModes(t *testing.T) {
 	}
 }
 
+func TestCodexCLIArgs_EffortValidation(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"empty defaults to medium", "", "medium"},
+		{"low allowed", "low", "low"},
+		{"medium allowed", "medium", "medium"},
+		{"high allowed", "high", "high"},
+		{"xhigh allowed", "xhigh", "xhigh"},
+		{"case insensitive and trimmed", "  HIGH  ", "high"},
+		{"command injection fallback", `medium" -c malicious="1`, "medium"},
+		{"unsupported effort fallback", "ultra_max", "medium"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			args, err := BuildCodexArgs("gpt-5-sol", tc.input, SandboxModeWorkspaceWrite, "/tmp/work")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			expectedFlag := `model_reasoning_effort="` + tc.expected + `"`
+			joined := strings.Join(args, " ")
+			if !strings.Contains(joined, expectedFlag) {
+				t.Errorf("expected %q in args, got: %s", expectedFlag, joined)
+			}
+			if strings.Contains(tc.input, "malicious") && strings.Contains(joined, "malicious") {
+				t.Errorf("injection payload leaked into args: %s", joined)
+			}
+		})
+	}
+}
+
+
 func TestRunCodexCLI_Success(t *testing.T) {
 	tempDir := t.TempDir()
 	mockBin := filepath.Join(tempDir, "mock_codex")
@@ -226,3 +261,30 @@ exit 0
 		t.Errorf("expected '--full-auto' in args: %s", rwArgs)
 	}
 }
+
+func TestRunCodexCLI_OverloadedError_HTTP529(t *testing.T) {
+	tempDir := t.TempDir()
+	mockBin := filepath.Join(tempDir, "mock_codex_529")
+	script := `#!/bin/sh
+echo '{"type":"thread.started","thread_id":"sess-codex-529"}'
+echo '{"type":"turn.failed","error":{"message":"server is overloaded (HTTP 529): please retry later"}}'
+exit 1
+`
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock binary: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := RunCodexCLI(ctx, tempDir, "gpt-5-sol", "high", "Heavy task", SandboxModeWorkspaceWrite, mockBin)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var fault *model.Fault
+	if !errors.As(err, &fault) || fault.Code != "RATE_LIMIT" {
+		t.Fatalf("expected RATE_LIMIT fault for overloaded 529 error, got %v", err)
+	}
+}
+

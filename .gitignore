@@ -19,9 +19,10 @@ coverage.html
 # Local workspace and state files
 /.ahenk/
 /.local/
-/.codex/config.toml
+/.codex/
 /ahenk.json
 /ahenk.local.json
+/opencode.json
 /state/
 *.db
 *.db-*
@@ -71,3 +72,15 @@ auth.json
 *.swp
 *.swo
 *~
+
+# Project-local development tools, indexes, and workflow drafts
+/.serena/
+/.codegraph/
+/.ctxo/
+.ctxo/.cache/
+/.agents/vendor/
+/.agents/frameworks.lock.json
+/.agents/skills/ahenk-bmad/
+/.agents/skills/ahenk-superpowers/
+/_bmad/
+/_bmad-output/

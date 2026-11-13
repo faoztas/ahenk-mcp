@@ -19,8 +19,8 @@ import (
 )
 
 // BuildClaudeArgs constructs the command-line arguments for the Claude CLI subprocess.
-func BuildClaudeArgs(modelID string, prompt string, sandbox SandboxMode) []string {
-	args := []string{"-p", prompt, "--output-format", "json"}
+func BuildClaudeArgs(modelID string, _ string, sandbox SandboxMode) []string {
+	args := []string{"--output-format", "json"}
 	if modelID != "" {
 		args = append(args, "--model", modelID)
 	}
@@ -59,6 +59,10 @@ func RunClaudeCLI(ctx context.Context, worktreeDir string, modelID string, promp
 	cmd.Env = claudeEnv(os.Environ(), worktreeDir, 0, 1)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
+	if prompt != "" {
+		cmd.Stdin = strings.NewReader(prompt)
+	}
+
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, model.Error("CLAUDE_LAUNCH_FAILED", err.Error())
@@ -90,11 +94,15 @@ func RunClaudeCLI(ctx context.Context, worktreeDir string, modelID string, promp
 
 	select {
 	case <-ctx.Done():
-		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		if pgid > 1 {
+			_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		}
 		select {
 		case <-waitDone:
 		case <-time.After(3 * time.Second):
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			if pgid > 1 {
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			}
 			<-waitDone
 		}
 		return nil, ctx.Err()

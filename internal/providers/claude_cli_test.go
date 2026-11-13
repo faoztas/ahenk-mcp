@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -43,8 +44,8 @@ func TestClaudeCLIArgs(t *testing.T) {
 	if !strings.Contains(joined, "--output-format json") {
 		t.Errorf("output-format flag missing: %s", joined)
 	}
-	if !strings.Contains(joined, "-p Refactor parsing logic") {
-		t.Errorf("prompt flag missing or incorrect: %s", joined)
+	if slices.Contains(args, "-p") || strings.Contains(joined, "Refactor parsing logic") {
+		t.Errorf("prompt should not be passed in CLI args (use stdin instead): %s", joined)
 	}
 
 	// 2. Read-only mode
@@ -371,3 +372,45 @@ exit 0
 		t.Errorf("expected '--disallowedTools Bash,WebFetch,WebSearch,NotebookEdit' in args: %s", rwArgs)
 	}
 }
+
+func TestRunClaudeCLI_StdinPromptPassed(t *testing.T) {
+	tempDir := t.TempDir()
+	stdinLog := filepath.Join(tempDir, "stdin.log")
+	mockBin := filepath.Join(tempDir, "mock_claude_stdin")
+	script := `#!/bin/sh
+cat > "` + stdinLog + `"
+cat << 'EOF'
+{
+  "session_id": "sess-stdin-1",
+  "result": "success",
+  "subtype": "success",
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 10
+  }
+}
+EOF
+exit 0
+`
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock binary: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	testPrompt := "Secure prompt passed via stdin to avoid ARG_MAX and ps snooping"
+	_, err := RunClaudeCLI(ctx, tempDir, "claude-3-7-sonnet", testPrompt, SandboxModeWorkspaceWrite, mockBin)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	content, err := os.ReadFile(stdinLog)
+	if err != nil {
+		t.Fatalf("failed to read stdin log: %v", err)
+	}
+	if string(content) != testPrompt {
+		t.Errorf("expected prompt in stdin, got: %q", string(content))
+	}
+}
+

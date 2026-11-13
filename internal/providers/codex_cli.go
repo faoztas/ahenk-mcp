@@ -21,7 +21,7 @@ import (
 type SandboxMode string
 
 const (
-	SandboxModeReadOnly      SandboxMode = "read-only"
+	SandboxModeReadOnly       SandboxMode = "read-only"
 	SandboxModeWorkspaceWrite SandboxMode = "workspace-write"
 )
 
@@ -62,11 +62,24 @@ type CLIRunResult struct {
 	RawEvents    []CodexJSONLEvent
 }
 
+var allowedCodexEfforts = map[string]bool{
+	"low":    true,
+	"medium": true,
+	"high":   true,
+	"xhigh":  true,
+}
+
+func sanitizeCodexEffort(effort string) string {
+	normalized := strings.ToLower(strings.TrimSpace(effort))
+	if allowedCodexEfforts[normalized] {
+		return normalized
+	}
+	return "medium"
+}
+
 // BuildCodexArgs constructs the CLI argument list based on model, effort, sandbox mode, and work directory.
 func BuildCodexArgs(modelID, effort string, sandbox SandboxMode, work string) ([]string, error) {
-	if effort == "" {
-		effort = "medium"
-	}
+	effort = sanitizeCodexEffort(effort)
 	args := []string{"exec", "--json", "--ephemeral", "--skip-git-repo-check"}
 	if sandbox == SandboxModeReadOnly {
 		args = append(args, "--sandbox", "read-only")
@@ -190,7 +203,7 @@ func RunCodexCLI(ctx context.Context, worktreeDir string, modelID string, effort
 					msg = ev.Message
 				}
 				low := strings.ToLower(msg)
-				if strings.Contains(low, "429") || strings.Contains(low, "rate limit") || strings.Contains(low, "usage_limit") {
+				if strings.Contains(low, "429") || strings.Contains(low, "529") || strings.Contains(low, "overloaded") || strings.Contains(low, "rate limit") || strings.Contains(low, "rate_limit") || strings.Contains(low, "usage_limit") {
 					streamErr = model.Error("RATE_LIMIT", "RATE_LIMIT: "+msg)
 				} else if strings.Contains(low, "401") || strings.Contains(low, "unauthorized") || strings.Contains(low, "not logged in") {
 					streamErr = model.Error("AUTH_REQUIRED", msg)
@@ -209,11 +222,15 @@ func RunCodexCLI(ctx context.Context, worktreeDir string, modelID string, effort
 
 	select {
 	case <-ctx.Done():
-		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		if pgid > 1 {
+			_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		}
 		select {
 		case <-waitDone:
 		case <-time.After(3 * time.Second):
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			if pgid > 1 {
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			}
 			<-waitDone
 		}
 		return nil, ctx.Err()
@@ -228,7 +245,7 @@ func RunCodexCLI(ctx context.Context, worktreeDir string, modelID string, effort
 				msg = waitErr.Error()
 			}
 			low := strings.ToLower(msg)
-			if strings.Contains(low, "429") || strings.Contains(low, "rate limit") || strings.Contains(low, "usage_limit") {
+			if strings.Contains(low, "429") || strings.Contains(low, "529") || strings.Contains(low, "overloaded") || strings.Contains(low, "rate limit") || strings.Contains(low, "rate_limit") || strings.Contains(low, "usage_limit") {
 				return nil, model.Error("RATE_LIMIT", "RATE_LIMIT: "+msg)
 			}
 			return nil, model.Error("EXECUTION_FAILED", msg)
@@ -294,7 +311,7 @@ func ParseCodexJSONL(data []byte) (model.CLIRunEvidence, error) {
 				msg = m
 			}
 			low := strings.ToLower(msg)
-			if strings.Contains(low, "429") || strings.Contains(low, "rate limit") || strings.Contains(low, "usage_limit") {
+			if strings.Contains(low, "429") || strings.Contains(low, "529") || strings.Contains(low, "overloaded") || strings.Contains(low, "rate limit") || strings.Contains(low, "rate_limit") || strings.Contains(low, "usage_limit") {
 				return ev, model.Error("RATE_LIMIT", "RATE_LIMIT: "+msg)
 			}
 			if strings.Contains(low, "401") || strings.Contains(low, "unauthorized") || strings.Contains(low, "not logged in") {

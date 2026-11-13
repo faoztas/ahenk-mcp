@@ -157,7 +157,7 @@ func nativeWriterCompletion(messages []openCodeNativeMessage, messageID, id, pro
 		switch {
 		case msg.Type == "user" && input == nil && msg.ID == messageID && msg.Text == prompt:
 			input = msg
-		case msg.Type == "assistant" && msg.Agent == openCodeNativeAgent && msg.Model.matches(id):
+		case msg.Type == "assistant" && msg.Agent == openCodeNativeAgent && msg.Model.matches(id, ""):
 			answers = append(answers, msg)
 		case msg.Type == "idle" && idle == nil:
 			idle = msg

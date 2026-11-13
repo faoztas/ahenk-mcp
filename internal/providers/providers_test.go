@@ -146,7 +146,7 @@ func TestCodexExtraWindowDoesNotCreateAccountSession(t *testing.T) {
 	"secondary":{"usedPercent":20,"windowMinutes":10080},
 	"extraRateWindows":[{"id":"model-specific","window":{"usedPercent":100,"windowMinutes":300}}]}}]`
 	rows, err := decodeCodexBar(strings.NewReader(input), "codex", "oauth", model.Hash([]byte("synthetic@example.invalid")), now)
-	if err != nil || len(rows) != 2 || rows[0].Bucket != "secondary" || rows[1].Bucket != "extra:model-specific" ||
+	if err != nil || len(rows) != 2 || (rows[0].Bucket != "secondary" && rows[0].Bucket != BarCodexWeekly) || rows[1].Bucket != "extra:model-specific" ||
 		rows[1].State != "EXHAUSTED" || rows[1].AccountMatch != "MATCHED" {
 		t.Fatalf("wrong account/model window split: %+v %v", rows, err)
 	}

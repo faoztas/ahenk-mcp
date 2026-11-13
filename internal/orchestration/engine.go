@@ -169,25 +169,11 @@ func (e *Engine) IsExecutable(provider string) bool {
 		return false
 	}
 	norm := normalizeProvider(provider)
-	hasCandidate := false
 	for _, c := range e.reg.Candidates {
 		if normalizeProvider(c.Provider) == norm {
-			hasCandidate = true
 			if c.Status == "available" {
 				return true
 			}
-		}
-	}
-	if hasCandidate && (norm == "codex" || norm == "claude") {
-		for _, p := range e.cfg.Providers {
-			if normalizeProvider(p.ID) == norm && p.Path != "" {
-				if _, err := os.Stat(p.Path); err == nil {
-					return true
-				}
-			}
-		}
-		if _, err := exec.LookPath(norm); err == nil {
-			return true
 		}
 	}
 	return false
@@ -197,10 +183,12 @@ func (e *Engine) persist(j model.Job) {
 	if e.fatal != nil {
 		return
 	}
-	if err := e.db.Save(j); err != nil {
-		e.fatal = err
-		e.stop()
-		return
+	if e.db != nil {
+		if err := e.db.Save(j); err != nil {
+			e.fatal = err
+			e.stop()
+			return
+		}
 	}
 	if model.Terminal(j.Status) && j.ID != "" && e.db != nil {
 		status := "FAILED"
@@ -208,9 +196,15 @@ func (e *Engine) persist(j model.Job) {
 			status = "SUCCESS"
 		}
 		latency := time.Since(j.CreatedAt).Milliseconds()
-		_ = e.db.UpdateRoutingAuditStatus(j.ID, status, latency)
+		attemptNumber := len(j.Attempts)
+		if attemptNumber == 0 {
+			attemptNumber = 1
+		}
+		_ = e.db.UpdateRoutingAuditStatus(j.ID, attemptNumber, status, latency)
 	}
-	e.jobs[j.ID] = j
+	if e.jobs != nil {
+		e.jobs[j.ID] = j
+	}
 	if e.jobCond != nil {
 		e.jobCond.Broadcast()
 	}
@@ -1662,6 +1656,15 @@ func (e *Engine) route(j *model.Job, now time.Time) (model.Capability, time.Dura
 			d.HeadroomPercent, d.HeadroomState = 100, headroomHealthy
 		}
 		if reason != "" {
+			if e.cb != nil && allowedProviders[c.Provider] {
+				hasOtherOption := slices.ContainsFunc(options, func(opt candidate) bool {
+					return opt.capability.Provider == c.Provider
+				})
+				if !hasOtherOption {
+					e.cb.Release(c.Provider)
+					delete(allowedProviders, c.Provider)
+				}
+			}
 			d.Reason = reason
 			j.Route = append(j.Route, d)
 			continue
@@ -1711,6 +1714,18 @@ func (e *Engine) route(j *model.Job, now time.Time) (model.Capability, time.Dura
 		if fallbackCheap {
 			for i := range options {
 				options[i].decision.WarningCodes = append(options[i].decision.WarningCodes, "FALLBACK_TO_CHEAP_TIER")
+			}
+		}
+		if e.cb != nil {
+			for p := range allowedProviders {
+				normP := normalizeProvider(p)
+				hasOpt := slices.ContainsFunc(options, func(opt candidate) bool {
+					return normalizeProvider(opt.capability.Provider) == normP
+				})
+				if !hasOpt {
+					e.cb.Release(p)
+					delete(allowedProviders, p)
+				}
 			}
 		}
 	}
@@ -1922,6 +1937,12 @@ func faultCode(err error) string {
 func (e *Engine) finish(ctx context.Context, j model.Job, err error) {
 	code := faultCode(err)
 	j.Status, j.Reason = model.Failed, code
+	if e.cb != nil && len(j.Attempts) > 0 {
+		last := j.Attempts[len(j.Attempts)-1]
+		if last.Provider != "" && (code != "RATE_LIMIT" || last.Provider == "opencode") {
+			e.cb.Release(last.Provider)
+		}
+	}
 	var fault *model.Fault
 	if errors.As(err, &fault) && fault.Gate != "" && code == "POLICY_DENIED" {
 		j.Reason = fault.Gate
@@ -1929,9 +1950,9 @@ func (e *Engine) finish(ctx context.Context, j model.Job, err error) {
 	switch {
 	case code == "CLEANUP_UNCONFIRMED":
 		j.Status = model.Blocked
-	case e.jobs[j.ID].Status == model.Cancelling:
+	case e.jobs != nil && e.jobs[j.ID].Status == model.Cancelling:
 		j.Status, j.Reason = model.Cancelled, "CLIENT_CANCELLED"
-	case e.closed || e.ctx.Err() != nil:
+	case e.closed || (e.ctx != nil && e.ctx.Err() != nil):
 		j.Status, j.Reason = model.Paused, "OWNER_DISCONNECTED"
 	case !time.Now().Before(j.DeadlineAt) || errors.Is(ctx.Err(), context.DeadlineExceeded):
 		j.Status, j.Reason = model.TimedOut, "DEADLINE_EXPIRED"

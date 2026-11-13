@@ -17,12 +17,12 @@ func validateReviews(batch model.Batch, keys map[string]int) error {
 			continue
 		}
 		if batch.Independence != "distinct_provider" || item.Mode != "read_only" ||
-			item.DataClass != "synthetic" || len(item.HandoffFrom) != 1 || item.HandoffFrom[0].Kind != "diff" {
+			(item.DataClass != "synthetic" && item.DataClass != model.PrivateSourceData) || len(item.HandoffFrom) != 1 || item.HandoffFrom[0].Kind != "diff" {
 			return model.Error("INVALID_INPUT", "independent review requires one verified diff and a distinct provider")
 		}
 		source, ok := keys[item.HandoffFrom[0].Key]
-		if !ok || batch.Items[source].Mode != "patch" || batch.Items[source].DataClass != "synthetic" {
-			return model.Error("INVALID_INPUT", "independent review requires a synthetic patch dependency")
+		if !ok || batch.Items[source].Mode != "patch" || batch.Items[source].DataClass != item.DataClass {
+			return model.Error("INVALID_INPUT", "independent review requires a matching patch dependency")
 		}
 	}
 	return nil
@@ -92,7 +92,7 @@ func reviewCheckStatus(source model.Job) string {
 	if required {
 		return "PASSED"
 	}
-	if source.Task.Risk == "critical" || source.Task.ExecutionProfile == model.TrustedLocalProfile {
+	if source.Task.Risk == "critical" || source.Task.ExecutionProfile == model.TrustedLocalProfile || source.Task.DataClass == model.PrivateSourceData {
 		return model.Failed
 	}
 	return model.NotRun

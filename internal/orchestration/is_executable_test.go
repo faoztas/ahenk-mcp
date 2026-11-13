@@ -72,4 +72,25 @@ func TestIsExecutable(t *testing.T) {
 	if missingEngine.IsExecutable("claude") {
 		t.Error("expected IsExecutable('claude') to be false with non-existent binary")
 	}
+
+	// 3. Admission security check: even if binary exists on disk, if Registry candidate is not "available", IsExecutable MUST return false
+	unadmittedCfg := model.Config{
+		Providers: []model.ProviderConfig{
+			{ID: "codex", Path: codexBin, Model: "gpt-6.1-sol"},
+		},
+	}
+	unadmittedReg := providers.Registry{
+		Candidates: []model.Capability{
+			{
+				Provider: "codex",
+				Model:    "gpt-6.1-sol",
+				Status:   "disabled", // Not available (failed fingerprinting or security policy)
+			},
+		},
+	}
+	unadmittedEngine := &Engine{cfg: unadmittedCfg, reg: unadmittedReg}
+	if unadmittedEngine.IsExecutable("codex") {
+		t.Error("expected IsExecutable('codex') to be false when Registry candidate is not available, even if binary exists on disk")
+	}
 }
+

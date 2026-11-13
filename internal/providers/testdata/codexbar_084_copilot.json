@@ -1,0 +1,1 @@
+[{"provider":"copilot","source":"oauth","usage":{"updatedAt":"2026-11-12T09:40:00Z","identity":{"providerID":"copilot","accountEmail":"fixture@example.invalid"},"primary":{"windowMinutes":43200,"usedPercent":100,"resetsAt":"2026-12-01T00:00:00Z"}}}]

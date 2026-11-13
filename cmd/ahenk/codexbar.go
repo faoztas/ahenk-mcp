@@ -41,5 +41,5 @@ func probeCodexBar(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return json.NewEncoder(os.Stdout).Encode(providers.ReadCodexBar(ctx, *provider, agy, cfg.CodexBarAccountSHA256[*provider]))
+	return json.NewEncoder(os.Stdout).Encode(providers.ReadCodexBar(ctx, *provider, agy, cfg.CodexBarAccountSHA256[*provider], cfg.CodexBarBinarySHA256))
 }

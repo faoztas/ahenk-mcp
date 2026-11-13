@@ -1,0 +1,6 @@
+[{"provider":"antigravity","source":"app","usage":{"updatedAt":"2026-11-12T09:40:00Z","dataConfidence":"exact","identity":{"providerID":"antigravity","accountEmail":"fixture@example.invalid"},"extraRateWindows":[
+{"id":"antigravity-quota-summary-gemini-5h","window":{"windowMinutes":300,"usedPercent":92.8,"resetsAt":"2026-11-12T14:00:00Z"}},
+{"id":"antigravity-quota-summary-gemini-weekly","window":{"windowMinutes":10080,"usedPercent":95.1,"resetsAt":"2026-11-16T00:00:00Z"}},
+{"id":"antigravity-quota-summary-3p-5h","window":{"windowMinutes":300,"usedPercent":0}},
+{"id":"antigravity-quota-summary-3p-weekly","window":{"windowMinutes":10080,"usedPercent":46.1,"resetsAt":"2026-11-16T00:00:00Z"}},
+{"id":"antigravity-quota-summary-gemini-argon-wtu-weekly","window":{"windowMinutes":10080,"usedPercent":52.1,"resetsAt":"2026-11-16T00:00:00Z"}}]}}]

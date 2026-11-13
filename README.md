@@ -92,7 +92,7 @@ Register each repository by ID, absolute Git root, path allowlist, and provider 
 
 Each repository may set `limits` to tighten the scheduler policy. Supported keys are `max_batch_tasks`, `max_active`, `max_deadline_seconds`, `minimum_quality_tier`, and `require_independent_review`. A repository’s `AGENTS.md` can enter the snapshot only through the registered and requested path scope. Its contents cannot grant permissions. Session continuations remain inside the provider attempt that created them.
 
-Provider opt-in is separate from repository permission. The live pilots require synthetic data and verified provider identities. `repository_internal` requests are blocked until a certified data policy exists. A path allowlist and temporary workspace restrict the context Ahenk prepares, while the operating system and provider still determine subprocess access. See the [security policy](SECURITY.md).
+Provider opt-in is separate from repository permission. The live pilots require synthetic data and verified provider identities. A dedicated local server can opt in to [private source analysis](docs/private-source-policy.md) with reviewed file and brief digests and an expiring grant for an exact supported route. A path allowlist and temporary workspace restrict the context Ahenk prepares, while the operating system and provider still determine subprocess access. See the [security policy](SECURITY.md).
 
 - **AGY.** `ahenk probe-agy --config FILE` checks the audited binary, signature, and official `/usage` output. The synthetic pilot uses signed AGY 1.5.3 or 1.5.4 and `gemini-3.8-flash-medium`. Version-specific evidence determines the allowed profile. It requires fresh Gemini subscription windows and checks model, workspace, agent, and permission mode before sending the prompt. Ahenk disables automatic updates and requests `useG1Credits:false`. The CLI does not attest the effective runtime credit setting.
 - **OpenCode.** Use `ahenk probe-opencode-catalog` to inspect the pinned OpenCode 2.2.6 binary's isolated catalog. Use `--public` for the public catalog. Configure an exact supported `opencode/<model>` ID, the audited App binary path and SHA-256, and `enable_synthetic: true`. Each attempt starts a fresh worker on loopback. The read-only native route rejects permission requests and results containing tool calls. A zero-price catalog entry alone does not establish supported execution or live capacity.
@@ -149,6 +149,8 @@ The offline core, a synthetic AGY-to-OpenCode M1 batch, and automatic AGY decomp
 `ahenk readiness --config FILE` reads local state without initiating provider calls. It reports `OFFLINE_CORE_READY`, `AGY_LIVE_READY`, `OPENCODE_LIVE_READY`, and `MULTI_PROVIDER_LIVE_READY` separately. Individual live readiness uses a controlled synthetic `read_only` task with a `readiness` acceptance item of the form `Return exactly ahenk-ready-<unique-marker>`. The marker suffix must be 8–64 ASCII letters, digits, underscores, or hyphens. Multi-provider readiness additionally requires a verified diff handoff in a `distinct_provider` batch.
 
 ## Development and testing
+
+Use the [local Swift and XCTest runner](docs/local-swift.md) to verify approved Swift code on macOS or in a disposable iOS Simulator under an enforced network policy.
 
 ```sh
 CGO_ENABLED=0 go test -mod=readonly -count=1 ./...

@@ -99,7 +99,7 @@ func runOpenCodeChild(ctx context.Context, dir, id, objective string, background
 			}
 			a := agent.Data
 			if a.ID != profile.id || a.Mode != profile.mode || a.Steps != profile.steps ||
-				profile.id == openCodeChildAgent && !a.Model.matches(id) || !openCodeChildRules(a.Permissions, profile.rules) {
+				profile.id == openCodeChildAgent && !a.Model.matches(id, "") || !openCodeChildRules(a.Permissions, profile.rules) {
 				fault := model.Error("POLICY_DENIED", "OpenCode native child permissions or eligibility were not verified")
 				fault.ProviderReason = "OPENCODE_CHILD_AGENT_GUARD"
 				return fault
@@ -240,7 +240,7 @@ func openCodeChildInvocation(messages []openCodeNativeMessage, modelID, objectiv
 			if m.Retry != nil {
 				return "", false, m.Retry.Error.error()
 			}
-			if m.Agent != openCodeNativeAgent || !m.Model.matches(modelID) ||
+			if m.Agent != openCodeNativeAgent || !m.Model.matches(modelID, "") ||
 				m.Time.Completed != 0 && (m.Cost == nil || *m.Cost != 0) {
 				return "", false, model.Error("ZERO_COST_UNVERIFIED", "OpenCode parent model or zero cost did not match")
 			}
@@ -341,7 +341,7 @@ func (o openCodeRuntime) verifyChildResult(ctx context.Context, parent openCodeN
 	}
 	s := row.Data
 	if s.ID != child || s.Parent != parent.ID || s.Location != parent.Location || !slices.Equal(s.Permissions, parent.Permissions) ||
-		s.Agent != openCodeChildAgent || s.Title != openCodeChildTitle || !s.Model.matches(id) {
+		s.Agent != openCodeChildAgent || s.Title != openCodeChildTitle || !s.Model.matches(id, "") {
 		return "", model.Error("POLICY_DENIED", "OpenCode child session ownership or permissions did not match")
 	}
 	messages, err := o.childMessages(ctx, path, child)

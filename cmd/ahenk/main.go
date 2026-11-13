@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/faoztas/ahenk-mcp/internal/execution"
+	"github.com/faoztas/ahenk-mcp/internal/ipc"
 	"github.com/faoztas/ahenk-mcp/internal/mcpserver"
 	"github.com/faoztas/ahenk-mcp/internal/model"
 	"github.com/faoztas/ahenk-mcp/internal/orchestration"
@@ -35,9 +36,15 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ahenk serve --stdio --config FILE | ahenk readiness --config FILE | ahenk m1-request --config FILE --repo ID | ahenk verify-m1 --config FILE --request FILE --job ID | ahenk version")
+		return errors.New("usage: ahenk serve --stdio --config FILE | ahenk readiness --config FILE | ahenk m1-request --config FILE --repo ID | ahenk verify-m1 --config FILE --request FILE --job ID | ahenk local-test --config FILE | ahenk version")
 	}
 	switch args[0] {
+	case "local-test":
+		return localTest(args[1:])
+	case "_supervise_local_swift":
+		return execution.SuperviseLocalSwift()
+	case "private-brief-digest":
+		return privateBriefDigest(args[1:])
 	case "audit-models":
 		return auditModels(args[1:])
 	case "probe-codexbar":
@@ -149,7 +156,7 @@ func serve(path string) error {
 	defer cancel()
 	db, err := store.Open(cfg.StateDir)
 	if errors.Is(err, store.ErrBusy) {
-		return runServer(ctx, mcpserver.New(nil, cfg, providers.Registry{}))
+		return ipc.RunProxy(ctx, cfg.StateDir, os.Stdin, os.Stdout)
 	}
 	if err != nil {
 		return err
@@ -160,8 +167,16 @@ func serve(path string) error {
 	if err != nil {
 		return err
 	}
-	err = runServer(ctx, mcpserver.New(engine, cfg, reg))
-	return errors.Join(err, engine.Close())
+	defer engine.Close()
+	server := mcpserver.New(engine, cfg, reg)
+
+	daemon, err := ipc.StartDaemon(ctx, cfg.StateDir, server)
+	if err != nil {
+		return err
+	}
+	defer daemon.Close()
+
+	return runServer(ctx, server)
 }
 
 func runServer(ctx context.Context, s *mcp.Server) error {
