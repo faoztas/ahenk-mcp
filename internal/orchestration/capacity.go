@@ -17,6 +17,7 @@ type CapacitySnapshot struct {
 	Codex    []providers.Quota `json:"codex"`
 	AGY      []providers.Quota `json:"agy"`
 	OpenCode []providers.Quota `json:"opencode_free"`
+	Headroom []HeadroomResult  `json:"headroom,omitempty"`
 }
 
 func timePointer(t time.Time) *time.Time {
@@ -181,6 +182,24 @@ func (e *Engine) capacitySnapshot(now time.Time, repoID string) CapacitySnapshot
 	slices.SortStableFunc(out.OpenCode, func(a, b providers.Quota) int {
 		return cmp.Or(cmp.Compare(a.Model, b.Model), cmp.Compare(a.OpenCodeTransport, b.OpenCodeTransport))
 	})
+	out.Headroom = capacityHeadroom(e, now, five, weekly)
+	return out
+}
+
+// capacityHeadroom reports the normalized H_effective margins for the Codex
+// controller and every AGY model family.
+func capacityHeadroom(e *Engine, now time.Time, five, weekly providers.Quota) []HeadroomResult {
+	out := []HeadroomResult{}
+	if five.Remaining != nil || weekly.Remaining != nil {
+		h := ComputeHeadroom(&five, &weekly)
+		h.Family = "codex"
+		out = append(out, h)
+	}
+	for _, family := range []string{"gemini", "claude_gpt", "gemini_argon"} {
+		if h, known := e.familyHeadroom(family, now); known {
+			out = append(out, h)
+		}
+	}
 	return out
 }
 
@@ -199,9 +218,106 @@ func (e *Engine) Capacity(repoID string) (CapacitySnapshot, []model.CapacityWarn
 	return e.capacitySnapshot(now, repoID), e.capacityWarnings("", routes, "CAPABILITY_CHECK", now), routes
 }
 
+func (e *Engine) RepoAdmission(repoID string) *model.RepoAdmissionReport {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	repo, ok := e.cfg.Repositories[repoID]
+	if !ok {
+		return &model.RepoAdmissionReport{
+			RepoID:     repoID,
+			Registered: false,
+			UnmetGates: []model.UnmetGate{{
+				Gate:       "REPO_NOT_REGISTERED",
+				Reason:     "repository is not registered in configuration",
+				NextAction: "register_repository_in_config",
+			}},
+		}
+	}
+	now := time.Now().UTC()
+	report := &model.RepoAdmissionReport{
+		RepoID:     repoID,
+		Registered: true,
+	}
+	p := repo.PrivateSource
+	if p == nil {
+		report.UnmetGates = append(report.UnmetGates,
+			model.UnmetGate{
+				Gate:       "PRIVATE_GRANT_REQUIRED",
+				Reason:     "repository is registered for synthetic/public policy without a private_source grant",
+				NextAction: "configure_private_source_grant",
+			},
+		)
+		if repo.TrustedLocal == nil {
+			report.UnmetGates = append(report.UnmetGates, model.UnmetGate{
+				Gate:       "WRITER_ISOLATION_UNVERIFIED",
+				Reason:     "writer isolation is not verified for this repository",
+				NextAction: "verify_writer_isolation_before_enabling_patch",
+			})
+		}
+		return report
+	}
+	report.PrivateSourceEnabled = true
+	report.GrantDigest = model.Digest(p)
+	report.ExpiresAt = &p.ExpiresAt
+	if !p.ConsentApproved() {
+		report.UnmetGates = append(report.UnmetGates, model.UnmetGate{
+			Gate:       "OWNER_CONSENT_REQUIRED",
+			Reason:     "private_source grant does not have explicit owner_consent",
+			NextAction: "set_owner_consent_in_private_source_grant",
+		})
+	}
+	if !now.Before(p.ExpiresAt) {
+		report.UnmetGates = append(report.UnmetGates, model.UnmetGate{
+			Gate:       "GRANT_EXPIRED",
+			Reason:     "private_source grant has expired",
+			NextAction: "renew_private_source_grant",
+		})
+	}
+	probe := model.Task{Mode: "read_only", DataClass: model.PrivateSourceData, WorkspaceMode: "head_only"}
+	hasReadRoute := false
+	for _, c := range e.reg.Candidates {
+		if !slices.Contains(repo.Providers, c.Provider) || c.Status != "available" {
+			continue
+		}
+		ok, gate := p.RouteDecision(c, probe, now)
+		if ok {
+			hasReadRoute = true
+			break
+		}
+		switch gate {
+		case "ACCOUNT_ATTESTATION_REQUIRED":
+			report.UnmetGates = append(report.UnmetGates, model.UnmetGate{
+				Gate:       "ACCOUNT_ATTESTATION_REQUIRED",
+				Reason:     "provider worker does not attest its executing account for private source",
+				NextAction: "use_attested_provider_or_keep_private_work_local",
+			})
+		case "ACCOUNT_MISMATCH":
+			report.UnmetGates = append(report.UnmetGates, model.UnmetGate{
+				Gate:       "ACCOUNT_MISMATCH",
+				Reason:     "attested provider account does not match the private_source route grant",
+				NextAction: "verify_expected_account_in_private_source_grant",
+			})
+		}
+	}
+	report.ReadOnlyAdmitted = p.Active(now) && hasReadRoute
+	if !p.WriterIsolationVerified || !p.AllowWrite {
+		report.UnmetGates = append(report.UnmetGates, model.UnmetGate{
+			Gate:       "WRITER_ISOLATION_UNVERIFIED",
+			Reason:     "private write admission remains blocked until writer isolation is verified",
+			NextAction: "verify_writer_isolation_and_enable_allow_write",
+		})
+	} else {
+		report.WriteAdmitted = report.ReadOnlyAdmitted && len(p.GoChecks) > 0 && p.RequireIndependentReview && repo.Limits.RequireIndependentReview
+	}
+	return report
+}
+
 func (e *Engine) previewRoute(j model.Job, now time.Time) []model.Decision {
 	if j.Task.Mode == "" {
 		j.Task = model.Task{Mode: "read_only", DataClass: "synthetic", TaskClass: "utility"}
+		if p := e.cfg.Repositories[j.RepoID].PrivateSource; p != nil {
+			j.Task.DataClass = model.PrivateSourceData
+		}
 	}
 	if j.DeadlineAt.IsZero() {
 		j.DeadlineAt = now.Add(10 * time.Minute)
@@ -345,6 +461,32 @@ func (e *Engine) capacityWarnings(id string, routes []model.Decision, consequenc
 			appendWarning(model.CapacityWarning{Code: "OPENCODE_FREE_UNAVAILABLE", Severity: "warning", Provider: "opencode", Model: modelID,
 				Scope: d.HealthScope, ObservedAt: d.QuotaObservedAt, RetryAt: d.RetryAt, RetrySource: d.RetrySource, Cause: d.CapacityState,
 				Message: "OpenCode Free has a model or confirmed shared cooldown.", NextAction: "Honor the cooldown and use only an eligible independent route."})
+		}
+	}
+	if agyRelevant {
+		for _, family := range []string{"gemini", "claude_gpt", "gemini_argon"} {
+			exhausted := slices.ContainsFunc(e.quotas["agy"], func(q providers.Quota) bool {
+				return q.Family == family && q.At(now).State == "EXHAUSTED"
+			})
+			h, known := e.familyHeadroom(family, now)
+			if !known || exhausted || h.Effective >= quotaDegradedHeadroom {
+				continue
+			}
+			tightest := tightestQuota(e.quotas["agy"], family, 0, now)
+			w := model.CapacityWarning{Provider: "agy", Scope: family, ResetAt: h.ResetsAt, Remaining: tightest.Remaining}
+			if !tightest.ObservedAt.IsZero() {
+				w.ObservedAt = timePointer(tightest.ObservedAt)
+			}
+			if h.Effective < quotaCriticalHeadroom {
+				w.Code, w.Severity = "QUOTA_CRITICAL_HEADROOM", "critical"
+				w.Message = "The AGY family headroom is below the critical 5% reserve barrier."
+				w.NextAction = "The family is excluded from routing until a verified reset."
+			} else {
+				w.Code, w.Severity = "HEADROOM_DEGRADED", "warning"
+				w.Message = "The AGY family headroom is below the 15% reserve threshold."
+				w.NextAction = "Routing applies the quadratic reserve penalty; conserve this family."
+			}
+			appendWarning(w)
 		}
 	}
 	if openRelevant && !openEligible && !slices.ContainsFunc(out, func(w model.CapacityWarning) bool { return w.Code == "OPENCODE_FREE_UNAVAILABLE" }) && !waiting {

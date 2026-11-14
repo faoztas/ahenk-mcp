@@ -148,7 +148,7 @@ func version(mode string, data []byte) (*Version, error) {
 		return nil, model.Error("WORKSPACE_ENTRY_UNSUPPORTED", "binary content is outside the text snapshot contract")
 	}
 	if model.ContainsSecret(data) {
-		return nil, model.Error("POLICY_DENIED", "secret pattern detected in snapshot")
+		return nil, model.GateError("POLICY_DENIED", "SECRET_DETECTED", "secret pattern detected in snapshot", "remove_secret_before_retry")
 	}
 	return &Version{Mode: mode, Hash: model.Hash(data), Bytes: data}, nil
 }
@@ -283,6 +283,9 @@ func capture(ctx context.Context, repo model.Repo, t model.Task) (Snapshot, erro
 	if err != nil {
 		return s, err
 	}
+	if repo.PrivateSource != nil {
+		return privateSnapshot(ctx, s, repo.PrivateSource, t, base)
+	}
 	idx, err := git(ctx, real, nil, append([]string{"ls-files", "--stage", "-z", "--"}, t.AllowedPaths...)...)
 	if err != nil {
 		return s, err
@@ -380,6 +383,49 @@ func capture(ctx context.Context, repo model.Repo, t model.Task) (Snapshot, erro
 	s.StagedSHA = model.Digest(s.StagedDiff)
 	s.UnstagedSHA = model.Digest(s.UnstagedDiff)
 	s.observed = model.Digest(workingState)
+	s.ID = s.digest()
+	return s, nil
+}
+
+func privateSnapshot(ctx context.Context, s Snapshot, policy *model.PrivateSourcePolicy, t model.Task, tree map[string]entry) (Snapshot, error) {
+	if policy == nil {
+		return Snapshot{}, model.GateError("POLICY_DENIED", "PRIVATE_GRANT_REQUIRED", "private snapshot requires an operator grant", "configure_private_source_grant")
+	}
+	if !policy.ConsentApproved() {
+		return Snapshot{}, model.GateError("POLICY_DENIED", "OWNER_CONSENT_REQUIRED", "private snapshot requires explicit owner consent", "set_owner_consent_in_private_source_grant")
+	}
+	if !policy.Active(time.Now()) {
+		return Snapshot{}, model.GateError("POLICY_DENIED", "GRANT_EXPIRED", "private source grant has expired", "renew_private_source_grant")
+	}
+	if t.DataClass != model.PrivateSourceData || s.Mode != "head_only" || len(t.UntrackedPaths) != 0 {
+		return Snapshot{}, model.GateError("POLICY_DENIED", "PRIVATE_MODE_UNSUPPORTED", "private snapshot requires a scoped HEAD-only task", "use_scoped_head_only_private_task")
+	}
+	if len(tree) != len(t.AllowedPaths) {
+		return Snapshot{}, model.GateError("POLICY_DENIED", "PATH_NOT_APPROVED", "private snapshot requires exact regular files in HEAD", "restrict_allowed_paths_to_approved_files")
+	}
+	for _, name := range t.AllowedPaths {
+		if _, ok := policy.Files[name]; !ok || tree[name].mode != "100644" {
+			return Snapshot{}, model.GateError("POLICY_DENIED", "PATH_NOT_APPROVED", "private source must be an approved regular non-executable file", "restrict_allowed_paths_to_approved_files")
+		}
+		v, err := blob(ctx, s.Root, tree[name])
+		if err != nil {
+			return Snapshot{}, err
+		}
+		if model.ContainsPersonalData(v.Bytes) {
+			return Snapshot{}, model.GateError("POLICY_DENIED", "PERSONAL_DATA_CLASSIFIED", "private source file contains classified personal data", "remove_personal_data_before_retry")
+		}
+		if v.Hash != policy.Files[name] {
+			return Snapshot{}, model.GateError("POLICY_DENIED", "DIGEST_MISMATCH", "private source file has changed since approval", "reapprove_file_digest_in_private_source_grant")
+		}
+		s.Files = append(s.Files, File{Path: name, Base: v, Index: v, Effective: v})
+	}
+	files, err := s.Context(t.AllowedPaths)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if fault := policy.CheckContext(t.AllowedPaths, files); fault != nil {
+		return Snapshot{}, fault
+	}
 	s.ID = s.digest()
 	return s, nil
 }
@@ -574,4 +620,53 @@ func SourceDrift(ctx context.Context, s Snapshot, preimages map[string]string) b
 		}
 	}
 	return false
+}
+
+// TakeSnapshot creates a scoped Snapshot of the target repository root.
+func TakeSnapshot(ctx context.Context, root, id, mode string, paths []string) (Snapshot, error) {
+	repo := model.Repo{Root: root, AllowedPaths: paths}
+	task := model.Task{WorkspaceMode: mode, AllowedPaths: paths}
+	snap, err := Capture(ctx, repo, task)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if snap.ID == "" && id != "" {
+		snap.ID = id
+	}
+	return snap, nil
+}
+
+// VerifySnapshot verifies that the repository working tree has not drifted from the snapshot.
+func VerifySnapshot(ctx context.Context, s Snapshot) (bool, error) {
+	if s.Root == "" {
+		return false, errors.New("empty snapshot root")
+	}
+	real, err := filepath.EvalSymlinks(s.Root)
+	if err != nil || real != s.Root {
+		return false, nil
+	}
+	root, err := os.OpenRoot(s.Root)
+	if err != nil {
+		return false, nil
+	}
+	defer root.Close()
+	for _, f := range s.Files {
+		if !model.SafePath(f.Path) {
+			continue
+		}
+		v, err := workfile(root, f.Path)
+		if err != nil {
+			return false, nil
+		}
+		if f.Effective == nil {
+			if v != nil {
+				return false, nil
+			}
+		} else {
+			if v == nil || v.Hash != f.Effective.Hash || v.Mode != f.Effective.Mode {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
 }

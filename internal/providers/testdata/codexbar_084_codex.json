@@ -1,0 +1,1 @@
+[{"provider":"codex","source":"oauth","usage":{"updatedAt":"2026-11-12T09:40:00Z","dataConfidence":"exact","identity":{"providerID":"codex","accountEmail":"fixture@example.invalid"},"primary":{"windowMinutes":300,"usedPercent":12.4,"resetsAt":"2026-11-12T14:00:00Z"},"secondary":{"windowMinutes":10080,"usedPercent":31.7,"resetsAt":"2026-11-16T00:00:00Z"}}}]

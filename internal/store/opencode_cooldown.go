@@ -46,8 +46,8 @@ type OpenCodeCooldownImport struct {
 	ImportedAt             time.Time `json:"imported_at"`
 }
 
-// ReadOpenCodeRateLimits projects only cooldown fields from an idle source DB.
-// Hold the source scheduler lock while reading the database and its WAL.
+// ReadOpenCodeRateLimits reads an idle state's cooldowns and imported history.
+// Hold the source scheduler lock while reading the database, WAL and imports.
 func ReadOpenCodeRateLimits(ctx context.Context, dir string) ([]OpenCodeCooldownImport, error) {
 	actual, err := stateDirectory(dir)
 	if err != nil {
@@ -121,7 +121,14 @@ func ReadOpenCodeRateLimits(ctx context.Context, dir string) ([]OpenCodeCooldown
 		}
 		records = append(records, record)
 	}
-	return records, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	imports, err := ReadOpenCodeCooldownImports(actual)
+	if err != nil {
+		return nil, err
+	}
+	return append(records, imports...), nil
 }
 
 func validOpenCodeImport(record OpenCodeCooldownImport) bool {
@@ -222,7 +229,9 @@ func (s *Store) SaveOpenCodeCooldownImports(records []OpenCodeCooldownImport, no
 			}
 			continue
 		}
-		record.ImportedAt = now
+		if record.ImportedAt.IsZero() {
+			record.ImportedAt = now
+		}
 		existing = append(existing, record)
 		changed = true
 	}

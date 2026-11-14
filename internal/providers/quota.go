@@ -8,13 +8,22 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"strings"
 	"time"
 
 	"github.com/faoztas/ahenk-mcp/internal/model"
 )
 
-const quotaMaxAge = 15 * time.Minute
+const (
+	quotaMaxAge     = 15 * time.Minute
+	BarCodexBurst   = "codex_5h_burst"
+	BarCodexWeekly  = "codex_weekly"
+	BarAgyGemini    = "agy_gemini_5h"
+	BarAgyOpus      = "agy_opus_5d"
+	BarAgyOpus5h    = "agy_opus_5h"
+	BarOpenCodeFree = "opencode_free_16h"
+)
 
 type codexBarWindow struct {
 	UsedPercent *float64   `json:"usedPercent"`
@@ -54,20 +63,20 @@ func (q Quota) At(now time.Time) Quota {
 	return q
 }
 
-func agyBucket(id string) (family string, minutes int) {
+func agyBucket(id string) (bar, family string, minutes int) {
 	switch id {
 	case "gemini-5h":
-		return "gemini", 300
+		return BarAgyGemini, "gemini", 300
 	case "gemini-weekly":
-		return "gemini", 10080
+		return "gemini-weekly", "gemini", 10080
 	case "3p-5h":
-		return "claude_gpt", 300
+		return BarAgyOpus5h, "claude_gpt", 300
 	case "3p-weekly":
-		return "claude_gpt", 10080
+		return BarAgyOpus, "claude_gpt", 7200
 	case "gemini-argon-wtu-weekly":
-		return "gemini_argon", 10080
+		return "gemini-argon-wtu-weekly", "gemini_argon", 10080
 	default:
-		return "", 0
+		return id, "", 0
 	}
 }
 
@@ -90,10 +99,11 @@ func DecodeCodexBar(r io.Reader, requested string, now time.Time) ([]Quota, erro
 	return decodeCodexBar(r, requested, "", "", now)
 }
 
-// requestedSource is set only by ReadCodexBar after validating the pinned 0.83.0 binary.
+// requestedSource is set only by ReadCodexBar after verifying the CodexBar
+// binary against its codesign identity and hash allowlist.
 func decodeCodexBar(r io.Reader, requested, requestedSource, expectedAccount string, now time.Time) ([]Quota, error) {
 	switch requested {
-	case "codex", "antigravity", "copilot":
+	case "codex", "antigravity", "copilot", "claude":
 	default:
 		return nil, errors.New("unsupported quota provider")
 	}
@@ -124,7 +134,8 @@ func decodeCodexBar(r io.Reader, requested, requestedSource, expectedAccount str
 		return []Quota{UnknownQuota(id)}, nil
 	}
 	accountMatch := "UNKNOWN"
-	trustedSource := requested == "codex" && requestedSource == "oauth" && row.Source == "oauth" ||
+	oauthProviders := requested == "codex" || requested == "claude" || requested == "copilot"
+	trustedSource := oauthProviders && requestedSource == "oauth" && row.Source == "oauth" ||
 		requested == "antigravity" && requestedSource == "cli" && (row.Source == "app" || row.Source == "cli")
 	if email := strings.ToLower(strings.TrimSpace(row.Usage.Identity.Email)); trustedSource && expectedAccount != "" &&
 		row.Usage.Identity.ProviderID == requested && email != "" {
@@ -153,10 +164,11 @@ func decodeCodexBar(r io.Reader, requested, requestedSource, expectedAccount str
 		}
 		q.ObservedAt, q.ResetAt = row.Usage.UpdatedAt, w.ResetsAt
 		// In the pinned schema, NamedRateWindow omits usageKnown only when true.
-		known := requestedSource != "" || namedKnown != nil || w.UsageKnown != nil
+		known := requestedSource != "" || namedKnown != nil || w.UsageKnown != nil ||
+			row.Source == "cli" || (requested == "codex" && row.Source == "oauth")
 		known = known && (namedKnown == nil || *namedKnown) && (w.UsageKnown == nil || *w.UsageKnown)
 		if known && !w.Placeholder && q.Source != "offline" && w.UsedPercent != nil && *w.UsedPercent >= 0 && *w.UsedPercent <= 100 {
-			left := 100 - *w.UsedPercent
+			left := math.Round((100-*w.UsedPercent)*10) / 10
 			q.Unit, q.State, q.Remaining = "percent", "KNOWN", &left
 			if left == 0 {
 				q.State = "EXHAUSTED"
@@ -168,22 +180,27 @@ func decodeCodexBar(r io.Reader, requested, requestedSource, expectedAccount str
 		const prefix = "antigravity-quota-summary-"
 		seen := map[string]bool{}
 		for _, extra := range row.Usage.Extra {
-			bucket, ok := strings.CutPrefix(extra.ID, prefix)
-			if !ok || !model.ValidID(bucket) || extra.Window == nil {
+			bucket := strings.TrimPrefix(extra.ID, prefix)
+			if !model.ValidID(bucket) || extra.Window == nil {
 				continue
 			}
 			if seen[bucket] {
 				return []Quota{UnknownQuota(id)}, nil
 			}
 			seen[bucket] = true
-			family, minutes := agyBucket(bucket)
-			if minutes != extra.Window.Minutes {
+			bar, family, minutes := agyBucket(bucket)
+			if minutes > 0 && extra.Window.Minutes > 0 && minutes != extra.Window.Minutes &&
+				(bucket != "3p-weekly" && bucket != "3p-5h") {
 				family = ""
 			}
-			add(bucket, family, extra.Window, extra.UsageKnown)
+			add(bar, family, extra.Window, extra.UsageKnown)
 		}
 	}
-	if id == "codex" || len(out) == 0 {
+	if id == "codex" {
+		add(BarCodexBurst, "", row.Usage.Primary, nil)
+		add(BarCodexWeekly, "", row.Usage.Secondary, nil)
+		add("tertiary", "", row.Usage.Tertiary, nil)
+	} else if len(out) == 0 {
 		add("primary", "", row.Usage.Primary, nil)
 		add("secondary", "", row.Usage.Secondary, nil)
 		add("tertiary", "", row.Usage.Tertiary, nil)
@@ -202,4 +219,30 @@ func decodeCodexBar(r io.Reader, requested, requestedSource, expectedAccount str
 		return []Quota{UnknownQuota(id)}, nil
 	}
 	return out, nil
+}
+
+// FPTier reports the price/performance tier of a route: "free" (OpenCode
+// anonymous), "cheap" (AGY Gemini Flash), "balanced" (Sonnet-class) or
+// "hard" (Argon, Codex and Claude frontier).
+func FPTier(provider, modelID string) string {
+	switch provider {
+	case "opencode":
+		return "free"
+	case "codex", "claude":
+		return "hard"
+	case "copilot":
+		return "cheap"
+	case "agy":
+		switch AGYModelFamily(modelID) {
+		case "gemini_argon":
+			return "hard"
+		case "claude_gpt":
+			return "balanced"
+		case "gemini":
+			return "cheap"
+		}
+		return ""
+	default:
+		return ""
+	}
 }

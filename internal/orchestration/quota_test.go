@@ -6,6 +6,7 @@ package orchestration
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -712,4 +713,44 @@ func openCodeFixture(now time.Time) (*Engine, model.Job) {
 		Mode: "read_only", DataClass: "synthetic", PreferredProvider: "opencode", PreferredModel: "free-a",
 	}}
 	return e, j
+}
+
+func TestQuotaHealthNormalizationAndNonBlocking(t *testing.T) {
+	e := &Engine{
+		quotas:           map[string][]providers.Quota{},
+		quotaRefreshedAt: time.Now().UTC(),
+	}
+	remaining75 := 75.0
+	remaining20 := 20.0
+	e.quotas["codex"] = []providers.Quota{
+		{Bucket: providers.BarCodexBurst, Remaining: &remaining75, State: "KNOWN"},
+		{Bucket: providers.BarCodexWeekly, Remaining: &remaining20, State: "KNOWN"},
+	}
+	if h := e.HealthPercent(providers.BarCodexBurst); h != 0.75 {
+		t.Fatalf("expected health 0.75, got %v", h)
+	}
+	if st := e.BarState(providers.BarCodexBurst); st != "HEALTHY" {
+		t.Errorf("expected HEALTHY, got %s", st)
+	}
+	if st := e.BarState(providers.BarCodexWeekly); st != "PRESSURE_HIGH" {
+		t.Errorf("expected PRESSURE_HIGH, got %s", st)
+	}
+
+	// Verify non-blocking concurrency under 50 routines
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			q := e.Quota("codex")
+			if len(q) == 0 {
+				t.Errorf("expected quotas returned")
+			}
+		}()
+	}
+	wg.Wait()
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("quota read took too long: %v", elapsed)
+	}
 }

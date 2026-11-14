@@ -26,14 +26,15 @@ const privateWorkspace = ".workspace"
 // checkout or object database from the source repository. The caller must
 // independently verify the worker's filesystem and command permissions.
 type Worktree struct {
-	Dir         string
-	attemptDir  string
-	identity    fs.FileInfo
-	gitLinkHash string
-	snapshot    Snapshot
-	task        model.Task
-	before      map[string]*Version
-	source      sourceIdentity
+	Dir           string
+	HarnessSocket string
+	attemptDir    string
+	identity      fs.FileInfo
+	gitLinkHash   string
+	snapshot      Snapshot
+	task          model.Task
+	before        map[string]*Version
+	source        sourceIdentity
 }
 
 type WorktreeResult struct {
@@ -108,6 +109,7 @@ func PrepareWorktree(ctx context.Context, attemptDir string, s Snapshot, t model
 	work := &Worktree{
 		Dir: filepath.Join(private, "work"), attemptDir: real, identity: identity,
 		snapshot: s, task: t, before: before, source: source,
+		HarnessSocket: filepath.Join(private, ".harness.sock"),
 	}
 	defer func() {
 		if result != nil {
@@ -264,10 +266,10 @@ func (w *Worktree) readWorkspace(ctx context.Context) (map[string]*Version, erro
 				}) {
 				return nil
 			}
-			return model.Error("POLICY_DENIED", "worktree contains a directory outside the approved scope")
+			return model.Error("POLICY_DENIED", "native edit changed a protected file")
 		}
 		if !model.InScope(name, w.task.AllowedPaths) {
-			return model.Error("POLICY_DENIED", "worktree contains a file outside the approved scope")
+			return model.Error("POLICY_DENIED", "native edit changed a protected file")
 		}
 		v, err := workfile(root, name)
 		if err != nil {
@@ -480,6 +482,14 @@ func digestIndex(common, path string) (string, error) {
 
 func (w *Worktree) SourceFingerprint() string {
 	return model.Digest([]string{w.source.head, w.source.index, w.source.files})
+}
+
+// HarnessSocketPath returns the path to the isolated .workspace/.harness.sock socket.
+func (w *Worktree) HarnessSocketPath() string {
+	if w.HarnessSocket != "" {
+		return w.HarnessSocket
+	}
+	return filepath.Join(filepath.Dir(w.Dir), ".harness.sock")
 }
 
 func (w *Worktree) Close() error {

@@ -141,10 +141,10 @@ func (s *Store) init() error {
 	if err = s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version == 1 {
+	if version == 2 {
 		return nil
 	}
-	if version != 0 {
+	if version > 2 {
 		return fmt.Errorf("unsupported state schema %d", version)
 	}
 	tx, err := s.db.Begin()
@@ -152,12 +152,48 @@ func (s *Store) init() error {
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.Exec(`
-	CREATE TABLE jobs (id TEXT PRIMARY KEY, repo TEXT NOT NULL, request TEXT, digest TEXT, body BLOB NOT NULL, UNIQUE(repo, request));
-	CREATE TABLE audit (seq INTEGER PRIMARY KEY, job TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, at TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL);
-	PRAGMA user_version=1;`)
-	if err != nil {
-		return err
+
+	if version == 0 {
+		_, err = tx.Exec(`
+		CREATE TABLE jobs (id TEXT PRIMARY KEY, repo TEXT NOT NULL, request TEXT, digest TEXT, body BLOB NOT NULL, UNIQUE(repo, request));
+		CREATE TABLE audit (seq INTEGER PRIMARY KEY, job TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, at TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL);`)
+		if err != nil {
+			return err
+		}
+	}
+
+	if version < 2 {
+		_, err = tx.Exec(`
+		CREATE TABLE IF NOT EXISTS provider_quota_state (
+			provider_id TEXT PRIMARY KEY,
+			tier_name TEXT NOT NULL,
+			window_duration_hours REAL NOT NULL,
+			requests_used_in_window INTEGER NOT NULL DEFAULT 0,
+			max_window_requests INTEGER NOT NULL,
+			health_pct REAL NOT NULL DEFAULT 1.0,
+			circuit_state TEXT NOT NULL DEFAULT 'CLOSED',
+			retry_after_utc TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE TABLE IF NOT EXISTS job_routing_audit (
+			job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+			task_category TEXT NOT NULL,
+			attempt_number INTEGER NOT NULL DEFAULT 1,
+			assigned_model TEXT NOT NULL,
+			assigned_effort TEXT NOT NULL,
+			route_reason TEXT NOT NULL,
+			quota_pressure_at_dispatch REAL NOT NULL,
+			dispatch_status TEXT NOT NULL,
+			latency_ms INTEGER,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (job_id, attempt_number)
+		);
+		CREATE INDEX IF NOT EXISTS idx_routing_audit_created ON job_routing_audit(created_at);
+		PRAGMA user_version=2;`)
+		if err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

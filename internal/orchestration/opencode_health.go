@@ -213,6 +213,15 @@ func openCodeScope(scope string) string {
 func (e *Engine) rememberOpenCodeHealth(a *model.Attempt) {
 	e.openCodeHistory.Apply(a)
 	e.recordOpenCodeObservation(a)
+	if e.cb != nil && a.Code == "RATE_LIMIT" && (a.ProviderRateLimitScope == "provider" || a.ProviderRateLimitScope == "free-limit" || a.ProviderReason == "provider.free-limit" || a.RetryAfterMS >= 59_760_000) {
+		cooldown := 59760 * time.Second
+		if a.RetryAfterMS > 0 {
+			cooldown = time.Duration(a.RetryAfterMS) * time.Millisecond
+		} else if a.RetryAt != nil && a.FinishedAt != nil {
+			cooldown = a.RetryAt.Sub(*a.FinishedAt)
+		}
+		e.cb.Trip("opencode", cooldown)
+	}
 }
 
 // OpenCodeVerifiedSuccess is shared by dispatch and read-only diagnostics.
@@ -235,6 +244,9 @@ func (e *Engine) recordOpenCodeObservation(a *model.Attempt) {
 	}
 	id := openCodeRoute(a.Model, a.OpenCodeAccount, a.OpenCodeTransport, a.OpenCodeEndpoint)
 	if OpenCodeVerifiedSuccess(*a) {
+		if e.cb != nil {
+			e.cb.Success("opencode")
+		}
 		if e.openCodeSuccess == nil {
 			e.openCodeSuccess = make(map[openCodeIdentity]time.Time)
 		}

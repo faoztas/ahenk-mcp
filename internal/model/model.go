@@ -4,6 +4,7 @@
 package model
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -44,6 +46,8 @@ func Terminal(status string) bool {
 type Fault struct {
 	RetryHints             []RetryHint `json:"retry_hints,omitempty"`
 	Code                   string      `json:"code"`
+	Gate                   string      `json:"gate,omitempty"`
+	NextAction             string      `json:"next_action,omitempty"`
 	Message                string      `json:"message"`
 	Retryable              bool        `json:"retryable"`
 	RetryAfterMS           int64       `json:"retry_after_ms,omitempty"`
@@ -58,6 +62,10 @@ func (f *Fault) Error() string { return f.Message }
 
 func Error(code, message string) *Fault {
 	return &Fault{Code: code, Message: message}
+}
+
+func GateError(code, gate, message, nextAction string) *Fault {
+	return &Fault{Code: code, Gate: gate, Message: message, NextAction: nextAction}
 }
 
 type Check struct {
@@ -91,6 +99,12 @@ type Task struct {
 	WorkspaceMode         string   `json:"workspace_mode,omitempty"`
 	UntrackedPaths        []string `json:"untracked_paths,omitempty"`
 	DeadlineSeconds       int      `json:"deadline_seconds,omitempty"`
+	TargetTier            string   `json:"target_tier,omitempty"`
+	TargetEffort          string   `json:"target_effort,omitempty"`
+	Variant               string   `json:"variant,omitempty"`
+	MaxDepth              int      `json:"max_depth,omitempty"`
+	Category              string   `json:"category,omitempty"`
+	Complexity            float64  `json:"complexity,omitempty"`
 }
 
 type HandoffFrom struct {
@@ -153,6 +167,343 @@ type Submission struct {
 	Task
 }
 
+func (s *Submission) Normalize(defaultCwd string, cfg *Config) error {
+	if s.Task.Objective == "" {
+		return Error("INVALID_INPUT", "objective is required")
+	}
+	if s.RequestID == "" {
+		rb := make([]byte, 4)
+		rand.Read(rb)
+		s.RequestID = fmt.Sprintf("req-%d-%x", time.Now().UnixNano(), rb)
+	}
+	if len(s.Task.AllowedPaths) == 0 {
+		if cfg != nil && s.RepoID != "" {
+			if repo, ok := cfg.Repositories[s.RepoID]; ok && len(repo.AllowedPaths) > 0 {
+				s.Task.AllowedPaths = slices.Clone(repo.AllowedPaths)
+			}
+		}
+		if len(s.Task.AllowedPaths) == 0 {
+			s.Task.AllowedPaths = []string{"."}
+		}
+	}
+	if len(s.Task.Acceptance) == 0 {
+		s.Task.Acceptance = []Check{{ID: "default", Description: "Complete task objective"}}
+	}
+	if s.Task.Mode == "" {
+		s.Task.Mode = "patch"
+	}
+	if s.Task.DataClass == "" {
+		if cfg != nil && s.RepoID != "" {
+			if repo, ok := cfg.Repositories[s.RepoID]; ok && repo.PrivateSource != nil {
+				s.Task.DataClass = "repository_internal"
+			}
+		}
+		if s.Task.DataClass == "" {
+			s.Task.DataClass = "synthetic"
+		}
+	}
+	return nil
+}
+
+// TargetSpec explicit target driver or dynamic F/P tier selection.
+type TargetSpec struct {
+	Provider string `json:"provider,omitempty" jsonschema:"Target provider driver, or 'auto' for quota-aware F/P routing (enum: auto, agy, opencode, codex, claude, copilot, acp)"`
+	Model    string `json:"model,omitempty" jsonschema:"Exact model ID (e.g. gemini-3.8-flash, gemini-4-argon, opencode/glm-5.3-flash-free, claude-sonnet-4-6, gpt-5.4)"`
+	Tier     string `json:"tier,omitempty" jsonschema:"F/P routing tier: 'free'/'cheap' (Flash/OpenCode), 'balanced' (Sonnet/Argon), 'hard'/'frontier' (Codex/Opus)"`
+	Effort   string `json:"effort,omitempty" jsonschema:"Reasoning effort level (low, medium, high, max)"`
+}
+
+func (t *TargetSpec) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		t.Provider = s
+		return nil
+	}
+	type Alias TargetSpec
+	var alias Alias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	*t = TargetSpec(alias)
+	return nil
+}
+
+// DelegateTaskInput is the universal subagent input schema accepting either a single 'task' string
+// or full explicit parameters with backwards compatibility.
+type DelegateTaskInput struct {
+	Task               string      `json:"task,omitempty" jsonschema:"Clear, self-contained instructions for the subagent (no parent chat history is shared)."`
+	Objective          string      `json:"objective,omitempty" jsonschema:"Alias for task (backwards compatibility)."`
+	Category           string      `json:"category,omitempty" jsonschema:"Task category: 'coding', 'debugging', 'code_review', 'architecture', 'planning', 'research', 'agent_orchestration'."`
+	Complexity         float64     `json:"complexity,omitempty" jsonschema:"Task cognitive complexity (0.0 to 1.0)."`
+	Role               string      `json:"role,omitempty" jsonschema:"Subagent role: 'implementation', 'research', 'review', 'design', 'test', 'general'. Defaults to 'general' or 'implementation'."`
+	Target             *TargetSpec `json:"target,omitempty" jsonschema:"Explicit provider/model selection OR automatic price/performance (F/P) tier routing. Omit to auto-route."`
+	Isolation          string      `json:"isolation,omitempty" jsonschema:"Isolation mode: 'worktree' (isolated git worktree returning verified diff), 'read_only' (safe analysis), 'shared' (direct checkout edit)."`
+	ExecutionMode      string      `json:"execution_mode,omitempty" jsonschema:"Execution mode: 'wait' (default, blocks until completion and returns result directly) or 'async' (returns durable job_id immediately)."`
+	Mode               string      `json:"mode,omitempty" jsonschema:"Legacy mode alias: 'wait'|'async' (execution wait) or 'read_only'|'patch' (task isolation)."`
+	RequestID          string      `json:"request_id,omitempty" jsonschema:"Optional idempotency request ID. Auto-generated if omitted."`
+	RepoID             string      `json:"repo_id,omitempty" jsonschema:"Optional registered repository ID. Auto-detected from cwd/git root if omitted."`
+	Cwd                string      `json:"cwd,omitempty" jsonschema:"Optional working directory. Auto-detected from current git root if omitted."`
+	AllowedPaths       []string    `json:"allowed_paths,omitempty" jsonschema:"Optional relative paths scoped for edits. Defaults to whole repository ['.'] if omitted."`
+	Acceptance         []Check     `json:"acceptance,omitempty" jsonschema:"Optional acceptance criteria. Defaults to single generic check if omitted."`
+	DataClass          string      `json:"data_class,omitempty" jsonschema:"Data sensitivity classification: 'public', 'synthetic', 'repository_internal'."`
+	WaitTimeoutSeconds int         `json:"wait_timeout_seconds,omitempty" jsonschema:"Max wait duration in seconds for execution_mode:'wait' (default 300s)."`
+	TimeoutSeconds     int         `json:"timeout_seconds,omitempty" jsonschema:"Alias for wait_timeout_seconds."`
+	Priority           string      `json:"priority,omitempty" jsonschema:"Priority: 'normal', 'high', 'background'."`
+	Strategy           string      `json:"strategy,omitempty" jsonschema:"Execution strategy: 'balanced', 'quality_first', 'quota_saving', 'conserve', 'latency_first', 'deep_audit', 'offline_privacy_first'."`
+	MaxDepth           int         `json:"max_depth,omitempty"`
+
+	WorkspaceMode     string   `json:"workspace_mode,omitempty"`
+	UntrackedPaths    []string `json:"untracked_paths,omitempty"`
+	DeadlineSeconds   int      `json:"deadline_seconds,omitempty"`
+	Decompose         bool     `json:"decompose,omitempty"`
+	ExecutionProfile  string   `json:"execution_profile,omitempty"`
+	PreferredProvider string   `json:"preferred_provider,omitempty"`
+	PreferredModel    string   `json:"preferred_model,omitempty"`
+}
+
+func (in *DelegateTaskInput) UnmarshalJSON(data []byte) error {
+	type Alias DelegateTaskInput
+	var raw struct {
+		Alias
+		RawTask   json.RawMessage `json:"task"`
+		RawTarget json.RawMessage `json:"target"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*in = DelegateTaskInput(raw.Alias)
+
+	// Process task
+	if len(raw.RawTask) > 0 {
+		var s string
+		if err := json.Unmarshal(raw.RawTask, &s); err == nil {
+			in.Task = s
+		} else {
+			var t Task
+			if err := json.Unmarshal(raw.RawTask, &t); err == nil {
+				if in.Category == "" {
+					in.Category = t.Category
+				}
+				if in.Complexity == 0 {
+					in.Complexity = t.Complexity
+				}
+				if in.Objective == "" {
+					in.Objective = t.Objective
+				}
+				if in.Role == "" && t.TaskClass != "" {
+					in.Role = t.TaskClass
+				}
+				if in.Mode == "" && t.Mode != "" {
+					in.Mode = t.Mode
+				}
+				if in.DataClass == "" && t.DataClass != "" {
+					in.DataClass = t.DataClass
+				}
+				if in.Priority == "" && t.Priority != "" {
+					in.Priority = t.Priority
+				}
+				if in.Strategy == "" && t.Strategy != "" {
+					in.Strategy = t.Strategy
+				}
+				if in.WorkspaceMode == "" && t.WorkspaceMode != "" {
+					in.WorkspaceMode = t.WorkspaceMode
+				}
+				if in.ExecutionProfile == "" && t.ExecutionProfile != "" {
+					in.ExecutionProfile = t.ExecutionProfile
+				}
+				if in.PreferredProvider == "" && t.PreferredProvider != "" {
+					in.PreferredProvider = t.PreferredProvider
+				}
+				if in.PreferredModel == "" && t.PreferredModel != "" {
+					in.PreferredModel = t.PreferredModel
+				}
+				if in.DeadlineSeconds == 0 && t.DeadlineSeconds != 0 {
+					in.DeadlineSeconds = t.DeadlineSeconds
+				}
+				if !in.Decompose && t.Decompose {
+					in.Decompose = t.Decompose
+				}
+				if len(in.AllowedPaths) == 0 && len(t.AllowedPaths) > 0 {
+					in.AllowedPaths = slices.Clone(t.AllowedPaths)
+				}
+				if len(in.UntrackedPaths) == 0 && len(t.UntrackedPaths) > 0 {
+					in.UntrackedPaths = slices.Clone(t.UntrackedPaths)
+				}
+				if len(in.Acceptance) == 0 && len(t.Acceptance) > 0 {
+					in.Acceptance = slices.Clone(t.Acceptance)
+				}
+			}
+		}
+	}
+
+	// Process target
+	if len(raw.RawTarget) > 0 {
+		var s string
+		if err := json.Unmarshal(raw.RawTarget, &s); err == nil {
+			in.Target = &TargetSpec{Provider: s}
+		} else {
+			var spec TargetSpec
+			if err := json.Unmarshal(raw.RawTarget, &spec); err == nil {
+				in.Target = &spec
+			}
+		}
+	}
+	return nil
+}
+
+func (in *DelegateTaskInput) Normalize(defaultCwd string, cfg *Config) (Submission, string, time.Duration, error) {
+	objective := strings.TrimSpace(in.Task)
+	if objective == "" {
+		objective = strings.TrimSpace(in.Objective)
+	}
+	if objective == "" {
+		return Submission{}, "", 0, Error("INVALID_INPUT", "task or objective is required")
+	}
+
+	execMode := in.ExecutionMode
+	if execMode == "" {
+		if in.Mode == "wait" || in.Mode == "async" {
+			execMode = in.Mode
+		} else if in.Task != "" {
+			execMode = "wait"
+		} else {
+			execMode = "async"
+		}
+	}
+	if execMode != "wait" && execMode != "async" {
+		execMode = "wait"
+	}
+
+	timeoutSec := in.WaitTimeoutSeconds
+	if timeoutSec <= 0 {
+		timeoutSec = in.TimeoutSeconds
+	}
+	if timeoutSec <= 0 {
+		timeoutSec = 300
+	}
+	waitTimeout := time.Duration(timeoutSec) * time.Second
+
+	reqID := in.RequestID
+	if reqID == "" {
+		rb := make([]byte, 4)
+		rand.Read(rb)
+		reqID = fmt.Sprintf("req-%d-%x", time.Now().UnixNano(), rb)
+	}
+
+	taskMode := in.Mode
+	if taskMode == "wait" || taskMode == "async" {
+		taskMode = ""
+	}
+	if taskMode == "" {
+		if in.Isolation == "read_only" || in.Role == "research" || in.Role == "review" {
+			taskMode = "read_only"
+		} else {
+			taskMode = "patch"
+		}
+	}
+
+	allowedPaths := in.AllowedPaths
+	if len(allowedPaths) == 0 {
+		if cfg != nil && in.RepoID != "" {
+			if repo, ok := cfg.Repositories[in.RepoID]; ok && len(repo.AllowedPaths) > 0 {
+				allowedPaths = slices.Clone(repo.AllowedPaths)
+			}
+		}
+		if len(allowedPaths) == 0 {
+			allowedPaths = []string{"."}
+		}
+	}
+
+	acceptance := in.Acceptance
+	if len(acceptance) == 0 {
+		acceptance = []Check{{ID: "default", Description: "Complete task objective"}}
+	}
+
+	dataClass := in.DataClass
+	if dataClass == "" {
+		if cfg != nil && in.RepoID != "" {
+			if repo, ok := cfg.Repositories[in.RepoID]; ok && repo.PrivateSource != nil {
+				dataClass = "repository_internal"
+			}
+		}
+		if dataClass == "" {
+			dataClass = "synthetic"
+		}
+	}
+
+	preferredProvider := in.PreferredProvider
+	preferredModel := in.PreferredModel
+	targetTier, targetEffort := "", ""
+	if in.Target != nil {
+		if in.Target.Provider != "" && in.Target.Provider != "auto" {
+			preferredProvider = in.Target.Provider
+		}
+		if in.Target.Model != "" {
+			preferredModel = in.Target.Model
+		}
+		targetTier = strings.ToLower(strings.TrimSpace(in.Target.Tier))
+		targetEffort = strings.ToLower(strings.TrimSpace(in.Target.Effort))
+	}
+
+	sub := Submission{
+		RequestID: reqID,
+		RepoID:    in.RepoID,
+		Task: Task{
+			Objective:         objective,
+			Acceptance:        acceptance,
+			AllowedPaths:      allowedPaths,
+			Mode:              taskMode,
+			DataClass:         dataClass,
+			Priority:          in.Priority,
+			Strategy:          in.Strategy,
+			WorkspaceMode:     in.WorkspaceMode,
+			UntrackedPaths:    in.UntrackedPaths,
+			DeadlineSeconds:   in.DeadlineSeconds,
+			Decompose:         in.Decompose,
+			ExecutionProfile:  in.ExecutionProfile,
+			PreferredProvider: preferredProvider,
+			PreferredModel:    preferredModel,
+			TargetTier:        targetTier,
+			TargetEffort:      targetEffort,
+		},
+	}
+	return sub, execMode, waitTimeout, nil
+}
+
+// WaitJobsInput defines the barrier tool for synchronizing multiple background subagents.
+type WaitJobsInput struct {
+	JobIDs         []string `json:"job_ids" jsonschema:"Array of durable job IDs to wait for."`
+	Mode           string   `json:"mode,omitempty" jsonschema:"Wait mode: 'all' (default, waits until all jobs finish) or 'any' (returns when first job completes)."`
+	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"Max duration to wait in seconds (default 300s)."`
+}
+
+func (w WaitJobsInput) Normalize() (WaitJobsInput, error) {
+	if len(w.JobIDs) == 0 {
+		return w, Error("INVALID_INPUT", "job_ids is required")
+	}
+	for _, id := range w.JobIDs {
+		if !ValidID(id) {
+			return w, Error("INVALID_INPUT", fmt.Sprintf("invalid job ID: %s", id))
+		}
+	}
+	mode := w.Mode
+	if mode == "" {
+		mode = "all"
+	}
+	if mode != "all" && mode != "any" {
+		return w, Error("INVALID_INPUT", "mode must be 'all' or 'any'")
+	}
+	timeoutSec := w.TimeoutSeconds
+	if timeoutSec <= 0 {
+		timeoutSec = 300
+	}
+	return WaitJobsInput{
+		JobIDs:         w.JobIDs,
+		Mode:           mode,
+		TimeoutSeconds: timeoutSec,
+	}, nil
+}
+
 type Batch struct {
 	RequestID           string   `json:"request_id"`
 	RepoID              string   `json:"repo_id"`
@@ -189,39 +540,53 @@ type ProjectLimits struct {
 }
 
 type Repo struct {
-	Limits                  ProjectLimits       `json:"limits,omitzero"`
-	AllowAGYReserveOverride bool                `json:"allow_agy_weekly_reserve_override,omitempty"`
-	TrustedLocal            *TrustedLocalPolicy `json:"trusted_local,omitempty"`
-	Root                    string              `json:"root"`
-	AllowedPaths            []string            `json:"allowed_paths"`
-	Providers               []string            `json:"providers"`
+	PrivateSource           *PrivateSourcePolicy `json:"private_source,omitempty"`
+	Limits                  ProjectLimits        `json:"limits,omitzero"`
+	AllowAGYReserveOverride bool                 `json:"allow_agy_weekly_reserve_override,omitempty"`
+	TrustedLocal            *TrustedLocalPolicy  `json:"trusted_local,omitempty"`
+	Root                    string               `json:"root"`
+	AllowedPaths            []string             `json:"allowed_paths"`
+	Providers               []string             `json:"providers"`
 }
 
 type ProviderConfig struct {
-	OpenCodeTransport    string `json:"opencode_transport,omitempty"`
-	EnableSynthetic      bool   `json:"enable_synthetic,omitempty"`
-	ID                   string `json:"id"`
-	Path                 string `json:"path,omitempty"`
-	Model                string `json:"model"`
-	Speed                string `json:"speed,omitempty"`
-	ExpectedBinarySHA256 string `json:"expected_binary_sha256,omitempty"`
+	OpenCodeTransport     string   `json:"opencode_transport,omitempty"`
+	EnableSynthetic       bool     `json:"enable_synthetic,omitempty"`
+	ID                    string   `json:"id"`
+	Path                  string   `json:"path,omitempty"`
+	Model                 string   `json:"model"`
+	Speed                 string   `json:"speed,omitempty"`
+	Variant               string   `json:"variant,omitempty"`
+	ExpectedBinarySHA256  string   `json:"expected_binary_sha256,omitempty"`
+	AttestedAccount       string   `json:"attested_account,omitempty"`
+	AttestedAccountSHA256 string   `json:"attested_account_sha256,omitempty"`
+	ACPCommand            string   `json:"acp_command,omitempty"`
+	ACPArgs               []string `json:"acp_args,omitempty"`
+}
+
+type XcodeSchemeRunnerConfig struct {
+	Verified        bool     `json:"verified,omitempty"`
+	Schemes         []string `json:"schemes,omitempty"`
+	AcceptanceModes []string `json:"acceptance_modes,omitempty"`
 }
 
 type Config struct {
-	CapacityPolicy        CapacityPolicy    `json:"capacity_policy,omitzero"`
-	ModelAuditFile        string            `json:"model_audit_file,omitempty"`
-	ModelAudit            *ModelInventory   `json:"-"`
-	StateDir              string            `json:"state_dir"`
-	Repositories          map[string]Repo   `json:"repositories"`
-	Providers             []ProviderConfig  `json:"providers"`
-	EnableFixture         bool              `json:"enable_fixture,omitempty"`
-	EnableCodexBar        bool              `json:"enable_codexbar,omitempty"`
-	CodexBarAccountSHA256 map[string]string `json:"codexbar_account_sha256,omitempty"`
+	CapacityPolicy        CapacityPolicy           `json:"capacity_policy,omitzero"`
+	ModelAuditFile        string                   `json:"model_audit_file,omitempty"`
+	ModelAudit            *ModelInventory          `json:"-"`
+	LocalXcodeRunner      *XcodeSchemeRunnerConfig `json:"local_xcode_runner,omitempty"`
+	StateDir              string                   `json:"state_dir"`
+	Repositories          map[string]Repo          `json:"repositories"`
+	Providers             []ProviderConfig         `json:"providers"`
+	EnableFixture         bool                     `json:"enable_fixture,omitempty"`
+	EnableCodexBar        bool                     `json:"enable_codexbar,omitempty"`
+	CodexBarAccountSHA256 map[string]string        `json:"codexbar_account_sha256,omitempty"`
+	CodexBarBinarySHA256  string                   `json:"codexbar_binary_sha256,omitempty"`
 }
 
 func LoadConfig(name string) (Config, error) {
 	var c Config
-	f, err := os.Open(name)
+	f, err := os.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return c, err
 	}
@@ -246,6 +611,9 @@ func LoadConfig(name string) (Config, error) {
 			return c, fmt.Errorf("invalid CodexBar account binding")
 		}
 	}
+	if digest, err := hex.DecodeString(c.CodexBarBinarySHA256); c.CodexBarBinarySHA256 != "" && (err != nil || len(digest) != sha256.Size) {
+		return c, fmt.Errorf("invalid CodexBar binary pin")
+	}
 	for _, p := range c.Providers {
 		if p.OpenCodeTransport != "" && (p.ID != "opencode" ||
 			p.OpenCodeTransport != OpenCodeStateless && p.OpenCodeTransport != OpenCodeNativeReadAsk) {
@@ -264,6 +632,28 @@ func LoadConfig(name string) (Config, error) {
 		for _, p := range repo.AllowedPaths {
 			if !SafePath(p) {
 				return c, fmt.Errorf("invalid repository path policy")
+			}
+		}
+		if policy := repo.PrivateSource; policy != nil {
+			info, err := f.Stat()
+			link, linkErr := os.Lstat(name)
+			if err != nil || linkErr != nil || !info.Mode().IsRegular() || !os.SameFile(info, link) ||
+				info.Mode().Perm()&0077 != 0 || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) ||
+				info.Sys().(*syscall.Stat_t).Nlink != 1 {
+				return c, fmt.Errorf("private source requires a private, user-owned configuration file")
+			}
+			statePath, resolveErr := filepath.EvalSymlinks(c.StateDir)
+			stateInfo, statErr := os.Stat(c.StateDir)
+			if resolveErr != nil || statErr != nil || statePath != c.StateDir || !stateInfo.IsDir() ||
+				stateInfo.Mode().Perm() != 0700 || stateInfo.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) ||
+				!privateStateSeparate(repo.Root, statePath) {
+				return c, fmt.Errorf("private source requires an existing canonical private state directory outside the repository")
+			}
+			if len(c.Repositories) != 1 {
+				return c, fmt.Errorf("private source requires a dedicated single-repository server")
+			}
+			if err := policy.validate(c, repo); err != nil {
+				return c, err
 			}
 		}
 		if policy := repo.TrustedLocal; policy != nil {
@@ -302,6 +692,39 @@ func LoadConfig(name string) (Config, error) {
 	return c, nil
 }
 
+// Compare directory identities because case-insensitive filesystems may
+// resolve different path spellings to the same directory.
+func privateStateSeparate(repoRoot, stateRoot string) bool {
+	realRepo, err := filepath.EvalSymlinks(repoRoot)
+	if err != nil || realRepo != repoRoot {
+		return false
+	}
+	contains := func(parent, child string) (bool, error) {
+		want, err := os.Stat(parent)
+		if err != nil {
+			return false, err
+		}
+		if !want.IsDir() {
+			return true, nil
+		}
+		for path := child; ; path = filepath.Dir(path) {
+			info, err := os.Stat(path)
+			if err != nil {
+				return false, err
+			}
+			if os.SameFile(info, want) {
+				return true, nil
+			}
+			if path == filepath.Dir(path) {
+				return false, nil
+			}
+		}
+	}
+	underRepo, repoErr := contains(repoRoot, stateRoot)
+	underState, stateErr := contains(stateRoot, repoRoot)
+	return repoErr == nil && stateErr == nil && !underRepo && !underState
+}
+
 func Within(parent, child string) (string, bool) {
 	r, err := filepath.Rel(parent, child)
 	return r, err == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator))
@@ -318,13 +741,19 @@ func ValidTrustedLocalPath(name string) bool {
 
 var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 var secretPattern = regexp.MustCompile(`(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:sk-(?:proj-)?|gh[pousr]_|github_pat_|AIza)[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16}|(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*["'][A-Za-z0-9_+./=-]{12,}["']`)
+var personalDataPattern = regexp.MustCompile(`(?i)\b(?:personal_data|pii_classified)\b|\b[A-Za-z0-9._%+-]+@(?:gmail|yahoo|hotmail|outlook|icloud|protonmail|yarinlik)\.[A-Za-z]{2,}\b|\bTR\d{2}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{2}\b|\b(?:tckn|tc_kimlik|ssn|national_id)\s*[:=]\s*["']?[0-9-]{9,11}["']?`)
 
 func ValidID(s string) bool { return idPattern.MatchString(s) }
 
 func ContainsSecret(b []byte) bool { return secretPattern.Match(b) }
 
+func ContainsPersonalData(b []byte) bool { return personalDataPattern.Match(b) }
+
 func SafePath(p string) bool {
-	if p == "." || p == "" || len(p) > 512 || path.IsAbs(p) || path.Clean(p) != p ||
+	if p == "." {
+		return true
+	}
+	if p == "" || len(p) > 512 || path.IsAbs(p) || path.Clean(p) != p ||
 		strings.ContainsAny(p, "\\:\x00\r\n\t") {
 		return false
 	}
@@ -343,7 +772,7 @@ func SafePath(p string) bool {
 
 func InScope(name string, paths []string) bool {
 	for _, p := range paths {
-		if name == p || strings.HasPrefix(name, p+"/") {
+		if p == "." || name == p || strings.HasPrefix(name, p+"/") {
 			return true
 		}
 	}
@@ -411,10 +840,17 @@ func (t *Task) Validate(repo Repo) *Fault {
 		return Error("POLICY_DENIED", "AGY weekly reserve override requires repository authorization and a bounded task justification")
 	}
 	if ContainsSecret([]byte(t.Objective)) {
-		return Error("POLICY_DENIED", "objective contains a secret pattern")
+		return GateError("POLICY_DENIED", "SECRET_DETECTED", "objective contains a secret pattern", "remove_secret_before_retry")
 	}
-	if t.DataClass == "repository_internal" {
-		return Error("POLICY_DENIED", "repository_internal requires a certified data policy")
+	if ContainsPersonalData([]byte(t.Objective)) || slices.ContainsFunc(t.Acceptance, func(c Check) bool {
+		return ContainsPersonalData([]byte(c.Description))
+	}) {
+		return GateError("POLICY_DENIED", "PERSONAL_DATA_CLASSIFIED", "objective or acceptance contains classified personal data", "remove_personal_data_before_retry")
+	}
+	if t.DataClass == PrivateSourceData || repo.PrivateSource != nil {
+		if fault := repo.PrivateSource.CheckRequest(*t, time.Now()); fault != nil {
+			return fault
+		}
 	}
 	ids := map[string]bool{}
 	for _, c := range t.Acceptance {
@@ -423,7 +859,7 @@ func (t *Task) Validate(repo Repo) *Fault {
 			return Error("INVALID_INPUT", "invalid acceptance criterion")
 		}
 		if ContainsSecret([]byte(c.Description)) {
-			return Error("POLICY_DENIED", "criterion contains a secret pattern")
+			return GateError("POLICY_DENIED", "SECRET_DETECTED", "criterion contains a secret pattern", "remove_secret_before_retry")
 		}
 		ids[c.ID] = true
 	}
@@ -466,10 +902,14 @@ func (t *Task) Validate(repo Repo) *Fault {
 			return Error("POLICY_DENIED", "untracked path is outside the task scope")
 		}
 	}
-	for _, p := range []string{t.TaskClass, t.Risk, t.Priority, t.Strategy, t.PreferredProvider} {
+	for _, p := range []string{t.TaskClass, t.Risk, t.Priority, t.Strategy, t.PreferredProvider, t.TargetTier, t.TargetEffort} {
 		if p != "" && !ValidID(p) {
 			return Error("INVALID_INPUT", "invalid task option")
 		}
+	}
+	if t.TargetTier != "" && !slices.Contains([]string{"auto", "free", "cheap", "balanced", "hard", "frontier"}, t.TargetTier) ||
+		t.TargetEffort != "" && !slices.Contains([]string{"low", "medium", "high", "max"}, t.TargetEffort) {
+		return Error("INVALID_INPUT", "invalid target tier or effort")
 	}
 	if len(t.PreferredModel) > 128 || ContainsSecret([]byte(t.PreferredModel)) {
 		return Error("INVALID_INPUT", "invalid model preference")
@@ -592,6 +1032,8 @@ type Attempt struct {
 	OpenCodeTransport      string               `json:"opencode_transport,omitempty"`
 	OpenCode               *OpenCodeRunEvidence `json:"opencode,omitempty"`
 	AGY                    *AGYRunEvidence      `json:"agy,omitempty"`
+	Codex                  *CLIRunEvidence      `json:"codex,omitempty"`
+	Claude                 *CLIRunEvidence      `json:"claude,omitempty"`
 	Handoffs               []HandoffManifest    `json:"handoffs,omitempty"`
 	Cost                   *CostEvidence        `json:"cost,omitempty"`
 	Number                 int                  `json:"number"`
@@ -623,6 +1065,9 @@ type Decision struct {
 	QualityRole         string        `json:"quality_role,omitempty"`
 	QualityTier         int           `json:"quality_tier,omitempty"`
 	QualitySource       string        `json:"quality_source,omitempty"`
+	FPTier              string        `json:"fp_tier,omitempty"`
+	HeadroomPercent     float64       `json:"headroom_percent,omitempty"`
+	HeadroomState       string        `json:"headroom_state,omitempty"`
 	CapacityState       string        `json:"capacity_state,omitempty"`
 	QuotaObservedAt     *time.Time    `json:"quota_observed_at,omitempty"`
 	WeeklyFloor         float64       `json:"agy_weekly_floor_percent,omitempty"`
@@ -709,6 +1154,27 @@ type AGYRunEvidence struct {
 	Cost                      *CostEvidence           `json:"cost,omitempty"`
 }
 
+type CLIRunEvidence struct {
+	SessionSHA256    string         `json:"session_sha256,omitempty"`
+	Summary          string         `json:"summary,omitempty"`
+	StartupVerified  bool           `json:"startup_verified,omitempty"`
+	TerminalVerified bool           `json:"terminal_verified,omitempty"`
+	InputTokens      int64          `json:"input_tokens,omitempty"`
+	OutputTokens     int64          `json:"output_tokens,omitempty"`
+	ObservedTools    map[string]int `json:"observed_tools,omitempty"`
+}
+
+type ACPRunEvidence struct {
+	SessionID        string `json:"session_id,omitempty"`
+	Summary          string `json:"summary,omitempty"`
+	TerminalVerified bool   `json:"terminal_verified,omitempty"`
+}
+
+type LocalRunEvidence struct {
+	Summary          string `json:"summary,omitempty"`
+	TerminalVerified bool   `json:"terminal_verified,omitempty"`
+}
+
 type OpenCodeRunEvidence struct {
 	NativeChild      *NativeChildEvidence `json:"native_child,omitempty"`
 	Session          *SessionEvidence     `json:"session,omitempty"`
@@ -737,6 +1203,8 @@ type Result struct {
 	Checks          []CheckEvidence          `json:"checks,omitempty"`
 	Review          *ReviewResult            `json:"review,omitempty"`
 	SummarySHA256   string                   `json:"summary_sha256,omitempty"`
+	GrantDigest     string                   `json:"grant_digest,omitempty"`
+	SnapshotID      string                   `json:"snapshot_id,omitempty"`
 	Cost            *CostEvidence            `json:"cost,omitempty"`
 	Summary         string                   `json:"summary"`
 	ArtifactID      string                   `json:"artifact_id,omitempty"`
@@ -780,8 +1248,10 @@ type Job struct {
 	PolicyDigest         string          `json:"policy_digest"`
 	Attempts             []Attempt       `json:"attempts,omitempty"`
 	Route                []Decision      `json:"route,omitempty"`
-	Result               *Result         `json:"result,omitempty"`
-	ResumeRequest        string          `json:"resume_request,omitempty"`
+	Result               *Result           `json:"result,omitempty"`
+	ResumeRequest        string            `json:"resume_request,omitempty"`
+	Diff                 string            `json:"diff,omitempty"`
+	Artifacts            map[string]string `json:"artifacts,omitempty"`
 }
 
 type ExecutionProfile struct {
@@ -791,6 +1261,8 @@ type ExecutionProfile struct {
 }
 
 type Capability struct {
+	AttestedAccount       string             `json:"attested_account,omitempty"`
+	AttestedAccountSHA256 string             `json:"attested_account_sha256,omitempty"`
 	OpenCodeEndpoint      string             `json:"opencode_endpoint,omitempty"`
 	Quality               []QualityEvidence  `json:"quality_evidence,omitempty"`
 	AuditValidUntil       *time.Time         `json:"audit_valid_until,omitempty"`
@@ -802,9 +1274,39 @@ type Capability struct {
 	Cost                  *CostEvidence      `json:"cost,omitempty"`
 	Provider              string             `json:"provider"`
 	Model                 string             `json:"model,omitempty"`
+	FPTier                string             `json:"fp_tier,omitempty"`
+	HeadroomPercent       float64            `json:"headroom_percent,omitempty"`
+	HeadroomState         string             `json:"headroom_state,omitempty"`
 	Status                string             `json:"status"`
 	Reason                string             `json:"reason,omitempty"`
 	Mode                  string             `json:"execution_mode,omitempty"`
 	Fingerprint           string             `json:"fingerprint,omitempty"`
 	Speed                 string             `json:"speed,omitempty"`
+}
+
+type LocalRunnerCapability struct {
+	Runner          string   `json:"runner"`
+	Status          string   `json:"status"`
+	Reason          string   `json:"reason,omitempty"`
+	NextAction      string   `json:"next_action,omitempty"`
+	NetworkBoundary string   `json:"network_boundary,omitempty"`
+	Schemes         []string `json:"schemes,omitempty"`
+	AcceptanceModes []string `json:"acceptance_modes,omitempty"`
+}
+
+type UnmetGate struct {
+	Gate       string `json:"gate"`
+	Reason     string `json:"reason"`
+	NextAction string `json:"next_action"`
+}
+
+type RepoAdmissionReport struct {
+	RepoID               string      `json:"repo_id"`
+	Registered           bool        `json:"registered"`
+	PrivateSourceEnabled bool        `json:"private_source_enabled"`
+	ReadOnlyAdmitted     bool        `json:"read_only_admitted"`
+	WriteAdmitted        bool        `json:"write_admitted"`
+	GrantDigest          string      `json:"grant_digest,omitempty"`
+	ExpiresAt            *time.Time  `json:"expires_at,omitempty"`
+	UnmetGates           []UnmetGate `json:"unmet_gates,omitempty"`
 }

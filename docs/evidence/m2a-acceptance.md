@@ -43,11 +43,11 @@ The AGY preflight verified the existing subscription quota and documented `useG1
 - `CGO_ENABLED=1 go test -mod=readonly -race -count=1 -p=1 ./...` passed.
 - `CGO_ENABLED=0 go vet -mod=readonly -p=1 ./...` and `go mod verify` passed.
 - The stdio suite found eight tools and exercised the existing M1 fixture handoff, job persistence, pause, resume and cancellation. The SQLite table schema was preserved. New optional evidence fields are stored in the existing JSON job body.
-- `make dist` produced a Mach-O x86_64 executable. Its version output was `ahenk 0.1.0 darwin/amd64`. The extracted Apache license matched the source file byte for byte.
+- `make dist` produced a Mach-O x86_64 executable. At the time of the M2A milestone snapshot, its version output was `ahenk 0.1.0 darwin/amd64` (superseded by `0.3.0-beta.1` in the public beta release; see [public beta acceptance](public-beta-acceptance.md)). The extracted Apache license matched the source file byte for byte.
 
 ## Open-Source Readiness
 
-The GitHub project is public. Local `origin` is `git@github.com:faoztas/ahenk-mcp.git` and the Go module is `github.com/faoztas/ahenk-mcp`. The local `main` branch has no commits. The repository has no commit history to remediate. Review and separate authorization are required for the initial commit and push.
+The GitHub project is public. Local `origin` is `git@github.com:faoztas/ahenk-mcp.git` and the Go module is `github.com/faoztas/ahenk-mcp`. At the M2A pre-commit audit snapshot, the local `main` branch had no commits and therefore no historical commit history to remediate; subsequent approved commits are tracked on `main`.
 
 The root license is the complete Apache License, Version 2.0. Original source files carry `Apache-2.0` SPDX identifiers. The Intel package includes 39 upstream legal files covering 18 linked modules and the Go toolchain, with their original text preserved. The project has no upstream attribution requiring a root NOTICE file. [Third-party inventory](../third-party-licenses.md)
 

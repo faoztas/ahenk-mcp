@@ -70,12 +70,15 @@ func TestCapacityQualityAndReserveT01T02T03(t *testing.T) {
 	}
 	e.reg.Candidates[0].Quality[0].Tier = 2
 	e.quotas["agy"][1] = quotaFixture("agy", "gemini-weekly", "gemini", weeklyMinutes, 16, now)
-	if c, _ := e.route(&j, now); c.Provider != "" {
-		t.Fatal("T03 silently downgraded quality")
+	// Faz 2 removed the rigid QUALITY_TIER_BELOW_BEST lock: with the premium
+	// family held as a protected reserve, routing falls back explicitly to
+	// the verified free route instead of silently blocking the job.
+	if c, _ := e.route(&j, now); c.Provider != "opencode" {
+		t.Fatal("T03 did not fall back to the verified free route")
 	}
 	finishWithoutRoute(&j)
 	w := requireWarning(t, e.capacityWarnings(j.ID, j.Route, j.Status, now), reserveReason)
-	if w.Threshold != 15 || w.Remaining == nil || *w.Remaining != 16 || w.Alternative != "NO_EQUIVALENT_OPENCODE_ROUTE" {
+	if w.Threshold != 15 || w.Remaining == nil || *w.Remaining != 16 || w.Alternative != "EQUIVALENT_OPENCODE_ROUTE:SELECTED_OPENCODE" {
 		t.Fatalf("reserve warning lacks evidence: %+v", w)
 	}
 	repo := e.cfg.Repositories[j.RepoID]
@@ -345,5 +348,39 @@ func TestCapacityReservationCoversAttemptsOverlappingObservation(t *testing.T) {
 	r := e.agyReserve(j, "gemini", now, time.Minute, e.quotas["codex"][1])
 	if r.reason != reserveReason || r.floor != 20 {
 		t.Fatalf("unaccounted overlapping spend: %+v", r)
+	}
+}
+
+func TestCriticalControllerKeepsPrivateSourceRouteAndQuotaGates(t *testing.T) {
+	now := capacityClock
+	e, job := capacityFixture(now)
+	e.quotas["codex"][0] = quotaFixture("codex", "primary", "", 300, 5, now)
+	e.quotas["codex"][1] = quotaFixture("codex", "secondary", "", weeklyMinutes, 5, now)
+	open := &e.reg.Candidates[1]
+	open.Mode, open.Fingerprint = "tool_free", "bfd1f79c2fb005246c56d0e9fb472206c22782d065872d71c26f01f3eb3a0a82"
+	open.OpenCodeAccount, open.OpenCodeEndpoint, open.OpenCodeTransport = model.OpenCodeAnonymous, model.OpenCodeFreeEndpoint, model.OpenCodeNativeReadAsk
+	open.Cost = &model.CostEvidence{Policy: "FREE_ONLY", Status: "CATALOG_PREFLIGHT_REQUIRED"}
+	repo := e.cfg.Repositories[job.RepoID]
+	repo.PrivateSource = &model.PrivateSourcePolicy{ExpiresAt: now.Add(time.Hour),
+		Files: map[string]string{"main.go": model.Hash([]byte("package main\n"))},
+		Routes: []model.PrivateRoute{{Provider: open.Provider, Model: open.Model, Fingerprint: open.Fingerprint,
+			Transport: open.OpenCodeTransport, DataHandlingReviewed: true}}}
+	e.cfg.Repositories[job.RepoID] = repo
+	job.Task.DataClass, job.Task.AllowedPaths = model.PrivateSourceData, []string{"main.go"}
+	if c, _ := e.route(&job, now); c.Provider != "opencode" {
+		t.Fatal("eligible private source worker was not selected under critical controller quota")
+	}
+	if w := requireWarning(t, e.capacityWarnings(job.ID, job.Route, job.Status, now), "CODEX_CONTROLLER_LOW"); w.Severity != "critical" {
+		t.Fatal("critical controller capacity not surfaced")
+	}
+	reset := now.Add(time.Hour)
+	e.rememberOpenCodeHealth(&model.Attempt{Provider: "opencode", Model: open.Model, OpenCodeAccount: open.OpenCodeAccount,
+		OpenCodeEndpoint: open.OpenCodeEndpoint, OpenCodeTransport: open.OpenCodeTransport, Code: "RATE_LIMIT", FinishedAt: &now, RetryAt: &reset})
+	if c, _ := e.route(&job, now); c.Provider != "" {
+		t.Fatal("critical controller quota admitted a rate-limited or unapproved route")
+	}
+	repo.PrivateSource.ExpiresAt = now
+	if c, _ := e.route(&job, now); c.Provider != "" {
+		t.Fatal("critical controller quota bypassed the expired grant")
 	}
 }

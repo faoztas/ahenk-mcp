@@ -116,11 +116,6 @@ func auditCooldown(ctx context.Context, state string) (providers.AuditCooldown, 
 	if err != nil {
 		return nil, err
 	}
-	imports, err := store.ReadOpenCodeCooldownImports(state)
-	if err != nil {
-		return nil, err
-	}
-	records = append(records, imports...)
 	return func(id string, now time.Time) *time.Time {
 		var latest *time.Time
 		for _, r := range records {

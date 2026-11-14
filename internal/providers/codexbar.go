@@ -6,9 +6,11 @@ package providers
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,27 +19,125 @@ import (
 )
 
 const (
-	codexBarPath        = "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI"
-	codexBarFingerprint = "0c37d6b892f2435266a842d426b06bf8bd9afd0443f5f81ef2a117d66703366e"
+	codexBarPath         = "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI"
+	codexBarExpectedTeam = "Y5PE65HELJ"
+	// An unpinned binary still passes every signature and identity check;
+	// the attestation marks the missing hash pin for telemetry instead of
+	// silently widening trust or blocking live quota reads.
+	codexBarUnpinned = "UNPINNED_CODESIGNED"
 )
+
+var (
+	codesignBin = "/usr/bin/codesign"
+	// knownCodexBarHashes pins the audited CodexBar releases. New codesigned
+	// builds from the expected team are accepted with codexBarUnpinned.
+	knownCodexBarHashes = map[string]string{
+		"0c37d6b892f2435266a842d426b06bf8bd9afd0443f5f81ef2a117d66703366e": "0.83.0",
+		"c5e1202974689b0dee263d6d00405536dddd8ccdf59ee0cd51c07c3ecb2794ad": "0.84.0",
+	}
+)
+
+// resolveCodexBarBinary resolves the configured or default CodexBar CLI path,
+// following symlinks (for example ~/.local/bin/codexbar) to the app helper.
+func resolveCodexBarBinary(customPath string) (string, error) {
+	target := customPath
+	if target == "" {
+		target = codexBarPath
+		if _, err := os.Stat(target); err != nil {
+			if home, herr := os.UserHomeDir(); herr == nil {
+				if link := filepath.Join(home, ".local", "bin", "codexbar"); func() bool {
+					_, serr := os.Stat(link)
+					return serr == nil
+				}() {
+					target = link
+				}
+			}
+		}
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return "", err
+	}
+	if st, err := os.Stat(resolved); err != nil || st.IsDir() {
+		return "", os.ErrNotExist
+	}
+	return resolved, nil
+}
+
+// codexBarTeamID reads the signing team identifier from codesign.
+func codexBarTeamID(ctx context.Context, path string) (string, error) {
+	cmd := exec.CommandContext(ctx, codesignBin, "-dv", path)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		if team, ok := strings.CutPrefix(strings.TrimSpace(line), "TeamIdentifier="); ok &&
+			team != "" && team != "not set" {
+			return team, nil
+		}
+	}
+	return "", errors.New("no team identifier")
+}
+
+// verifyCodexBarBinary resolves the CodexBar CLI, verifies its macOS code
+// signature and team identifier, and pins its SHA-256 against the allowlist
+// or a configured pin. It returns the resolved path, the binary fingerprint
+// and the attestation marker ("0.83.0", "0.84.0", "CONFIGURED" or
+// "UNPINNED_CODESIGNED").
+func verifyCodexBarBinary(ctx context.Context, customPath, customHash string) (string, string, string, error) {
+	unverified := func(msg string) (string, string, string, error) {
+		return "", "", "", model.Error("CODEXBAR_BINARY_UNVERIFIED", "CODEXBAR_BINARY_UNVERIFIED: "+msg)
+	}
+	resolved, err := resolveCodexBarBinary(customPath)
+	if err != nil {
+		return unverified("CodexBar CLI not found")
+	}
+	if err := exec.CommandContext(ctx, codesignBin, "--verify", "--strict", resolved).Run(); err != nil {
+		return unverified("CodexBar CLI failed strict codesign verification")
+	}
+	team, err := codexBarTeamID(ctx, resolved)
+	if err != nil {
+		return unverified("CodexBar CLI signing identity could not be read")
+	}
+	if team != codexBarExpectedTeam {
+		return unverified("CodexBar CLI was signed by an unexpected team")
+	}
+	fp, err := Fingerprint(resolved)
+	if err != nil {
+		return unverified("CodexBar CLI fingerprint failed")
+	}
+	if version, pinned := knownCodexBarHashes[fp]; pinned {
+		return resolved, fp, version, nil
+	}
+	if customHash != "" {
+		if fp == customHash {
+			return resolved, fp, "CONFIGURED", nil
+		}
+		return unverified("CodexBar CLI does not match the configured binary pin")
+	}
+	return resolved, fp, codexBarUnpinned, nil
+}
 
 // ReadCodexBar runs the existing account's documented usage command. Only
 // normalized quota windows leave this function.
-func ReadCodexBar(ctx context.Context, provider string, agy model.ProviderConfig, expectedAccount string) []Quota {
+func ReadCodexBar(ctx context.Context, provider string, agy model.ProviderConfig, expectedAccount, binarySHA256 string) []Quota {
 	unknown := func(reason string) []Quota {
 		q := UnknownQuota(provider)
 		q.Reason = reason
 		return []Quota{q}
 	}
-	fp, err := Fingerprint(codexBarPath)
-	if err != nil || fp != codexBarFingerprint ||
-		exec.CommandContext(ctx, "/usr/bin/codesign", "--verify", "--strict", codexBarPath).Run() != nil {
+	cliPath, _, _, err := verifyCodexBarBinary(ctx, "", binarySHA256)
+	if err != nil {
 		return unknown("CODEXBAR_BINARY_UNVERIFIED")
 	}
 	source, providerArg := "oauth", "codex"
 	agyPath := ""
 	switch provider {
 	case "codex":
+	case "claude", "copilot":
+		source, providerArg = "oauth", provider
 	case "agy":
 		source, providerArg = "cli", "antigravity"
 		if _, err := verifyAGY(ctx, agy); err != nil {
@@ -52,7 +152,7 @@ func ReadCodexBar(ctx context.Context, provider string, agy model.ProviderConfig
 		return unknown("USAGE_UNAVAILABLE")
 	}
 	defer os.RemoveAll(dir)
-	cmd := exec.Command(codexBarPath, "usage", "--provider", providerArg, "--source", source, "--format", "json", "--json-only", "--no-credits")
+	cmd := exec.Command(cliPath, "usage", "--provider", providerArg, "--source", source, "--format", "json", "--json-only", "--no-credits")
 	// The explicit path disables CodexBar's ambient AGY search. An empty
 	// override means CodexBar must not launch AGY for the Codex query.
 	cmd.Env = []string{"ANTIGRAVITY_CLI_PATH=" + agyPath}
@@ -119,12 +219,22 @@ func runUsage(ctx context.Context, cmd *exec.Cmd, dir string) ([]byte, []byte, e
 // overrides in the controller environment cannot select an alternate route.
 func vendorUsageEnv(env []string, dir string) []string {
 	launcher := filepath.Join(dir, "open")
-	env = append(env, "PATH="+dir+":/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C", "TMPDIR="+dir,
-		"BROWSER="+launcher, "AGY_CLI_DISABLE_AUTO_UPDATE=true")
-	for _, key := range []string{"HOME", "USER", "LOGNAME"} {
-		if value, ok := os.LookupEnv(key); ok {
-			env = append(env, key+"="+value)
+	clean := []string{
+		"PATH=" + dir + ":/usr/bin:/bin:/usr/sbin:/sbin",
+		"LC_ALL=C",
+		"TMPDIR=" + dir,
+		"BROWSER=" + launcher,
+		"AGY_CLI_DISABLE_AUTO_UPDATE=true",
+	}
+	for _, e := range env {
+		if strings.HasPrefix(e, "ANTIGRAVITY_CLI_PATH=") {
+			clean = append(clean, e)
 		}
 	}
-	return env
+	for _, key := range []string{"HOME", "USER", "LOGNAME"} {
+		if value, ok := os.LookupEnv(key); ok {
+			clean = append(clean, key+"="+value)
+		}
+	}
+	return clean
 }

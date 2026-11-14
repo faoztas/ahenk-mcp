@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -80,5 +81,38 @@ func TestReadOpenCodeRateLimitsIncludesCommittedWAL(t *testing.T) {
 	defer db.Close()
 	if _, err := ReadOpenCodeRateLimits(t.Context(), dir); err != syscall.EWOULDBLOCK {
 		t.Fatalf("import did not respect scheduler ownership: %v", err)
+	}
+}
+
+func TestReadOpenCodeRateLimitsCarriesImportedHistory(t *testing.T) {
+	parent := t.TempDir()
+	source, err := Open(filepath.Join(parent, "source"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	rows := []OpenCodeCooldownImport{
+		{SourceDir: filepath.Join(parent, "original"), JobID: "native", Attempt: 1, Model: "opencode/glm-5.3-flash-free",
+			OpenCodeTransport: model.OpenCodeNativeReadAsk, FinishedAt: now, RetryAfterMS: 90000},
+		{SourceDir: filepath.Join(parent, "original"), JobID: "stateless", Attempt: 1, Model: "opencode/beam-free",
+			FinishedAt: now, RetryAfterMS: 60000},
+	}
+	imported, err := source.SaveOpenCodeCooldownImports(rows, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.Close()
+	history, err := ReadOpenCodeRateLimits(t.Context(), source.Dir)
+	if err != nil || !slices.Equal(history, imported) {
+		t.Fatalf("carried history mismatch: %v", err)
+	}
+	dest, err := Open(filepath.Join(parent, "dest"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dest.Close()
+	reimported, err := dest.SaveOpenCodeCooldownImports(history, now.Add(time.Minute))
+	if err != nil || !slices.Equal(reimported, imported) {
+		t.Fatalf("source provenance changed on second import: %v", err)
 	}
 }
