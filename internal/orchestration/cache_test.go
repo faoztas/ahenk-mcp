@@ -16,7 +16,7 @@ func TestQuotaCacheServesMemoryWithinTTLAndRefreshesInBackground(t *testing.T) {
 	now := time.Now().UTC()
 	remaining := 90.0
 	e := &Engine{
-		cfg: model.Config{},
+		cfg: model.Config{EnableCodexBar: true},
 		quotas: map[string][]providers.Quota{"codex": {
 			{Bucket: "primary", WindowMinutes: 300, Unit: "percent", AccountMatch: "MATCHED", State: "KNOWN", Remaining: &remaining, ObservedAt: now},
 		}},
@@ -65,7 +65,7 @@ func TestQuotaCacheFirstRefreshIsNeverBlockedByCaller(t *testing.T) {
 	now := time.Now().UTC()
 	remaining := 80.0
 	e := &Engine{
-		cfg: model.Config{},
+		cfg: model.Config{EnableCodexBar: true},
 		quotas: map[string][]providers.Quota{"agy": {
 			{Family: "gemini", Bucket: "gemini-5h", Unit: "percent", AccountMatch: "MATCHED", State: "KNOWN", Remaining: &remaining, ObservedAt: now},
 		}},
@@ -85,4 +85,24 @@ func TestQuotaCacheFirstRefreshIsNeverBlockedByCaller(t *testing.T) {
 		t.Fatalf("wrong cached rows: %+v", rows)
 	}
 	close(slow)
+}
+
+func TestQuotaCacheKeepsObservationsWithCodexBarDisabled(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	e := &Engine{
+		quotas:     make(map[string][]providers.Quota),
+		readQuotas: func() { <-release },
+	}
+	zero := 0.0
+	e.SetQuotaForTest("codex", []providers.Quota{{Bucket: providers.BarCodexBurst, Remaining: &zero}})
+
+	_ = e.Quota("claude")
+	// A started refresh holds the flag until the fake reader is released.
+	if e.quotaRefreshing.Load() {
+		t.Fatal("quota diagnostics started a refresh with CodexBar disabled")
+	}
+	if health := e.HealthPercent(providers.BarCodexBurst); health != 0 {
+		t.Fatalf("fresh exhausted observation was lost: health=%v", health)
+	}
 }

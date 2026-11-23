@@ -68,10 +68,10 @@ func (e *Engine) readQuotasOnce() {
 	e.mu.Unlock()
 }
 
-// refreshQuotasAsync triggers at most one background refresh when the cached
-// quota snapshot is older than the TTL. It never blocks the caller.
+// refreshQuotasAsync refreshes stale quota snapshots in the background for
+// engines with CodexBar enabled.
 func (e *Engine) refreshQuotasAsync() {
-	if e.readQuotas == nil || e.quotaRefreshing.Load() {
+	if !e.cfg.EnableCodexBar || e.readQuotas == nil || e.quotaRefreshing.Load() {
 		return
 	}
 	if e.ctx != nil && e.ctx.Err() != nil {
