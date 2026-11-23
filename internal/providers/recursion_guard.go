@@ -4,12 +4,20 @@
 package providers
 
 import (
-	"os"
 	"strconv"
 	"strings"
 
 	"github.com/faoztas/ahenk-mcp/internal/model"
 )
+
+var blockedEnvExact = map[string]bool{
+	"AGY_ADC_AUTH": true,
+	"TOKEN":        true,
+	"SECRET":       true,
+	"PASSWORD":     true,
+	"KEY":          true,
+	"API_KEY":      true,
+}
 
 var blockedEnvPrefixes = []string{
 	"AWS_",
@@ -22,15 +30,24 @@ var blockedEnvPrefixes = []string{
 	"CODEX_",
 	"CLAUDE_",
 	"OPENCODE_",
-	"TOKEN",
-	"SECRET",
-	"PASSWORD",
-	"KEY",
+	"TOKEN_",
+	"SECRET_",
+	"PASSWORD_",
+	"KEY_",
+	"API_KEY_",
+}
+
+var blockedEnvSuffixes = []string{
+	"_API_KEY",
+	"_KEY",
+	"_TOKEN",
+	"_SECRET",
+	"_PASSWORD",
 }
 
 func isBlockedSecretEnv(key string) bool {
-	upper := strings.ToUpper(key)
-	if upper == "AGY_ADC_AUTH" {
+	upper := strings.ToUpper(strings.TrimSpace(key))
+	if blockedEnvExact[upper] {
 		return true
 	}
 	for _, p := range blockedEnvPrefixes {
@@ -38,12 +55,67 @@ func isBlockedSecretEnv(key string) bool {
 			return true
 		}
 	}
+	for _, s := range blockedEnvSuffixes {
+		if strings.HasSuffix(upper, s) {
+			return true
+		}
+	}
 	return false
+}
+
+// DepthFromEnv reads AHENK_CHILD_DEPTH and AHENK_MAX_DEPTH from env.
+// If AHENK_CHILD_SESSION=1 is present without a positive AHENK_CHILD_DEPTH,
+// currentDepth fails safe to 1.
+func DepthFromEnv(env []string) (currentDepth, maxDepth int) {
+	var childSession string
+	for _, e := range env {
+		k, v, ok := strings.Cut(e, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "AHENK_CHILD_SESSION":
+			childSession = strings.TrimSpace(v)
+		case "AHENK_CHILD_DEPTH":
+			if d, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && d > 0 {
+				currentDepth = d
+			} else {
+				currentDepth = 0
+			}
+		case "AHENK_MAX_DEPTH":
+			if m, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && m > 0 {
+				maxDepth = m
+			} else {
+				maxDepth = 0
+			}
+		}
+	}
+	if childSession == "1" && currentDepth <= 0 {
+		currentDepth = 1
+	}
+	return currentDepth, maxDepth
+}
+
+// EffectiveMaxDepth returns requestedMaxDepth clamped by any positive AHENK_MAX_DEPTH in env.
+func EffectiveMaxDepth(env []string, requestedMaxDepth int) int {
+	effective := requestedMaxDepth
+	if effective <= 0 {
+		effective = 1
+	}
+	_, envMax := DepthFromEnv(env)
+	if envMax > 0 && envMax < effective {
+		effective = envMax
+	}
+	return effective
 }
 
 // ChildEnv builds the environment for a child CLI process, injecting recursion
 // markers and stripping secret-bearing variables.
 func ChildEnv(base []string, tempDir string, currentDepth, maxDepth int) []string {
+	maxDepth = EffectiveMaxDepth(base, maxDepth)
+	if currentDepth < 0 {
+		currentDepth = 0
+	}
 	out := make([]string, 0, len(base)+8)
 	for _, e := range base {
 		k, _, ok := strings.Cut(e, "=")
@@ -51,13 +123,16 @@ func ChildEnv(base []string, tempDir string, currentDepth, maxDepth int) []strin
 			out = append(out, e)
 			continue
 		}
+		if k == "AHENK_CHILD_SESSION" || k == "AHENK_CHILD_DEPTH" || k == "AHENK_MAX_DEPTH" {
+			continue
+		}
+		if tempDir != "" && k == "BROWSER" {
+			continue
+		}
 		if isBlockedSecretEnv(k) {
 			continue
 		}
 		out = append(out, e)
-	}
-	if maxDepth <= 0 {
-		maxDepth = 1
 	}
 	out = append(out,
 		"AHENK_CHILD_SESSION=1",
@@ -67,7 +142,6 @@ func ChildEnv(base []string, tempDir string, currentDepth, maxDepth int) []strin
 	if tempDir != "" {
 		out = append(out, "BROWSER="+tempDir+"/open")
 	}
-	_ = os.Environ
 	return out
 }
 
@@ -80,14 +154,17 @@ func CheckRecursionGuard(env []string, maxDepth int) error {
 			m[k] = v
 		}
 	}
-	if m["AHENK_CHILD_SESSION"] != "1" {
+	if strings.TrimSpace(m["AHENK_CHILD_SESSION"]) != "1" {
 		return nil
 	}
-	current, _ := strconv.Atoi(m["AHENK_CHILD_DEPTH"])
-	if maxDepth <= 0 {
-		maxDepth = 1
+	current, err := strconv.Atoi(strings.TrimSpace(m["AHENK_CHILD_DEPTH"]))
+	if err != nil || current <= 0 {
+		return model.GateError("POLICY_DENIED", "RECURSIVE_DELEGATION_DENIED",
+			"subagent session cannot recursively delegate tasks (AHENK_CHILD_SESSION=1, invalid or missing depth)",
+			"complete_task_directly_in_subagent")
 	}
-	if current >= maxDepth {
+	effectiveMax := EffectiveMaxDepth(env, maxDepth)
+	if current >= effectiveMax {
 		return model.GateError("POLICY_DENIED", "RECURSIVE_DELEGATION_DENIED",
 			"subagent session cannot recursively delegate tasks (AHENK_CHILD_SESSION=1, depth limit reached)",
 			"complete_task_directly_in_subagent")

@@ -27,7 +27,7 @@ func (e *Engine) runFixtureImplementation(ctx context.Context, dir string, c mod
 	}
 	defer func() {
 		if cleanupErr := w.Close(); cleanupErr != nil {
-			err = cleanupErr
+			err = errors.Join(err, cleanupErr)
 		}
 	}()
 	out, err = e.reg.Run(ctx, dir, c, t, files, handoffs)
@@ -49,7 +49,7 @@ func (e *Engine) runFixtureImplementation(ctx context.Context, dir string, c mod
 }
 
 func (e *Engine) runSubagentImplementation(ctx context.Context, dir string, c model.Capability, t model.Task,
-	snapshot execution.Snapshot, files map[string]string, repo model.Repo,
+	snapshot execution.Snapshot, files map[string]string, handoffs []model.Handoff, repo model.Repo,
 ) (out execution.FixtureInput, collected *execution.WorktreeResult, checks []model.CheckEvidence, err error) {
 	w, err := execution.PrepareWorktree(ctx, dir, snapshot, t)
 	if err != nil {
@@ -65,7 +65,7 @@ func (e *Engine) runSubagentImplementation(ctx context.Context, dir string, c mo
 	if c.Provider == "codex" || c.Provider == "claude" {
 		runDir = w.Dir
 	}
-	out, err = e.reg.Run(ctx, runDir, c, t, files, nil)
+	out, err = e.reg.Run(ctx, runDir, c, t, files, handoffs)
 	if err != nil || out.Failure != "" {
 		return out, nil, checks, err
 	}
@@ -141,7 +141,7 @@ func (e *Engine) runSubagentImplementation(ctx context.Context, dir string, c mo
 func (e *Engine) runPrivateWriteImplementation(ctx context.Context, dir string, c model.Capability, t model.Task,
 	snapshot execution.Snapshot, files map[string]string, handoffs []model.Handoff, policy *model.PrivateSourcePolicy,
 ) (out execution.FixtureInput, collected *execution.WorktreeResult, checks []model.CheckEvidence, err error) {
-	writerVerified := policy != nil && (policy.WriterIsolationVerified || c.Provider == "codex" || c.Provider == "claude")
+	writerVerified := policy != nil && policy.WriterIsolationVerified
 	if policy == nil || !writerVerified || !policy.AllowWrite || len(policy.GoChecks) == 0 {
 		return out, nil, nil, model.GateError("POLICY_DENIED", "WRITER_ISOLATION_UNVERIFIED", "private write requires verified writer isolation and registered Go checks", "verify_writer_isolation_and_enable_allow_write")
 	}
@@ -164,7 +164,7 @@ func (e *Engine) runPrivateWriteImplementation(ctx context.Context, dir string, 
 	}
 	defer func() {
 		if cleanupErr := w.Close(); cleanupErr != nil {
-			err = cleanupErr
+			err = errors.Join(err, cleanupErr)
 		}
 	}()
 	out, err = e.reg.RunPrivate(ctx, dir, c, t, files, handoffs, policy)

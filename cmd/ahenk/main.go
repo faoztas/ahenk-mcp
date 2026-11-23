@@ -36,7 +36,20 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: ahenk serve --stdio --config FILE | ahenk readiness --config FILE | ahenk m1-request --config FILE --repo ID | ahenk verify-m1 --config FILE --request FILE --job ID | ahenk local-test --config FILE | ahenk version")
+		return errors.New(`usage:
+  ahenk serve --stdio --config FILE
+  ahenk readiness --config FILE
+  ahenk m1-request --config FILE --repo ID
+  ahenk verify-m1 --config FILE --request FILE --job ID
+  ahenk local-test --config FILE
+  ahenk private-brief-digest
+  ahenk audit-models --config FILE
+  ahenk probe-agy --config FILE
+  ahenk probe-codexbar --config FILE --provider ID
+  ahenk probe-opencode-catalog [--longcat|--public]
+  ahenk import-opencode-cooldown --config FILE --from-state DIR
+  ahenk decode-quota --provider ID
+  ahenk version`)
 	}
 	switch args[0] {
 	case "local-test":
@@ -88,24 +101,27 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		encoder := json.NewEncoder(os.Stdout)
+		configured := false
+		var probeErr error
 		for _, provider := range cfg.Providers {
 			if provider.ID != "agy" {
 				continue
 			}
-			dir, err := os.MkdirTemp("", "ahenk-agy-usage-")
+			configured = true
+			evidence, err := probeAGYEntry(provider)
 			if err != nil {
+				probeErr = errors.Join(probeErr, err)
+				continue
+			}
+			if err := encoder.Encode(evidence); err != nil {
 				return err
 			}
-			defer os.RemoveAll(dir)
-			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-			defer cancel()
-			evidence, err := providers.ProbeAGY(ctx, provider, dir)
-			if err != nil {
-				return err
-			}
-			return json.NewEncoder(os.Stdout).Encode(evidence)
 		}
-		return errors.New("AGY is not configured")
+		if !configured {
+			return errors.New("AGY is not configured")
+		}
+		return probeErr
 	case "decode-quota":
 		flags := flag.NewFlagSet("decode-quota", flag.ContinueOnError)
 		provider := flags.String("provider", "", "CodexBar export provider")
@@ -133,7 +149,7 @@ func run(args []string) error {
 		return execution.FixtureWorker()
 	case "serve":
 		flags := flag.NewFlagSet("serve", flag.ContinueOnError)
-		path := flags.String("config", "", "absolute path to local configuration")
+		path := flags.String("config", "", "path to local configuration")
 		stdio := flags.Bool("stdio", false, "serve MCP over stdio")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
@@ -147,6 +163,17 @@ func run(args []string) error {
 	}
 }
 
+func probeAGYEntry(provider model.ProviderConfig) (providers.AGYProbe, error) {
+	dir, err := os.MkdirTemp("", "ahenk-agy-usage-")
+	if err != nil {
+		return providers.AGYProbe{}, err
+	}
+	defer os.RemoveAll(dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	return providers.ProbeAGY(ctx, provider, dir)
+}
+
 func serve(path string) error {
 	cfg, err := model.LoadConfig(path)
 	if err != nil {
@@ -154,6 +181,7 @@ func serve(path string) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
+
 	db, err := store.Open(cfg.StateDir)
 	if errors.Is(err, store.ErrBusy) {
 		return ipc.RunProxy(ctx, cfg.StateDir, os.Stdin, os.Stdout)
@@ -176,7 +204,15 @@ func serve(path string) error {
 	}
 	defer daemon.Close()
 
-	return runServer(ctx, server)
+	if err := runServer(ctx, server); err != nil {
+		return err
+	}
+	if ctx.Err() == nil && daemon.ActiveClients() > 0 {
+		if err := daemon.WaitIdle(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+	}
+	return nil
 }
 
 func runServer(ctx context.Context, s *mcp.Server) error {

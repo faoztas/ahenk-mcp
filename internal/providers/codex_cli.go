@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -71,6 +72,9 @@ var allowedCodexEfforts = map[string]bool{
 
 func sanitizeCodexEffort(effort string) string {
 	normalized := strings.ToLower(strings.TrimSpace(effort))
+	if normalized == "max" {
+		return "xhigh"
+	}
 	if allowedCodexEfforts[normalized] {
 		return normalized
 	}
@@ -123,7 +127,8 @@ func RunCodexCLI(ctx context.Context, worktreeDir string, modelID string, effort
 	if worktreeDir != "" {
 		cmd.Dir = worktreeDir
 	}
-	cmd.Env = codexEnv(os.Environ(), worktreeDir, 0, 1)
+	currentDepth, maxDepth := DepthFromEnv(os.Environ())
+	cmd.Env = codexEnv(os.Environ(), worktreeDir, currentDepth, maxDepth)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if prompt != "" {
@@ -147,10 +152,11 @@ func RunCodexCLI(ctx context.Context, worktreeDir string, modelID string, effort
 	}
 
 	var (
-		rawEvents []CodexJSONLEvent
-		evidence  model.CLIRunEvidence
-		streamErr error
-		outputBuf strings.Builder
+		rawEvents    []CodexJSONLEvent
+		evidence     model.CLIRunEvidence
+		streamErr    error
+		streamErrPri int
+		outputBuf    strings.Builder
 	)
 
 	stdoutDone := make(chan struct{})
@@ -202,15 +208,33 @@ func RunCodexCLI(ctx context.Context, worktreeDir string, modelID string, effort
 				if ev.Message != "" && msg == "" {
 					msg = ev.Message
 				}
+				var (
+					candErr error
+					candPri int
+				)
 				low := strings.ToLower(msg)
 				if strings.Contains(low, "429") || strings.Contains(low, "529") || strings.Contains(low, "overloaded") || strings.Contains(low, "rate limit") || strings.Contains(low, "rate_limit") || strings.Contains(low, "usage_limit") {
-					streamErr = model.Error("RATE_LIMIT", "RATE_LIMIT: "+msg)
-				} else if strings.Contains(low, "401") || strings.Contains(low, "unauthorized") || strings.Contains(low, "not logged in") {
-					streamErr = model.Error("AUTH_REQUIRED", msg)
+					candErr = model.Error("RATE_LIMIT", "RATE_LIMIT: "+msg)
+					candPri = 2
+				} else if strings.Contains(low, "401") || strings.Contains(low, "unauthorized") || strings.Contains(low, "not logged in") || strings.Contains(low, "authentication") || strings.Contains(low, "credit balance") || strings.Contains(low, "invalid_api_key") {
+					candErr = model.Error("AUTH_REQUIRED", msg)
+					candPri = 2
 				} else {
-					streamErr = model.Error("INVALID_OUTPUT", msg)
+					candErr = model.Error("INVALID_OUTPUT", msg)
+					candPri = 1
+				}
+				if candPri > streamErrPri {
+					streamErr = candErr
+					streamErrPri = candPri
 				}
 			}
+		}
+		if err := sc.Err(); err != nil {
+			if streamErrPri == 0 {
+				streamErr = model.Error("INVALID_OUTPUT", err.Error())
+				streamErrPri = 1
+			}
+			_, _ = io.Copy(io.Discard, stdoutPipe)
 		}
 	}()
 
@@ -239,8 +263,8 @@ func RunCodexCLI(ctx context.Context, worktreeDir string, modelID string, effort
 		if streamErr != nil {
 			return nil, streamErr
 		}
-		if waitErr != nil && evidence.Summary == "" {
-			msg := stderrBuf.String()
+		if waitErr != nil {
+			msg := strings.TrimSpace(stderrBuf.String())
 			if msg == "" {
 				msg = waitErr.Error()
 			}
@@ -248,7 +272,13 @@ func RunCodexCLI(ctx context.Context, worktreeDir string, modelID string, effort
 			if strings.Contains(low, "429") || strings.Contains(low, "529") || strings.Contains(low, "overloaded") || strings.Contains(low, "rate limit") || strings.Contains(low, "rate_limit") || strings.Contains(low, "usage_limit") {
 				return nil, model.Error("RATE_LIMIT", "RATE_LIMIT: "+msg)
 			}
+			if strings.Contains(low, "401") || strings.Contains(low, "unauthorized") || strings.Contains(low, "not logged in") || strings.Contains(low, "authentication") || strings.Contains(low, "credit balance") || strings.Contains(low, "invalid_api_key") {
+				return nil, model.Error("AUTH_REQUIRED", msg)
+			}
 			return nil, model.Error("EXECUTION_FAILED", msg)
+		}
+		if evidence.Summary == "" {
+			return nil, model.Error("INVALID_OUTPUT", "codex produced empty agent output")
 		}
 
 		res := &CLIRunResult{
@@ -314,11 +344,14 @@ func ParseCodexJSONL(data []byte) (model.CLIRunEvidence, error) {
 			if strings.Contains(low, "429") || strings.Contains(low, "529") || strings.Contains(low, "overloaded") || strings.Contains(low, "rate limit") || strings.Contains(low, "rate_limit") || strings.Contains(low, "usage_limit") {
 				return ev, model.Error("RATE_LIMIT", "RATE_LIMIT: "+msg)
 			}
-			if strings.Contains(low, "401") || strings.Contains(low, "unauthorized") || strings.Contains(low, "not logged in") {
+			if strings.Contains(low, "401") || strings.Contains(low, "unauthorized") || strings.Contains(low, "not logged in") || strings.Contains(low, "authentication") || strings.Contains(low, "credit balance") || strings.Contains(low, "invalid_api_key") {
 				return ev, model.Error("AUTH_REQUIRED", msg)
 			}
 			return ev, model.Error("INVALID_OUTPUT", msg)
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return ev, model.Error("INVALID_OUTPUT", err.Error())
 	}
 	return ev, nil
 }

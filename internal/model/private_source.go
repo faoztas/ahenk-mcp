@@ -209,8 +209,8 @@ func (t Task) privateWriteAllowed(p *PrivateSourcePolicy) bool {
 }
 
 func (r PrivateRoute) AccountMatches(c Capability) (bool, string) {
-	want := r.ExpectedAccount
-	wantSHA := r.ExpectedAccountSHA256
+	want := strings.TrimSpace(r.ExpectedAccount)
+	wantSHA := strings.ToLower(strings.TrimSpace(r.ExpectedAccountSHA256))
 	if want == "" && wantSHA == "" {
 		if c.Provider == "opencode" && c.OpenCodeAccount == OpenCodeAnonymous {
 			return true, ""
@@ -220,22 +220,31 @@ func (r PrivateRoute) AccountMatches(c Capability) (bool, string) {
 		}
 		return false, "ACCOUNT_ATTESTATION_REQUIRED"
 	}
-	actual := c.AttestedAccount
+	actual := strings.TrimSpace(c.AttestedAccount)
 	if actual == "" && c.Provider == "opencode" {
-		actual = c.OpenCodeAccount
+		actual = strings.TrimSpace(c.OpenCodeAccount)
 	}
-	actualSHA := c.AttestedAccountSHA256
-	if actualSHA == "" && actual != "" {
-		actualSHA = Hash([]byte(actual))
-	}
+	actualSHA := strings.ToLower(strings.TrimSpace(c.AttestedAccountSHA256))
 	if actual == "" && actualSHA == "" {
 		return false, "ACCOUNT_ATTESTATION_REQUIRED"
 	}
-	if want != "" && actual != want {
-		return false, "ACCOUNT_MISMATCH"
+	if want != "" {
+		if actual != "" {
+			if !strings.EqualFold(actual, want) {
+				return false, "ACCOUNT_MISMATCH"
+			}
+		} else if actualSHA != Hash([]byte(strings.ToLower(want))) && actualSHA != Hash([]byte(want)) {
+			return false, "ACCOUNT_MISMATCH"
+		}
 	}
-	if wantSHA != "" && actualSHA != wantSHA {
-		return false, "ACCOUNT_MISMATCH"
+	if wantSHA != "" {
+		if actualSHA != "" {
+			if actualSHA != wantSHA {
+				return false, "ACCOUNT_MISMATCH"
+			}
+		} else if Hash([]byte(strings.ToLower(actual))) != wantSHA && Hash([]byte(actual)) != wantSHA {
+			return false, "ACCOUNT_MISMATCH"
+		}
 	}
 	return true, ""
 }

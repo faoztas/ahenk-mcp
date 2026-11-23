@@ -43,6 +43,24 @@ func fpRoutingJob(now time.Time, targetTier string) model.Job {
 	}}
 }
 
+func TestExecutionRouteUsesSameRepositoryProviderAliasAsAutoRoute(t *testing.T) {
+	now := time.Now()
+	e := fpRoutingFixture(now)
+	e.cfg.Repositories["demo"] = model.Repo{Providers: []string{"antigravity"}}
+	j := fpRoutingJob(now, "cheap")
+	j.Task.PreferredProvider, j.Task.PreferredModel = "", ""
+
+	decision, selected := e.EvaluateAutoRoute(j.RepoID, "coding", nil, j.Task, now)
+	if selected == nil || selected.Provider != "agy" {
+		t.Fatalf("alias did not admit the AGY capability during auto-routing: %+v", decision)
+	}
+	j.Task.PreferredProvider, j.Task.PreferredModel = selected.Provider, selected.Model
+	if got, _ := e.route(&j, now); got.Provider != selected.Provider || got.Model != selected.Model {
+		t.Fatalf("execution route chose %s/%s, want %s/%s: %+v",
+			got.Provider, got.Model, selected.Provider, selected.Model, j.Route)
+	}
+}
+
 func TestQualityTierBelowBestRemoved(t *testing.T) {
 	now := time.Now()
 	e := fpRoutingFixture(now)
@@ -92,9 +110,14 @@ func TestTargetTierRoutingMatrix(t *testing.T) {
 	}
 	// A "free" target rejects every paid tier candidate explicitly.
 	e := fpRoutingFixture(now)
+	e.reg.Candidates[2].Model = "beam-free"
 	j := fpRoutingJob(now, "free")
-	if c, _ := e.route(&j, now); c.Provider != "" {
-		t.Fatalf("free tier selected a paid route: %+v", c)
+	decision, selected := e.EvaluateAutoRoute(j.RepoID, "coding", nil, j.Task, now)
+	if selected == nil || selected.Provider != "opencode" {
+		t.Fatalf("free tier auto-routing did not select OpenCode: %+v", decision)
+	}
+	if c, _ := e.route(&j, now); c.Provider != selected.Provider || c.Model != selected.Model {
+		t.Fatalf("free tier execution did not select %s/%s: %+v", selected.Provider, selected.Model, j.Route)
 	}
 	for _, d := range j.Route {
 		if d.Provider != "opencode" && (d.PolicyEligible || d.Reason != "TARGET_TIER_MISMATCH_FREE_ONLY") {

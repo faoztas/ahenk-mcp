@@ -400,10 +400,10 @@ exit 0
 	sub := model.Submission{
 		RepoID: "e2e-repo",
 		Task: model.Task{
-			Objective:    "Refactor Add function to optimize performance",
-			Category:     "coding",
-			Mode:         "patch",
-			AllowedPaths: []string{"calc.go", "calc_test.go", "go.mod"},
+			Objective:         "Refactor Add function to optimize performance",
+			Category:          "coding",
+			Mode:              "patch",
+			AllowedPaths:      []string{"calc.go", "calc_test.go", "go.mod"},
 			PreferredProvider: "codex",
 			PreferredModel:    "gpt-6.1-sol",
 			ExecutionProfile:  "implementation",
@@ -449,5 +449,274 @@ exit 0
 	}
 	if completedJob.Result.Checks[0].Status != "PASSED" || completedJob.Result.Checks[0].ExitStatus != 0 {
 		t.Errorf("expected check to pass, got %+v", completedJob.Result.Checks[0])
+	}
+}
+
+func TestImplementationPreservesPrimaryErrorOnCleanupFailure(t *testing.T) {
+	tempDir := canonicalTempDir(t)
+	sourceRepo := filepath.Join(tempDir, "source")
+	if err := os.MkdirAll(sourceRepo, 0700); err != nil {
+		t.Fatal(err)
+	}
+	const sampleGo = "package immut\n\nfunc Value() string { return \"before\" }\n"
+	const sampleTest = "package immut\n\nimport \"testing\"\n\nfunc TestAfter(t *testing.T) {}\n"
+	_ = os.WriteFile(filepath.Join(sourceRepo, "go.mod"), []byte("module example.test/immut\n\ngo 1.24\n"), 0644)
+	_ = os.WriteFile(filepath.Join(sourceRepo, "sample.go"), []byte(sampleGo), 0644)
+	_ = os.WriteFile(filepath.Join(sourceRepo, "sample_test.go"), []byte(sampleTest), 0644)
+	setupTestGitRepo(t, sourceRepo)
+
+	snap, err := execution.TakeSnapshot(context.Background(), sourceRepo, "snap-errjoin", "head_only", []string{"go.mod", "sample.go", "sample_test.go"})
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	cfg := model.Config{
+		StateDir:      filepath.Join(tempDir, "state"),
+		EnableFixture: true,
+		Providers:     []model.ProviderConfig{{ID: "fixture-a", AttestedAccount: "owner-1"}},
+	}
+	db, err := store.Open(cfg.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	e, err := New(cfg, db, providers.New(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	runCase := func(t *testing.T, private bool) {
+		t.Helper()
+		attemptDir := filepath.Join(tempDir, fmt.Sprintf("attempt-%t", private))
+		if err := execution.NewAttemptDir(attemptDir); err != nil {
+			t.Fatal(err)
+		}
+		workspaceDir := filepath.Join(attemptDir, ".workspace")
+		t.Cleanup(func() {
+			_ = os.Chmod(workspaceDir, 0700)
+		})
+
+		var capFixture model.Capability
+		for _, c := range e.reg.Candidates {
+			if c.Provider == "fixture-a" {
+				capFixture = c
+				break
+			}
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Once RunFixture starts (OpenWorkerLease removes .worker.cleaned after PrepareWorktree returns),
+		// lock .workspace perms so w.Close() returns ErrCleanup, then cancel ctx so RunFixture fails.
+		go func() {
+			cleanedMarker := filepath.Join(attemptDir, ".worker.cleaned")
+			for range 500 {
+				if _, err := os.Stat(cleanedMarker); os.IsNotExist(err) {
+					time.Sleep(50 * time.Millisecond)
+					_ = os.Chmod(workspaceDir, 0500)
+					cancel()
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+
+		task := model.Task{
+			Objective:    "fixture:slow",
+			Mode:         "patch",
+			DataClass:    "synthetic",
+			AllowedPaths: []string{"sample.go", "sample_test.go", "go.mod"},
+		}
+		files := map[string]string{
+			"go.mod":         "module example.test/immut\n\ngo 1.24\n",
+			"sample.go":      sampleGo,
+			"sample_test.go": sampleTest,
+		}
+
+		var gotErr error
+		if !private {
+			_, _, gotErr = e.runFixtureImplementation(ctx, attemptDir, capFixture, task, snap, files, nil)
+		} else {
+			consent := true
+			policy := &model.PrivateSourcePolicy{
+				OwnerConsent:            &consent,
+				ExpiresAt:               time.Now().Add(time.Hour),
+				WriterIsolationVerified: true,
+				AllowWrite:              true,
+				GoChecks:                map[string]string{"unit": "TestAfter"},
+				Files: map[string]string{
+					"go.mod":         model.Hash([]byte("module example.test/immut\n\ngo 1.24\n")),
+					"sample.go":      model.Hash([]byte(sampleGo)),
+					"sample_test.go": model.Hash([]byte(sampleTest)),
+				},
+				Briefs: []string{model.PrivateBriefDigest("fixture:slow", []model.Check{{ID: "unit", Description: "Pass TestAfter", CheckID: "unit"}})},
+				Routes: []model.PrivateRoute{{Provider: "fixture-a", Model: "synthetic", Fingerprint: execution.SelfBinarySHA256(), DataHandlingReviewed: true, ExpectedAccount: "owner-1"}},
+			}
+			task.DataClass = model.PrivateSourceData
+			task.Acceptance = []model.Check{{ID: "unit", Description: "Pass TestAfter", CheckID: "unit"}}
+			_, _, _, gotErr = e.runPrivateWriteImplementation(ctx, attemptDir, capFixture, task, snap, files, nil, policy)
+		}
+		if !errors.Is(gotErr, execution.ErrCleanup) {
+			t.Fatalf("expected ErrCleanup in joined error, got: %v", gotErr)
+		}
+		if !errors.Is(gotErr, context.Canceled) {
+			t.Fatalf("primary context.Canceled error was clobbered by cleanup error: %v", gotErr)
+		}
+	}
+
+	t.Run("fixture implementation", func(t *testing.T) { runCase(t, false) })
+	t.Run("private write implementation", func(t *testing.T) { runCase(t, true) })
+}
+
+func TestPatchWithCheckIDCannotSkipGoChecks(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	tempDir := canonicalTempDir(t)
+	sourceRepo := filepath.Join(tempDir, "source_check_required")
+	if err := os.MkdirAll(sourceRepo, 0700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(sourceRepo, "go.mod"), []byte("module example.test/checkreq\n\ngo 1.24\n"), 0644)
+	_ = os.WriteFile(filepath.Join(sourceRepo, "fixture.txt"), []byte("before\n"), 0644)
+	_ = os.WriteFile(filepath.Join(sourceRepo, "calc.go"), []byte("package checkreq\n\nfunc Ok() bool { return true }\n"), 0644)
+	_ = os.WriteFile(filepath.Join(sourceRepo, "calc_test.go"), []byte("package checkreq\n\nimport \"testing\"\n\nfunc TestFail(t *testing.T) {\n\tt.Fatal(\"expected deterministic failure\")\n}\n\nfunc TestPass(t *testing.T) {}\n"), 0644)
+	setupTestGitRepo(t, sourceRepo)
+
+	dbPath := filepath.Join(tempDir, "state")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	cfg := model.Config{
+		StateDir:      dbPath,
+		EnableFixture: true,
+		Repositories: map[string]model.Repo{
+			"check-repo": {
+				Root:         sourceRepo,
+				AllowedPaths: []string{"fixture.txt", "calc.go", "calc_test.go", "go.mod"},
+				Providers:    []string{"codex", "fixture-a"},
+			},
+		},
+	}
+	reg := providers.New(cfg)
+	// Ensure a deterministic codex candidate exists in registry, then put codex on cooldown
+	// so routing falls back to fixture-a while subagent=true.
+	reg.Candidates = append(reg.Candidates, model.Capability{
+		Provider: "codex",
+		Model:    "gpt-6.1-sol",
+		Status:   "available",
+		Mode:     "cli",
+		Speed:    "fast",
+	})
+	e, err := New(cfg, db, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	// 1. Explicit implementation profile with fixture-a must run Go checks and fail TestFail.
+	subImpl, err := e.Submit(model.Submission{
+		RepoID:    "check-repo",
+		RequestID: "impl-fixture-fail",
+		Task: model.Task{
+			Objective:         "Modify fixture.txt",
+			Mode:              "patch",
+			DataClass:         "synthetic",
+			ExecutionProfile:  "implementation",
+			PreferredProvider: "fixture-a",
+			AllowedPaths:      []string{"fixture.txt", "calc.go", "calc_test.go", "go.mod"},
+			Acceptance: []model.Check{
+				{ID: "check_fail", Description: "Run TestFail", CheckID: "TestFail"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("submit impl: %v", err)
+	}
+	gotImpl, err := e.Wait(ctx, subImpl.ID, 60*time.Second)
+	if err != nil {
+		t.Fatalf("wait impl: %v", err)
+	}
+	if gotImpl.Status == model.Completed || gotImpl.Reason != "CHECK_FAILED" {
+		t.Fatalf("implementation fixture skipped Go check: status=%s reason=%s result=%+v", gotImpl.Status, gotImpl.Reason, gotImpl.Result)
+	}
+
+	// 2. Implicit patch task with CheckID when codex is on cooldown and routes to fixture-a must still run Go checks.
+	e.mu.Lock()
+	e.cooldown["codex"] = time.Now().Add(10 * time.Minute)
+	e.mu.Unlock()
+	subFallback, err := e.Submit(model.Submission{
+		RepoID:    "check-repo",
+		RequestID: "fallback-fixture-fail",
+		Task: model.Task{
+			Objective:    "Modify fixture.txt with fallback",
+			Mode:         "patch",
+			DataClass:    "synthetic",
+			AllowedPaths: []string{"fixture.txt", "calc.go", "calc_test.go", "go.mod"},
+			Acceptance: []model.Check{
+				{ID: "check_fail", Description: "Run TestFail", CheckID: "TestFail"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("submit fallback: %v", err)
+	}
+	gotFallback, err := e.Wait(ctx, subFallback.ID, 60*time.Second)
+	if err != nil {
+		t.Fatalf("wait fallback: %v", err)
+	}
+	if gotFallback.Status == model.Completed || gotFallback.Reason != "CHECK_FAILED" {
+		t.Fatalf("fallback patch skipped Go check: status=%s reason=%s result=%+v", gotFallback.Status, gotFallback.Reason, gotFallback.Result)
+	}
+
+	// 3. Batch handoff into implementation patch task with CheckID must forward handoffs to worker.
+	batchJob, err := e.SubmitBatch(model.Batch{
+		RepoID:    "check-repo",
+		RequestID: "batch-handoff-impl",
+		Items: []model.Item{
+			{
+				Key: "produce",
+				Task: model.Task{
+					Objective:         "Produce fixture diff",
+					Mode:              "patch",
+					DataClass:         "synthetic",
+					PreferredProvider: "fixture-a",
+					AllowedPaths:      []string{"fixture.txt"},
+					Acceptance:        []model.Check{{ID: "p", Description: "diff"}},
+				},
+			},
+			{
+				Key:       "consume",
+				DependsOn: []string{"produce"},
+				HandoffFrom: []model.HandoffFrom{
+					{Key: "produce", Kind: "diff"},
+				},
+				Task: model.Task{
+					Objective:         "fixture:handoff",
+					Mode:              "patch",
+					DataClass:         "synthetic",
+					ExecutionProfile:  "implementation",
+					PreferredProvider: "fixture-a",
+					AllowedPaths:      []string{"fixture.txt", "calc.go", "calc_test.go", "go.mod"},
+					Acceptance:        []model.Check{{ID: "check_pass", Description: "Run TestPass", CheckID: "TestPass"}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("submit batch: %v", err)
+	}
+	gotBatch, err := e.Wait(ctx, batchJob.ID, 60*time.Second)
+	if err != nil {
+		t.Fatalf("wait batch: %v", err)
+	}
+	if gotBatch.Status != model.Completed {
+		consumer, _ := e.Get(gotBatch.Children[1])
+		t.Fatalf("expected batch with handoff into subagent implementation to complete, got batch=%s(%s) consumer=%s(%s)", gotBatch.Status, gotBatch.Reason, consumer.Status, consumer.Reason)
 	}
 }

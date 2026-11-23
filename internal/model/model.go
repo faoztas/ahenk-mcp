@@ -4,6 +4,7 @@
 package model
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -238,7 +239,7 @@ type DelegateTaskInput struct {
 	Role               string      `json:"role,omitempty" jsonschema:"Subagent role: 'implementation', 'research', 'review', 'design', 'test', 'general'. Defaults to 'general' or 'implementation'."`
 	Target             *TargetSpec `json:"target,omitempty" jsonschema:"Explicit provider/model selection OR automatic price/performance (F/P) tier routing. Omit to auto-route."`
 	Isolation          string      `json:"isolation,omitempty" jsonschema:"Isolation mode: 'worktree' (isolated git worktree returning verified diff), 'read_only' (safe analysis), 'shared' (direct checkout edit)."`
-	ExecutionMode      string      `json:"execution_mode,omitempty" jsonschema:"Execution mode: 'wait' (default, blocks until completion and returns result directly) or 'async' (returns durable job_id immediately)."`
+	ExecutionMode      string      `json:"execution_mode,omitempty" jsonschema:"Use 'wait' to return the result directly or 'async' to return a durable job_id. A string task defaults to wait. Structured input defaults to async."`
 	Mode               string      `json:"mode,omitempty" jsonschema:"Legacy mode alias: 'wait'|'async' (execution wait) or 'read_only'|'patch' (task isolation)."`
 	RequestID          string      `json:"request_id,omitempty" jsonschema:"Optional idempotency request ID. Auto-generated if omitted."`
 	RepoID             string      `json:"repo_id,omitempty" jsonschema:"Optional registered repository ID. Auto-detected from cwd/git root if omitted."`
@@ -252,13 +253,26 @@ type DelegateTaskInput struct {
 	Strategy           string      `json:"strategy,omitempty" jsonschema:"Execution strategy: 'balanced', 'quality_first', 'quota_saving', 'conserve', 'latency_first', 'deep_audit', 'offline_privacy_first'."`
 	MaxDepth           int         `json:"max_depth,omitempty"`
 
-	WorkspaceMode     string   `json:"workspace_mode,omitempty"`
-	UntrackedPaths    []string `json:"untracked_paths,omitempty"`
-	DeadlineSeconds   int      `json:"deadline_seconds,omitempty"`
-	Decompose         bool     `json:"decompose,omitempty"`
-	ExecutionProfile  string   `json:"execution_profile,omitempty"`
-	PreferredProvider string   `json:"preferred_provider,omitempty"`
-	PreferredModel    string   `json:"preferred_model,omitempty"`
+	WorkspaceMode         string   `json:"workspace_mode,omitempty"`
+	UntrackedPaths        []string `json:"untracked_paths,omitempty"`
+	DeadlineSeconds       int      `json:"deadline_seconds,omitempty"`
+	Decompose             bool     `json:"decompose,omitempty"`
+	ExecutionProfile      string   `json:"execution_profile,omitempty"`
+	PreferredProvider     string   `json:"preferred_provider,omitempty"`
+	PreferredModel        string   `json:"preferred_model,omitempty"`
+	HasComplexity         bool     `json:"-"`
+	CheckpointObjective   string   `json:"checkpoint_objective,omitempty"`
+	FollowUp              string   `json:"follow_up,omitempty"`
+	RoleCalibration       bool     `json:"role_calibration,omitempty"`
+	OpenCodeRecheck       bool     `json:"opencode_recheck,omitempty"`
+	AGYReserveOverride    string   `json:"agy_weekly_reserve_override,omitempty"`
+	NativeChild           bool     `json:"native_child,omitempty"`
+	NativeChildBackground bool     `json:"native_child_background,omitempty"`
+	TaskClass             string   `json:"task_class,omitempty"`
+	Risk                  string   `json:"risk,omitempty"`
+	TargetTier            string   `json:"target_tier,omitempty"`
+	TargetEffort          string   `json:"target_effort,omitempty"`
+	Variant               string   `json:"variant,omitempty"`
 }
 
 func (in *DelegateTaskInput) UnmarshalJSON(data []byte) error {
@@ -273,79 +287,132 @@ func (in *DelegateTaskInput) UnmarshalJSON(data []byte) error {
 	}
 	*in = DelegateTaskInput(raw.Alias)
 
+	var topMap map[string]json.RawMessage
+	if err := json.Unmarshal(data, &topMap); err == nil {
+		if val, ok := topMap["complexity"]; ok && len(bytes.TrimSpace(val)) > 0 && string(bytes.TrimSpace(val)) != "null" {
+			in.HasComplexity = true
+		}
+	}
+
 	// Process task
-	if len(raw.RawTask) > 0 {
+	if trimmedTask := bytes.TrimSpace(raw.RawTask); len(trimmedTask) > 0 && string(trimmedTask) != "null" {
 		var s string
-		if err := json.Unmarshal(raw.RawTask, &s); err == nil {
+		if err := json.Unmarshal(trimmedTask, &s); err == nil {
 			in.Task = s
 		} else {
 			var t Task
-			if err := json.Unmarshal(raw.RawTask, &t); err == nil {
-				if in.Category == "" {
-					in.Category = t.Category
-				}
-				if in.Complexity == 0 {
+			if err := json.Unmarshal(trimmedTask, &t); err != nil {
+				return err
+			}
+			var taskMap map[string]json.RawMessage
+			_ = json.Unmarshal(trimmedTask, &taskMap)
+			if !in.HasComplexity {
+				if val, ok := taskMap["complexity"]; ok && len(bytes.TrimSpace(val)) > 0 && string(bytes.TrimSpace(val)) != "null" {
 					in.Complexity = t.Complexity
+					in.HasComplexity = true
 				}
-				if in.Objective == "" {
-					in.Objective = t.Objective
-				}
-				if in.Role == "" && t.TaskClass != "" {
-					in.Role = t.TaskClass
-				}
-				if in.Mode == "" && t.Mode != "" {
-					in.Mode = t.Mode
-				}
-				if in.DataClass == "" && t.DataClass != "" {
-					in.DataClass = t.DataClass
-				}
-				if in.Priority == "" && t.Priority != "" {
-					in.Priority = t.Priority
-				}
-				if in.Strategy == "" && t.Strategy != "" {
-					in.Strategy = t.Strategy
-				}
-				if in.WorkspaceMode == "" && t.WorkspaceMode != "" {
-					in.WorkspaceMode = t.WorkspaceMode
-				}
-				if in.ExecutionProfile == "" && t.ExecutionProfile != "" {
-					in.ExecutionProfile = t.ExecutionProfile
-				}
-				if in.PreferredProvider == "" && t.PreferredProvider != "" {
-					in.PreferredProvider = t.PreferredProvider
-				}
-				if in.PreferredModel == "" && t.PreferredModel != "" {
-					in.PreferredModel = t.PreferredModel
-				}
-				if in.DeadlineSeconds == 0 && t.DeadlineSeconds != 0 {
-					in.DeadlineSeconds = t.DeadlineSeconds
-				}
-				if !in.Decompose && t.Decompose {
-					in.Decompose = t.Decompose
-				}
-				if len(in.AllowedPaths) == 0 && len(t.AllowedPaths) > 0 {
-					in.AllowedPaths = slices.Clone(t.AllowedPaths)
-				}
-				if len(in.UntrackedPaths) == 0 && len(t.UntrackedPaths) > 0 {
-					in.UntrackedPaths = slices.Clone(t.UntrackedPaths)
-				}
-				if len(in.Acceptance) == 0 && len(t.Acceptance) > 0 {
-					in.Acceptance = slices.Clone(t.Acceptance)
-				}
+			}
+			if in.Category == "" {
+				in.Category = t.Category
+			}
+			if in.Objective == "" {
+				in.Objective = t.Objective
+			}
+			if in.TaskClass == "" {
+				in.TaskClass = t.TaskClass
+			}
+			if in.Role == "" && t.TaskClass != "" {
+				in.Role = t.TaskClass
+			}
+			if in.Risk == "" {
+				in.Risk = t.Risk
+			}
+			if in.Mode == "" && t.Mode != "" {
+				in.Mode = t.Mode
+			}
+			if in.DataClass == "" && t.DataClass != "" {
+				in.DataClass = t.DataClass
+			}
+			if in.Priority == "" && t.Priority != "" {
+				in.Priority = t.Priority
+			}
+			if in.Strategy == "" && t.Strategy != "" {
+				in.Strategy = t.Strategy
+			}
+			if in.WorkspaceMode == "" && t.WorkspaceMode != "" {
+				in.WorkspaceMode = t.WorkspaceMode
+			}
+			if in.ExecutionProfile == "" && t.ExecutionProfile != "" {
+				in.ExecutionProfile = t.ExecutionProfile
+			}
+			if in.PreferredProvider == "" && t.PreferredProvider != "" {
+				in.PreferredProvider = t.PreferredProvider
+			}
+			if in.PreferredModel == "" && t.PreferredModel != "" {
+				in.PreferredModel = t.PreferredModel
+			}
+			if in.DeadlineSeconds == 0 && t.DeadlineSeconds != 0 {
+				in.DeadlineSeconds = t.DeadlineSeconds
+			}
+			if !in.Decompose && t.Decompose {
+				in.Decompose = t.Decompose
+			}
+			if in.CheckpointObjective == "" {
+				in.CheckpointObjective = t.CheckpointObjective
+			}
+			if in.FollowUp == "" {
+				in.FollowUp = t.FollowUp
+			}
+			if !in.RoleCalibration && t.RoleCalibration {
+				in.RoleCalibration = t.RoleCalibration
+			}
+			if !in.OpenCodeRecheck && t.OpenCodeRecheck {
+				in.OpenCodeRecheck = t.OpenCodeRecheck
+			}
+			if in.AGYReserveOverride == "" {
+				in.AGYReserveOverride = t.AGYReserveOverride
+			}
+			if !in.NativeChild && t.NativeChild {
+				in.NativeChild = t.NativeChild
+			}
+			if !in.NativeChildBackground && t.NativeChildBackground {
+				in.NativeChildBackground = t.NativeChildBackground
+			}
+			if in.TargetTier == "" {
+				in.TargetTier = t.TargetTier
+			}
+			if in.TargetEffort == "" {
+				in.TargetEffort = t.TargetEffort
+			}
+			if in.Variant == "" {
+				in.Variant = t.Variant
+			}
+			if in.MaxDepth == 0 && t.MaxDepth != 0 {
+				in.MaxDepth = t.MaxDepth
+			}
+			if len(in.AllowedPaths) == 0 && len(t.AllowedPaths) > 0 {
+				in.AllowedPaths = slices.Clone(t.AllowedPaths)
+			}
+			if len(in.UntrackedPaths) == 0 && len(t.UntrackedPaths) > 0 {
+				in.UntrackedPaths = slices.Clone(t.UntrackedPaths)
+			}
+			if len(in.Acceptance) == 0 && len(t.Acceptance) > 0 {
+				in.Acceptance = slices.Clone(t.Acceptance)
 			}
 		}
 	}
 
 	// Process target
-	if len(raw.RawTarget) > 0 {
+	if trimmedTarget := bytes.TrimSpace(raw.RawTarget); len(trimmedTarget) > 0 && string(trimmedTarget) != "null" {
 		var s string
-		if err := json.Unmarshal(raw.RawTarget, &s); err == nil {
+		if err := json.Unmarshal(trimmedTarget, &s); err == nil {
 			in.Target = &TargetSpec{Provider: s}
 		} else {
 			var spec TargetSpec
-			if err := json.Unmarshal(raw.RawTarget, &spec); err == nil {
-				in.Target = &spec
+			if err := json.Unmarshal(trimmedTarget, &spec); err != nil {
+				return err
 			}
+			in.Target = &spec
 		}
 	}
 	return nil
@@ -433,7 +500,8 @@ func (in *DelegateTaskInput) Normalize(defaultCwd string, cfg *Config) (Submissi
 
 	preferredProvider := in.PreferredProvider
 	preferredModel := in.PreferredModel
-	targetTier, targetEffort := "", ""
+	targetTier := strings.ToLower(strings.TrimSpace(in.TargetTier))
+	targetEffort := strings.ToLower(strings.TrimSpace(in.TargetEffort))
 	if in.Target != nil {
 		if in.Target.Provider != "" && in.Target.Provider != "auto" {
 			preferredProvider = in.Target.Provider
@@ -441,30 +509,47 @@ func (in *DelegateTaskInput) Normalize(defaultCwd string, cfg *Config) (Submissi
 		if in.Target.Model != "" {
 			preferredModel = in.Target.Model
 		}
-		targetTier = strings.ToLower(strings.TrimSpace(in.Target.Tier))
-		targetEffort = strings.ToLower(strings.TrimSpace(in.Target.Effort))
+		if t := strings.ToLower(strings.TrimSpace(in.Target.Tier)); t != "" {
+			targetTier = t
+		}
+		if ef := strings.ToLower(strings.TrimSpace(in.Target.Effort)); ef != "" {
+			targetEffort = ef
+		}
 	}
 
 	sub := Submission{
 		RequestID: reqID,
 		RepoID:    in.RepoID,
 		Task: Task{
-			Objective:         objective,
-			Acceptance:        acceptance,
-			AllowedPaths:      allowedPaths,
-			Mode:              taskMode,
-			DataClass:         dataClass,
-			Priority:          in.Priority,
-			Strategy:          in.Strategy,
-			WorkspaceMode:     in.WorkspaceMode,
-			UntrackedPaths:    in.UntrackedPaths,
-			DeadlineSeconds:   in.DeadlineSeconds,
-			Decompose:         in.Decompose,
-			ExecutionProfile:  in.ExecutionProfile,
-			PreferredProvider: preferredProvider,
-			PreferredModel:    preferredModel,
-			TargetTier:        targetTier,
-			TargetEffort:      targetEffort,
+			Decompose:             in.Decompose,
+			NativeChildBackground: in.NativeChildBackground,
+			RoleCalibration:       in.RoleCalibration,
+			OpenCodeRecheck:       in.OpenCodeRecheck,
+			AGYReserveOverride:    in.AGYReserveOverride,
+			CheckpointObjective:   in.CheckpointObjective,
+			NativeChild:           in.NativeChild,
+			FollowUp:              in.FollowUp,
+			ExecutionProfile:      in.ExecutionProfile,
+			Objective:             objective,
+			Acceptance:            acceptance,
+			AllowedPaths:          allowedPaths,
+			Mode:                  taskMode,
+			DataClass:             dataClass,
+			TaskClass:             in.TaskClass,
+			Risk:                  in.Risk,
+			Priority:              in.Priority,
+			Strategy:              in.Strategy,
+			PreferredProvider:     preferredProvider,
+			PreferredModel:        preferredModel,
+			WorkspaceMode:         in.WorkspaceMode,
+			UntrackedPaths:        in.UntrackedPaths,
+			DeadlineSeconds:       in.DeadlineSeconds,
+			TargetTier:            targetTier,
+			TargetEffort:          targetEffort,
+			Variant:               in.Variant,
+			MaxDepth:              in.MaxDepth,
+			Category:              in.Category,
+			Complexity:            in.Complexity,
 		},
 	}
 	return sub, execMode, waitTimeout, nil
@@ -481,9 +566,18 @@ func (w WaitJobsInput) Normalize() (WaitJobsInput, error) {
 	if len(w.JobIDs) == 0 {
 		return w, Error("INVALID_INPUT", "job_ids is required")
 	}
+	if len(w.JobIDs) > 32 {
+		return w, Error("INVALID_INPUT", "job_ids exceeds maximum of 32")
+	}
+	seen := make(map[string]bool, len(w.JobIDs))
+	dedup := make([]string, 0, len(w.JobIDs))
 	for _, id := range w.JobIDs {
 		if !ValidID(id) {
 			return w, Error("INVALID_INPUT", fmt.Sprintf("invalid job ID: %s", id))
+		}
+		if !seen[id] {
+			seen[id] = true
+			dedup = append(dedup, id)
 		}
 	}
 	mode := w.Mode
@@ -498,7 +592,7 @@ func (w WaitJobsInput) Normalize() (WaitJobsInput, error) {
 		timeoutSec = 300
 	}
 	return WaitJobsInput{
-		JobIDs:         w.JobIDs,
+		JobIDs:         dedup,
 		Mode:           mode,
 		TimeoutSeconds: timeoutSec,
 	}, nil
@@ -847,11 +941,6 @@ func (t *Task) Validate(repo Repo) *Fault {
 	}) {
 		return GateError("POLICY_DENIED", "PERSONAL_DATA_CLASSIFIED", "objective or acceptance contains classified personal data", "remove_personal_data_before_retry")
 	}
-	if t.DataClass == PrivateSourceData || repo.PrivateSource != nil {
-		if fault := repo.PrivateSource.CheckRequest(*t, time.Now()); fault != nil {
-			return fault
-		}
-	}
 	ids := map[string]bool{}
 	for _, c := range t.Acceptance {
 		if !ValidID(c.ID) || ids[c.ID] || len(c.Description) < 1 || len(c.Description) > 2048 ||
@@ -954,6 +1043,11 @@ func (t *Task) Validate(repo Repo) *Fault {
 			t.TaskClass = "code"
 		default:
 			t.TaskClass = "review"
+		}
+	}
+	if t.DataClass == PrivateSourceData || repo.PrivateSource != nil {
+		if fault := repo.PrivateSource.CheckRequest(*t, time.Now()); fault != nil {
+			return fault
 		}
 	}
 	if limit := repo.Limits.MaxDeadlineSeconds; limit > 0 && t.Deadline() > time.Duration(limit)*time.Second {
@@ -1222,32 +1316,32 @@ type OpenCodeRoute struct {
 }
 
 type Job struct {
-	PlanSHA256           string          `json:"plan_sha256,omitempty"`
-	CapacityWarningCodes []string        `json:"capacity_warning_codes,omitempty"`
-	RoutingMode          string          `json:"routing_mode,omitempty"`
-	QualityRole          string          `json:"quality_role,omitempty"`
-	M1OpenCodeRoutes     []OpenCodeRoute `json:"m1_opencode_routes,omitempty"`
-	HandoffFrom          []HandoffFrom   `json:"handoff_from,omitempty"`
-	ID                   string          `json:"job_id"`
-	RepoID               string          `json:"repo_id"`
-	RequestID            string          `json:"-"`
-	Parent               string          `json:"parent_id,omitempty"`
-	Key                  string          `json:"key,omitempty"`
-	Children             []string        `json:"children,omitempty"`
-	DependsOn            []string        `json:"depends_on,omitempty"`
-	Distinct             bool            `json:"distinct,omitempty"`
-	Task                 Task            `json:"task"`
-	Status               string          `json:"status"`
-	Reason               string          `json:"reason_code,omitempty"`
-	CreatedAt            time.Time       `json:"created_at"`
-	DeadlineAt           time.Time       `json:"deadline_at"`
-	ReadyAt              time.Time       `json:"ready_at,omitzero"`
-	SnapshotID           string          `json:"snapshot_id,omitempty"`
-	BaseSHA              string          `json:"base_sha,omitempty"`
-	Dirty                bool            `json:"scope_dirty,omitempty"`
-	PolicyDigest         string          `json:"policy_digest"`
-	Attempts             []Attempt       `json:"attempts,omitempty"`
-	Route                []Decision      `json:"route,omitempty"`
+	PlanSHA256           string            `json:"plan_sha256,omitempty"`
+	CapacityWarningCodes []string          `json:"capacity_warning_codes,omitempty"`
+	RoutingMode          string            `json:"routing_mode,omitempty"`
+	QualityRole          string            `json:"quality_role,omitempty"`
+	M1OpenCodeRoutes     []OpenCodeRoute   `json:"m1_opencode_routes,omitempty"`
+	HandoffFrom          []HandoffFrom     `json:"handoff_from,omitempty"`
+	ID                   string            `json:"job_id"`
+	RepoID               string            `json:"repo_id"`
+	RequestID            string            `json:"-"`
+	Parent               string            `json:"parent_id,omitempty"`
+	Key                  string            `json:"key,omitempty"`
+	Children             []string          `json:"children,omitempty"`
+	DependsOn            []string          `json:"depends_on,omitempty"`
+	Distinct             bool              `json:"distinct,omitempty"`
+	Task                 Task              `json:"task"`
+	Status               string            `json:"status"`
+	Reason               string            `json:"reason_code,omitempty"`
+	CreatedAt            time.Time         `json:"created_at"`
+	DeadlineAt           time.Time         `json:"deadline_at"`
+	ReadyAt              time.Time         `json:"ready_at,omitzero"`
+	SnapshotID           string            `json:"snapshot_id,omitempty"`
+	BaseSHA              string            `json:"base_sha,omitempty"`
+	Dirty                bool              `json:"scope_dirty,omitempty"`
+	PolicyDigest         string            `json:"policy_digest"`
+	Attempts             []Attempt         `json:"attempts,omitempty"`
+	Route                []Decision        `json:"route,omitempty"`
 	Result               *Result           `json:"result,omitempty"`
 	ResumeRequest        string            `json:"resume_request,omitempty"`
 	Diff                 string            `json:"diff,omitempty"`

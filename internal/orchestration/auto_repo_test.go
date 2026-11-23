@@ -96,9 +96,11 @@ func TestEngine_AutoRegisterRepo_Dynamic(t *testing.T) {
 	if resolvedID == "" {
 		t.Fatalf("expected dynamic repo ID, got empty string")
 	}
+	if _, exists := cfg.Repositories[resolvedID]; exists {
+		t.Fatalf("dynamic repo %q mutated the caller's static config", resolvedID)
+	}
 
-	// Verify repo is added to e.cfg.Repositories
-	r, ok := e.cfg.Repositories[resolvedID]
+	r, ok := e.Repo(resolvedID)
 	if !ok {
 		t.Fatalf("expected repo %q in e.cfg.Repositories", resolvedID)
 	}

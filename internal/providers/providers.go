@@ -26,6 +26,7 @@ type Registry struct {
 	agy        model.ProviderConfig
 	codex      model.ProviderConfig
 	claude     model.ProviderConfig
+	cliPaths   map[string]string
 }
 
 var defaultCodexModels = []string{
@@ -42,9 +43,9 @@ var defaultClaudeModels = []string{
 
 func New(c model.Config) Registry {
 	r := Registry{Candidates: []model.Capability{
-		{Provider: "agy", Status: "unverified", Reason: "ZERO_COST_UNVERIFIED", Mode: "headless",
+		{Provider: "agy", Status: "unverified", Reason: "ZERO_COST_UNVERIFIED", Mode: "headless", Speed: "fast",
 			Cost: agyUnverifiedCost(), Profiles: agyProfiles()},
-		{Provider: "opencode", Status: "unverified", Reason: "PERMISSION_AND_FREE_MODEL_SMOKE_REQUIRED", Mode: "tool_free"},
+		{Provider: "opencode", Status: "unverified", Reason: "PERMISSION_AND_FREE_MODEL_SMOKE_REQUIRED", Mode: "tool_free", Speed: "fast"},
 		{Provider: "copilot", Status: "disabled", Reason: "CLAUDE_ONLY_UNAVAILABLE"},
 	}}
 	for _, m := range defaultCodexModels {
@@ -72,124 +73,8 @@ func New(c model.Config) Registry {
 		if i < 0 || p.ID == "copilot" {
 			continue
 		}
-		if p.ID == "codex" {
-			r.codex = p
-			canonicalPath := p.Path
-			if canonicalPath == "" {
-				if lp, err := exec.LookPath("codex"); err == nil {
-					canonicalPath = lp
-				}
-			}
-			if canonicalPath != "" {
-				if abs, err := filepath.Abs(canonicalPath); err == nil {
-					if real, err := filepath.EvalSymlinks(abs); err == nil && filepath.IsAbs(real) {
-						canonicalPath = real
-					}
-				}
-			}
-			fp, err := Fingerprint(canonicalPath)
-			if err == nil {
-				r.codex.Path = canonicalPath
-				for idx := range r.Candidates {
-					if r.Candidates[idx].Provider == "codex" {
-						r.Candidates[idx].Status = "available"
-						r.Candidates[idx].Reason = "CODEX_CLI_AVAILABLE"
-						r.Candidates[idx].Fingerprint = fp
-						if p.Speed != "" {
-							r.Candidates[idx].Speed = p.Speed
-						}
-					}
-				}
-				if p.Model != "" && !slices.Contains(defaultCodexModels, p.Model) {
-					if match := slices.IndexFunc(r.Candidates, func(other model.Capability) bool {
-						return other.Provider == "codex" && other.Model == p.Model
-					}); match >= 0 {
-						r.Candidates[match].Status = "available"
-						r.Candidates[match].Reason = "CODEX_CLI_AVAILABLE"
-						r.Candidates[match].Fingerprint = fp
-						if p.Speed != "" {
-							r.Candidates[match].Speed = p.Speed
-						}
-					} else {
-						r.Candidates = append(r.Candidates, model.Capability{
-							Provider:    "codex",
-							Model:       p.Model,
-							Status:      "available",
-							Reason:      "CODEX_CLI_AVAILABLE",
-							Fingerprint: fp,
-							Mode:        "cli",
-							Speed:       p.Speed,
-						})
-					}
-				}
-			} else {
-				for idx := range r.Candidates {
-					if r.Candidates[idx].Provider == "codex" {
-						r.Candidates[idx].Status = "disabled"
-						r.Candidates[idx].Reason = "BINARY_UNAVAILABLE"
-					}
-				}
-			}
-			continue
-		}
-		if p.ID == "claude" {
-			r.claude = p
-			canonicalPath := p.Path
-			if canonicalPath == "" {
-				if lp, err := exec.LookPath("claude"); err == nil {
-					canonicalPath = lp
-				}
-			}
-			if canonicalPath != "" {
-				if abs, err := filepath.Abs(canonicalPath); err == nil {
-					if real, err := filepath.EvalSymlinks(abs); err == nil && filepath.IsAbs(real) {
-						canonicalPath = real
-					}
-				}
-			}
-			fp, err := Fingerprint(canonicalPath)
-			if err == nil {
-				r.claude.Path = canonicalPath
-				for idx := range r.Candidates {
-					if r.Candidates[idx].Provider == "claude" {
-						r.Candidates[idx].Status = "available"
-						r.Candidates[idx].Reason = "CLAUDE_CLI_AVAILABLE"
-						r.Candidates[idx].Fingerprint = fp
-						if p.Speed != "" {
-							r.Candidates[idx].Speed = p.Speed
-						}
-					}
-				}
-				if p.Model != "" && !slices.Contains(defaultClaudeModels, p.Model) {
-					if match := slices.IndexFunc(r.Candidates, func(other model.Capability) bool {
-						return other.Provider == "claude" && other.Model == p.Model
-					}); match >= 0 {
-						r.Candidates[match].Status = "available"
-						r.Candidates[match].Reason = "CLAUDE_CLI_AVAILABLE"
-						r.Candidates[match].Fingerprint = fp
-						if p.Speed != "" {
-							r.Candidates[match].Speed = p.Speed
-						}
-					} else {
-						r.Candidates = append(r.Candidates, model.Capability{
-							Provider:    "claude",
-							Model:       p.Model,
-							Status:      "available",
-							Reason:      "CLAUDE_CLI_AVAILABLE",
-							Fingerprint: fp,
-							Mode:        "cli",
-							Speed:       p.Speed,
-						})
-					}
-				}
-			} else {
-				for idx := range r.Candidates {
-					if r.Candidates[idx].Provider == "claude" {
-						r.Candidates[idx].Status = "disabled"
-						r.Candidates[idx].Reason = "BINARY_UNAVAILABLE"
-					}
-				}
-			}
+		if p.ID == "codex" || p.ID == "claude" {
+			r.configureCLI(p)
 			continue
 		}
 		if p.ID == "opencode" {
@@ -212,7 +97,11 @@ func New(c model.Config) Registry {
 		}
 		m := &r.Candidates[i]
 		m.Model = p.Model
-		m.Speed = p.Speed
+		if p.Speed != "" {
+			m.Speed = p.Speed
+		} else if m.Speed == "" {
+			m.Speed = "fast"
+		}
 		m.AttestedAccount = p.AttestedAccount
 		m.AttestedAccountSHA256 = p.AttestedAccountSHA256
 		if p.Path == "" {
@@ -351,8 +240,131 @@ func New(c model.Config) Registry {
 	return r
 }
 
+func (r *Registry) configureCLI(p model.ProviderConfig) {
+	provider := p.ID
+	availReason := "CODEX_CLI_AVAILABLE"
+	cfgRef := &r.codex
+	defaults := defaultCodexModels
+	if provider == "claude" {
+		availReason = "CLAUDE_CLI_AVAILABLE"
+		cfgRef = &r.claude
+		defaults = defaultClaudeModels
+	}
+
+	canonicalPath := p.Path
+	if canonicalPath == "" {
+		canonicalPath = cfgRef.Path
+	}
+	if canonicalPath == "" {
+		if lp, err := exec.LookPath(provider); err == nil {
+			canonicalPath = lp
+		}
+	}
+	if canonicalPath != "" {
+		if abs, err := filepath.Abs(canonicalPath); err == nil {
+			if real, err := filepath.EvalSymlinks(abs); err == nil && filepath.IsAbs(real) {
+				canonicalPath = real
+			}
+		}
+	}
+
+	speed := p.Speed
+	if speed == "" {
+		speed = "fast"
+	}
+
+	fp, err := Fingerprint(canonicalPath)
+	if err != nil {
+		if p.Model != "" {
+			match := slices.IndexFunc(r.Candidates, func(other model.Capability) bool {
+				return other.Provider == provider && other.Model == p.Model
+			})
+			if match < 0 {
+				r.Candidates = append(r.Candidates, model.Capability{
+					Provider: provider,
+					Model:    p.Model,
+					Status:   "disabled",
+					Reason:   "BINARY_UNAVAILABLE",
+					Mode:     "cli",
+					Speed:    speed,
+				})
+			}
+		}
+		return
+	}
+
+	if cfgRef.Path == "" {
+		*cfgRef = p
+		cfgRef.Path = canonicalPath
+	}
+	if p.Model != "" {
+		if r.cliPaths == nil {
+			r.cliPaths = make(map[string]string)
+		}
+		r.cliPaths[provider+"\x00"+p.Model] = canonicalPath
+	}
+
+	for idx := range r.Candidates {
+		if r.Candidates[idx].Provider != provider || !slices.Contains(defaults, r.Candidates[idx].Model) {
+			continue
+		}
+		if r.Candidates[idx].Status != "available" {
+			r.Candidates[idx].Status = "available"
+			r.Candidates[idx].Reason = availReason
+			r.Candidates[idx].Fingerprint = fp
+			if r.Candidates[idx].Speed == "" {
+				r.Candidates[idx].Speed = "fast"
+			}
+		}
+		if p.Model == "" && p.Speed != "" {
+			r.Candidates[idx].Speed = p.Speed
+		}
+	}
+
+	if p.Model != "" {
+		if match := slices.IndexFunc(r.Candidates, func(other model.Capability) bool {
+			return other.Provider == provider && other.Model == p.Model
+		}); match >= 0 {
+			r.Candidates[match].Status = "available"
+			r.Candidates[match].Reason = availReason
+			r.Candidates[match].Fingerprint = fp
+			if p.Speed != "" {
+				r.Candidates[match].Speed = p.Speed
+			} else if r.Candidates[match].Speed == "" {
+				r.Candidates[match].Speed = "fast"
+			}
+		} else {
+			r.Candidates = append(r.Candidates, model.Capability{
+				Provider:    provider,
+				Model:       p.Model,
+				Status:      "available",
+				Reason:      availReason,
+				Fingerprint: fp,
+				Mode:        "cli",
+				Speed:       speed,
+			})
+		}
+	}
+}
+
+func (r Registry) cliPath(provider, modelID string) string {
+	if modelID != "" && r.cliPaths != nil {
+		if p := r.cliPaths[provider+"\x00"+modelID]; p != "" {
+			return p
+		}
+	}
+	if provider == "codex" {
+		return r.codex.Path
+	}
+	return r.claude.Path
+}
+
 func openCodeCapability(p model.ProviderConfig) model.Capability {
-	c := model.Capability{Provider: "opencode", Model: p.Model, OpenCodeAccount: model.OpenCodeAnonymous, Speed: p.Speed, Status: "unverified",
+	speed := p.Speed
+	if speed == "" {
+		speed = "fast"
+	}
+	c := model.Capability{Provider: "opencode", Model: p.Model, OpenCodeAccount: model.OpenCodeAnonymous, Speed: speed, Status: "unverified",
 		OpenCodeTransport: p.OpenCodeTransport, Reason: "PERMISSION_AND_FREE_MODEL_SMOKE_REQUIRED", Mode: "tool_free",
 		AttestedAccount: p.AttestedAccount, AttestedAccountSHA256: p.AttestedAccountSHA256}
 	if p.AttestedAccount != "" {
@@ -486,7 +498,7 @@ func (r Registry) RunTrustedLocal(ctx context.Context, dir, work string, c model
 		if effort == "" {
 			effort = "medium"
 		}
-		res, err := RunCodexCLI(ctx, work, modelID, effort, t.Objective, SandboxModeWorkspaceWrite, r.codex.Path)
+		res, err := RunCodexCLI(ctx, work, modelID, effort, t.Objective, SandboxModeWorkspaceWrite, r.cliPath("codex", modelID))
 		if err != nil {
 			return execution.FixtureInput{}, err
 		}
@@ -496,14 +508,16 @@ func (r Registry) RunTrustedLocal(ctx context.Context, dir, work string, c model
 		if modelID == "" {
 			modelID = r.claude.Model
 		}
-		res, err := RunClaudeCLI(ctx, work, modelID, t.Objective, SandboxModeWorkspaceWrite, r.claude.Path)
+		res, err := RunClaudeCLIWithEffort(ctx, work, modelID, t.TargetEffort, t.Objective, SandboxModeWorkspaceWrite, r.cliPath("claude", modelID))
 		if err != nil {
 			return execution.FixtureInput{}, err
 		}
 		return execution.FixtureInput{Claude: &res.Evidence, Summary: res.Output}, nil
 	case "agy":
+		// Non-CLI provider: agy encodes effort in the model slug (e.g. -low/-medium/-high) and takes no separate effort flag.
 		return superviseAGY(ctx, dir, agyRequest{Config: r.agy, Task: t, Worktree: work, WritePaths: writePaths})
 	default:
+		// Non-CLI provider (opencode): tool-free/native JSON transport has no reasoning-effort parameter.
 		return runOpenCodeTrusted(ctx, dir, work, c, t, writePaths)
 	}
 }
@@ -571,7 +585,7 @@ func (r Registry) Run(ctx context.Context, dir string, c model.Capability, t mod
 		if effort == "" {
 			effort = "medium"
 		}
-		res, err := RunCodexCLI(ctx, dir, modelID, effort, t.Objective, sb, r.codex.Path)
+		res, err := RunCodexCLI(ctx, dir, modelID, effort, t.Objective, sb, r.cliPath("codex", modelID))
 		if err != nil {
 			return execution.FixtureInput{}, err
 		}
@@ -586,12 +600,16 @@ func (r Registry) Run(ctx context.Context, dir string, c model.Capability, t mod
 		if modelID == "" {
 			modelID = r.claude.Model
 		}
-		res, err := RunClaudeCLI(ctx, dir, modelID, t.Objective, sb, r.claude.Path)
+		res, err := RunClaudeCLIWithEffort(ctx, dir, modelID, t.TargetEffort, t.Objective, sb, r.cliPath("claude", modelID))
 		if err != nil {
 			return execution.FixtureInput{}, err
 		}
 		return execution.FixtureInput{Claude: &res.Evidence, Summary: res.Output}, nil
 	}
+	// Non-CLI providers below do not take a separate reasoning-effort parameter:
+	// - agy encodes effort in the model slug itself (e.g. -low/-medium/-high).
+	// - opencode runs over an anonymous HTTP/JSON transport without effort controls.
+	// - fixture is an offline deterministic test adapter.
 	if c.Provider == "agy" {
 		if c.Status != "available" || !r.agy.EnableSynthetic {
 			return execution.FixtureInput{}, model.Error("ZERO_COST_UNVERIFIED", "AGY synthetic preflight is unavailable")

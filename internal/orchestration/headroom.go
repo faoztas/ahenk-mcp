@@ -103,6 +103,24 @@ func effectiveTargetTier(t model.Task) string {
 	}
 }
 
+func targetTierViolation(targetTier, fpTier string, qualityTier int) string {
+	switch targetTier {
+	case "free":
+		if fpTier != "free" {
+			return "TARGET_TIER_MISMATCH_FREE_ONLY"
+		}
+	case "cheap":
+		if fpTier == "" && qualityTier > 1 || fpTier != "" && fpTier != "free" && fpTier != "cheap" {
+			return "TARGET_TIER_CONSERVE_PREMIUM"
+		}
+	case "hard", "frontier":
+		if fpTier == "free" || fpTier == "cheap" || fpTier == "" && qualityTier < 2 {
+			return "TARGET_TIER_INSUFFICIENT_QUALITY"
+		}
+	}
+	return ""
+}
+
 // fpWeights returns the price/performance score weights for a target tier:
 // headroom, quality and cost. Auto routing keeps quality dominant so the
 // removal of the rigid QUALITY_TIER_BELOW_BEST lock does not silently

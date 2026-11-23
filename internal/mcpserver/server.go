@@ -119,125 +119,57 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 	}
 
 	handleDelegateTask := func(ctx context.Context, in model.DelegateTaskInput) (response, error) {
-		maxDepth := in.MaxDepth
-		if maxDepth <= 0 {
-			maxDepth = 1
-		}
-		if err := providers.CheckRecursionGuard(os.Environ(), maxDepth); err != nil {
+		effectiveMaxDepth := providers.EffectiveMaxDepth(os.Environ(), in.MaxDepth)
+		if err := providers.CheckRecursionGuard(os.Environ(), effectiveMaxDepth); err != nil {
 			return nil, err
 		}
-		if in.RepoID == "" {
+		if in.RepoID == "" && e != nil {
 			repoID, rErr := e.ResolveRepo(in.Cwd)
 			if rErr == nil {
 				in.RepoID = repoID
 			}
 		}
-		sub, execMode, waitTimeout, err := in.Normalize(in.Cwd, &cfg)
+		normCfg := &cfg
+		if e != nil && in.RepoID != "" {
+			if repo, ok := e.Repo(in.RepoID); ok {
+				normCfg = &model.Config{Repositories: map[string]model.Repo{in.RepoID: repo}}
+			}
+		}
+		sub, execMode, waitTimeout, err := in.Normalize(in.Cwd, normCfg)
 		if err != nil {
 			return nil, err
 		}
+		sub.Task.MaxDepth = effectiveMaxDepth
 
 		var routeDecision map[string]any
 		isAuto := (in.Target == nil || in.Target.Provider == "" || in.Target.Provider == "auto") &&
 			in.PreferredProvider == "" && in.PreferredModel == "" && sub.Task.PreferredProvider == "" && sub.Task.PreferredModel == ""
-		if isAuto {
-			category := in.Category
-			if category == "" {
-				category = "coding"
+		if isAuto && e != nil {
+			var complexityPtr *float64
+			if in.HasComplexity || in.Complexity != 0 {
+				c := in.Complexity
+				complexityPtr = &c
 			}
-			complexity := in.Complexity
-			if complexity <= 0 {
-				if category == "research" {
-					complexity = 0.2
-				} else {
-					complexity = 0.9
-				}
-			}
-
-			matrix := orchestration.FallbackMatrix(category)
-			var selectedModel string
-			var selectedProvider string
-			var selectedHealth float64 = 1.0
-
-			var allowedProviders []string
-			if in.RepoID != "" {
-				if repoCfg, ok := cfg.Repositories[in.RepoID]; ok {
-					allowedProviders = repoCfg.Providers
-				}
-			}
-
-			isProviderAllowed := func(prov string) bool {
-				if len(allowedProviders) == 0 {
-					return true
-				}
-				norm := orchestration.NormalizeProvider(prov)
-				for _, ap := range allowedProviders {
-					if orchestration.NormalizeProvider(ap) == norm {
-						return true
-					}
-				}
-				return false
-			}
-
-			for _, candidate := range matrix {
-				parts := strings.Split(candidate, "/")
-				candProv := parts[0]
-
-				if !isProviderAllowed(candProv) {
-					continue
-				}
-
-				if e != nil && !e.IsExecutable(candProv) {
-					continue
-				}
-
-				health := 1.0
-				switch orchestration.NormalizeProvider(candProv) {
-				case "codex":
-					health = e.HealthPercent(providers.BarCodexBurst)
-				case "agy":
-					health = e.HealthPercent(providers.BarAgyGemini)
-				case "opencode":
-					health = e.HealthPercent(providers.BarOpenCodeFree)
-				}
-
-				if health <= 0.0 {
-					continue
-				}
-
-				if e.CircuitBreaker() != nil && !e.CircuitBreaker().Eligible(candProv) {
-					continue
-				}
-
-				opusHealth := e.HealthPercent(providers.BarAgyOpus)
-				if err := orchestration.ValidateModelAdmission(category, candidate, opusHealth); err != nil {
-					continue
-				}
-
-				selectedModel = candidate
-				selectedProvider = candProv
-				selectedHealth = health
-				break
-			}
-
-			if selectedModel != "" {
-				effort, reason := orchestration.ResolveEffort(category, complexity, selectedHealth, selectedModel)
-
+			decision, selectedCap := e.EvaluateAutoRoute(in.RepoID, in.Category, complexityPtr, sub.Task, time.Now().UTC())
+			if selectedCap != nil {
 				routeDecision = map[string]any{
-					"selected_model":  selectedModel,
-					"resolved_effort": string(effort),
-					"reason":          reason,
-					"task_category":   category,
-					"quota_pressure":  1.0 - selectedHealth,
+					"selected_model":  decision.SelectedModel,
+					"resolved_effort": decision.ResolvedEffort,
+					"reason":          decision.Reason,
+					"task_category":   decision.TaskCategory,
+					"quota_pressure":  decision.QuotaPressure,
 				}
-
-				modelName := selectedModel
-				if parts := strings.SplitN(selectedModel, "/", 2); len(parts) == 2 {
-					modelName = parts[1]
+				sub.Task.PreferredProvider = orchestration.NormalizeProvider(selectedCap.Provider)
+				if selectedCap.Model != "" {
+					sub.Task.PreferredModel = selectedCap.Model
+				} else if parts := strings.SplitN(decision.SelectedModel, "/", 2); len(parts) == 2 {
+					sub.Task.PreferredModel = parts[1]
+				} else {
+					sub.Task.PreferredModel = decision.SelectedModel
 				}
-				sub.Task.PreferredProvider = orchestration.NormalizeProvider(selectedProvider)
-				sub.Task.PreferredModel = modelName
-				sub.Task.TargetEffort = string(effort)
+				if sub.Task.TargetEffort == "" {
+					sub.Task.TargetEffort = decision.ResolvedEffort
+				}
 			}
 		}
 
@@ -265,29 +197,13 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 				LatencyMs:               time.Since(dispatchStart).Milliseconds(),
 				CreatedAt:               auditCreatedAt,
 			})
+			if cur, getErr := e.Get(j.ID); getErr == nil && model.Terminal(cur.Status) {
+				e.SyncTerminalAudit(cur)
+			}
 		}
 
 		if execMode == "wait" {
 			waitedJob, waitErr := e.Wait(ctx, j.ID, waitTimeout)
-			latency := time.Since(dispatchStart).Milliseconds()
-			dispatchStatus := "SUCCESS"
-			if waitErr != nil || waitedJob.Status == model.Failed {
-				dispatchStatus = "FAILED"
-			}
-			if routeDecision != nil && e.Store() != nil && j.ID != "" {
-				_ = e.Store().RecordRoutingAudit(store.JobRoutingAudit{
-					JobID:                   j.ID,
-					TaskCategory:            routeDecision["task_category"].(string),
-					AttemptNumber:           1,
-					AssignedModel:           routeDecision["selected_model"].(string),
-					AssignedEffort:          routeDecision["resolved_effort"].(string),
-					RouteReason:             routeDecision["reason"].(string),
-					QuotaPressureAtDispatch: routeDecision["quota_pressure"].(float64),
-					DispatchStatus:          dispatchStatus,
-					LatencyMs:               latency,
-					CreatedAt:               auditCreatedAt,
-				})
-			}
 			out := jobDetailedResponse(ctx, waitedJob)
 			if routeDecision != nil {
 				out["route_decision"] = routeDecision
@@ -301,8 +217,8 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 		return out, nil
 	}
 
-	add(s, e, "delegate_task", "Delegate an objective to a bounded subagent. Executes in an isolated git worktree with verification and returns summary and verified diff. Defaults to synchronous execution (mode: wait).", false, handleDelegateTask)
-	add(s, e, "spawn_subagent", "Spawn an autonomous subagent for isolated work. Alias for delegate_task.", false, handleDelegateTask)
+	add(s, e, "delegate_task", "Delegate an objective to a bounded subagent in an isolated worktree. A string task defaults to wait. A structured task or objective defaults to async. Set execution_mode to choose explicitly.", false, handleDelegateTask, delegateDualFormSchema)
+	add(s, e, "spawn_subagent", "Spawn an autonomous subagent for isolated work. Alias for delegate_task.", false, handleDelegateTask, delegateDualFormSchema)
 	add(s, e, "wait_jobs", "Wait for one or more subagent jobs to finish. Use after launching multiple parallel subagents with execution_mode:'async'.", false,
 		func(ctx context.Context, in model.WaitJobsInput) (response, error) {
 			norm, err := in.Normalize()
@@ -322,7 +238,7 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 		})
 	add(s, e, "delegate_batch", "Queue up to eight tasks with dependencies and optional verified result handoffs.", false,
 		func(ctx context.Context, in model.Batch) (response, error) {
-			if repo, ok := cfg.Repositories[in.RepoID]; ok && repo.PrivateSource != nil {
+			if repo, ok := e.Repo(in.RepoID); ok && repo.PrivateSource != nil {
 				if !repo.PrivateSource.WriterIsolationVerified || !repo.PrivateSource.AllowWrite {
 					return nil, model.GateError("POLICY_DENIED", "WRITER_ISOLATION_UNVERIFIED", "private source batch requires verified writer isolation and explicit write admission", "verify_writer_isolation_and_enable_allow_write")
 				}
@@ -337,6 +253,9 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 		})
 	add(s, e, "get_job_status", "Read a job status without waiting for completion.", false,
 		func(_ context.Context, in jobID) (response, error) {
+			if !model.ValidID(in.JobID) {
+				return nil, model.Error("INVALID_INPUT", "invalid job_id")
+			}
 			j, err := e.Get(in.JobID)
 			return jobResponse(j), err
 		})
@@ -345,8 +264,14 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 			if in.Limit == 0 {
 				in.Limit = 20
 			}
-			if in.Limit < 1 || in.Limit > 100 || in.Cursor != "" && !model.ValidID(in.Cursor) {
+			if in.Limit < 1 || in.Limit > 100 || (in.Cursor != "" && !model.ValidID(in.Cursor)) {
 				return nil, model.Error("INVALID_INPUT", "invalid pagination")
+			}
+			if in.RepoID != "" && !model.ValidID(in.RepoID) {
+				return nil, model.Error("INVALID_INPUT", "invalid repo_id")
+			}
+			if in.Status != "" && !model.ValidID(in.Status) {
+				return nil, model.Error("INVALID_INPUT", "invalid status")
 			}
 			list, next := e.List(in.RepoID, in.Status, in.Cursor, in.Limit)
 			items := make([]response, 0, len(list))
@@ -357,16 +282,25 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 		})
 	add(s, e, "cancel_job", "Cancel a durable job and terminate its worker.", false,
 		func(_ context.Context, in jobID) (response, error) {
+			if !model.ValidID(in.JobID) {
+				return nil, model.Error("INVALID_INPUT", "invalid job_id")
+			}
 			j, err := e.Cancel(in.JobID)
 			return jobResponse(j), err
 		})
 	add(s, e, "resume_job", "Resume a paused or interrupted job, or retry one malformed review, with the original deadline and snapshot.", false,
 		func(_ context.Context, in resumeInput) (response, error) {
+			if !model.ValidID(in.JobID) || !model.ValidID(in.RequestID) {
+				return nil, model.Error("INVALID_INPUT", "invalid job_id or request_id")
+			}
 			j, err := e.Resume(in.JobID, in.RequestID)
 			return jobResponse(j), err
 		})
 	add(s, e, "get_job_result", "Read a summary, route evidence, or a bounded page of a verified diff.", false,
 		func(ctx context.Context, in resultInput) (response, error) {
+			if !model.ValidID(in.JobID) {
+				return nil, model.Error("INVALID_INPUT", "invalid job_id")
+			}
 			j, err := e.Get(in.JobID)
 			if err != nil {
 				return nil, err
@@ -391,7 +325,17 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 					out["routing_mode"] = j.RoutingMode
 				}
 			case "diff":
-				p, drift, err := e.Artifact(ctx, j, in.ArtifactID)
+				if j.Result == nil || j.Result.ArtifactID == "" {
+					return nil, model.Error("NOT_FOUND", "job has no verified diff artifact")
+				}
+				artifactID := in.ArtifactID
+				if artifactID == "" {
+					artifactID = j.Result.ArtifactID
+				}
+				if !model.ValidID(artifactID) {
+					return nil, model.Error("INVALID_INPUT", "invalid artifact_id")
+				}
+				p, drift, err := e.Artifact(ctx, j, artifactID)
 				if err != nil {
 					return nil, err
 				}
@@ -428,18 +372,18 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 					"version": model.Version, "binary_sha256": execution.SelfBinarySHA256()}, nil
 			}
 			if in.RepoID != "" {
-				if _, ok := cfg.Repositories[in.RepoID]; !ok {
+				if !e.HasRepo(in.RepoID) {
 					return nil, model.GateError("REPO_NOT_REGISTERED", "REPO_NOT_REGISTERED", "repository is not registered", "register_repository_in_config")
 				}
 			}
 			capacity, warnings, preview := e.Capacity(in.RepoID)
+			repoProviders := e.RepoProviders(in.RepoID)
 			items := make([]model.Capability, 0)
 			for _, c := range r.Candidates {
 				if in.Provider != "" && orchestration.NormalizeProvider(c.Provider) != orchestration.NormalizeProvider(in.Provider) {
 					continue
 				}
 				if in.RepoID != "" && c.Status == "available" {
-					repoProviders := cfg.Repositories[in.RepoID].Providers
 					cNorm := orchestration.NormalizeProvider(c.Provider)
 					match := false
 					for _, rp := range repoProviders {
@@ -456,7 +400,8 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 				if c.Status == "available" {
 					c.Quality = e.RoleQualities(c)
 					c.FPTier = providers.FPTier(c.Provider, c.Model)
-					if c.Provider == "agy" {
+					switch orchestration.NormalizeProvider(c.Provider) {
+					case "agy":
 						if family := providers.AGYModelFamily(c.Model); family != "" {
 							for _, h := range capacity.Headroom {
 								if h.Family == family {
@@ -465,8 +410,30 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 								}
 							}
 						}
-					} else if c.Provider == "opencode" {
-						c.HeadroomPercent, c.HeadroomState = 100, "HEALTHY"
+					case "opencode":
+						c.HeadroomPercent = e.HealthPercent(providers.BarOpenCodeFree) * 100
+						c.HeadroomState = e.BarState(providers.BarOpenCodeFree)
+					case "codex":
+						for _, h := range capacity.Headroom {
+							if h.Family == "codex" {
+								c.HeadroomPercent, c.HeadroomState = h.Effective*100, h.State
+								break
+							}
+						}
+						if c.HeadroomState == "" {
+							burst := e.HealthPercent(providers.BarCodexBurst)
+							weekly := e.HealthPercent(providers.BarCodexWeekly)
+							if burst <= 0 || weekly <= 0 {
+								c.HeadroomPercent, c.HeadroomState = 0, "EXHAUSTED"
+							}
+						}
+					case "claude":
+						for _, q := range e.Quota("claude") {
+							if q.State == "EXHAUSTED" || (q.Remaining != nil && *q.Remaining <= 0) {
+								c.HeadroomPercent, c.HeadroomState = 0, "EXHAUSTED"
+								break
+							}
+						}
 					}
 				}
 				items = append(items, c)
@@ -476,8 +443,8 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 				"version":          model.Version,
 				"binary_sha256":    execution.SelfBinarySHA256(),
 				"providers":        items,
-				"local_runners":    readiness.LocalRunners(cfg),
-				"routing_summary":  routingSummary(items, e.ActiveCircuitBreakers()),
+				"local_runners":    e.LocalRunners(),
+				"routing_summary":  routingSummary(items, e.ActiveCircuitBreakers(), e),
 			}
 			if in.RepoID != "" {
 				out["repo_admission"] = e.RepoAdmission(in.RepoID)
@@ -506,19 +473,27 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 				{Bucket: providers.BarCodexWeekly, Provider: "codex"},
 				{Bucket: providers.BarAgyGemini, Provider: "antigravity"},
 				{Bucket: providers.BarAgyOpus, Provider: "antigravity"},
+				{Bucket: providers.BarAgyArgon, Provider: "antigravity"},
 				{Bucket: providers.BarOpenCodeFree, Provider: "opencode"},
 			}
 			bars := make([]map[string]any, 0, len(trackedBars))
 			for _, b := range trackedBars {
-				health := 1.0
-				state := "HEALTHY"
+				if e == nil {
+					bars = append(bars, map[string]any{
+						"bucket":            b.Bucket,
+						"provider":          b.Provider,
+						"remaining_percent": nil,
+						"health_pct":        nil,
+						"state":             "UNKNOWN",
+						"circuit_state":     "UNKNOWN",
+					})
+					continue
+				}
+				health := e.HealthPercent(b.Bucket)
+				state := e.BarState(b.Bucket)
 				circuitState := "CLOSED"
-				if e != nil {
-					health = e.HealthPercent(b.Bucket)
-					state = e.BarState(b.Bucket)
-					if e.CircuitBreaker() != nil {
-						circuitState = string(e.CircuitBreaker().State(b.Provider))
-					}
+				if e.CircuitBreaker() != nil {
+					circuitState = string(e.CircuitBreaker().State(b.Provider))
 				}
 				bars = append(bars, map[string]any{
 					"bucket":            b.Bucket,
@@ -534,31 +509,25 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 
 	add(s, e, "get_active_circuit_breakers", "Read active provider circuit breakers and cooldown deadlines.", true,
 		func(_ context.Context, _ emptyInput) (response, error) {
-			tripped := make([]map[string]any, 0)
-			if e != nil && e.CircuitBreaker() != nil {
-				for p, until := range e.CircuitBreaker().ActiveTripped() {
-					tripped = append(tripped, map[string]any{
-						"provider":       p,
-						"state":          "OPEN",
-						"cooldown_until": until.Format(time.RFC3339),
-					})
-				}
+			if e == nil {
+				return response{"tripped_breakers": []map[string]any{}}, nil
 			}
-			if e != nil {
-				for _, item := range e.ActiveCircuitBreakers() {
-					tripped = append(tripped, item)
-				}
-			}
-			return response{"tripped_breakers": tripped}, nil
+			return response{"tripped_breakers": e.ActiveCircuitBreakers()}, nil
 		})
 
 	add(s, e, "get_routing_audit", "Retrieve dynamic routing decision history and fallbacks for a given job ID.", true,
 		func(_ context.Context, in jobID) (response, error) {
-			if in.JobID == "" {
-				return nil, model.Error("INVALID_INPUT", "job_id is required")
+			if !model.ValidID(in.JobID) {
+				return nil, model.Error("INVALID_INPUT", "invalid job_id")
+			}
+			if e == nil {
+				return nil, model.GateError("STATE_BUSY", "STATE_BUSY", "another stdio session owns this state; reconnect after the owner exits", "reconnect_after_owner_exits")
+			}
+			if _, err := e.Get(in.JobID); err != nil {
+				return nil, err
 			}
 			var history []store.JobRoutingAudit
-			if e != nil && e.Store() != nil {
+			if e.Store() != nil {
 				var err error
 				history, err = e.Store().GetRoutingAudit(in.JobID)
 				if err != nil {
@@ -579,7 +548,78 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 
 // routingSummary recommends one available route per price/performance tier
 // and lists the active circuit breakers.
-func routingSummary(items []model.Capability, breakers []map[string]any) response {
+func routingSummary(items []model.Capability, breakers []map[string]any, eng ...*orchestration.Engine) response {
+	if breakers == nil {
+		breakers = []map[string]any{}
+	}
+	var e *orchestration.Engine
+	if len(eng) > 0 {
+		e = eng[0]
+	}
+
+	trippedProviders := make(map[string]bool)
+	trippedModels := make(map[string]bool)
+	for _, b := range breakers {
+		p, _ := b["provider"].(string)
+		m, _ := b["model"].(string)
+		normP := orchestration.NormalizeProvider(p)
+		if normP == "" {
+			continue
+		}
+		if m != "" {
+			trippedModels[normP+":"+m] = true
+		} else {
+			trippedProviders[normP] = true
+		}
+	}
+
+	isCandidateHealthy := func(c model.Capability) bool {
+		normP := orchestration.NormalizeProvider(c.Provider)
+		if trippedProviders[normP] || trippedModels[normP+":"+c.Model] {
+			return false
+		}
+		if e != nil && e.CircuitBreaker() != nil && !e.CircuitBreaker().Eligible(c.Provider) {
+			return false
+		}
+		if c.HeadroomState == "EXHAUSTED" || c.HeadroomState == "CRITICAL" {
+			return false
+		}
+		if e != nil {
+			switch normP {
+			case "codex":
+				if e.HealthPercent(providers.BarCodexBurst) <= 0 || e.HealthPercent(providers.BarCodexWeekly) <= 0 {
+					return false
+				}
+			case "claude":
+				for _, q := range e.Quota("claude") {
+					if q.State == "EXHAUSTED" || (q.Remaining != nil && *q.Remaining <= 0) {
+						return false
+					}
+				}
+			case "opencode":
+				if e.HealthPercent(providers.BarOpenCodeFree) <= 0 {
+					return false
+				}
+			case "agy":
+				switch providers.AGYModelFamily(c.Model) {
+				case "gemini_argon":
+					if e.HealthPercent(providers.BarAgyArgon) <= 0 {
+						return false
+					}
+				case "claude_gpt":
+					if e.HealthPercent(providers.BarAgyOpus) <= 0 {
+						return false
+					}
+				case "gemini":
+					if e.HealthPercent(providers.BarAgyGemini) <= 0 {
+						return false
+					}
+				}
+			}
+		}
+		return true
+	}
+
 	summary := response{"active_circuit_breakers": breakers}
 	const criticalHeadroom = 5.0
 	for tier, key := range map[string]string{
@@ -588,10 +628,13 @@ func routingSummary(items []model.Capability, breakers []map[string]any) respons
 	} {
 		best, bestHeadroom := "", criticalHeadroom
 		for _, c := range items {
-			if c.Status != "available" || c.FPTier != tier {
+			if c.Status != "available" || c.FPTier != tier || !isCandidateHealthy(c) {
 				continue
 			}
-			if c.HeadroomPercent > bestHeadroom || best == "" && c.HeadroomState == "" {
+			if c.HeadroomState != "" && c.HeadroomPercent <= criticalHeadroom {
+				continue
+			}
+			if c.HeadroomPercent > bestHeadroom || (best == "" && c.HeadroomState == "") {
 				best, bestHeadroom = c.Provider+":"+c.Model, c.HeadroomPercent
 			}
 		}
@@ -619,24 +662,19 @@ func status(j model.Job) response {
 	return out
 }
 
-func add[I any](s *mcp.Server, e *orchestration.Engine, name, description string, diagnostic bool, fn func(context.Context, I) (response, error)) {
-	schema, err := jsonschema.For[I](nil)
-	if err != nil {
-		panic(err)
-	}
-	b, err := json.Marshal(schema)
-	if err != nil {
-		panic(err)
-	}
-	var wire map[string]any
-	if err = json.Unmarshal(b, &wire); err != nil {
-		panic(err)
+func add[I any](s *mcp.Server, e *orchestration.Engine, name, description string, diagnostic bool, fn func(context.Context, I) (response, error), adjust ...func(map[string]any)) {
+	wire := schemaWire[I]()
+	for _, adjustSchema := range adjust {
+		adjustSchema(wire)
 	}
 	s.AddTool(&mcp.Tool{Name: name, Description: description, InputSchema: wire}, func(ctx context.Context, r *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if e == nil && !diagnostic {
 			return toolError(model.GateError("STATE_BUSY", "STATE_BUSY", "another stdio session owns this state; reconnect after the owner exits", "reconnect_after_owner_exits")), nil
 		}
-		args := r.Params.Arguments
+		if len(r.Params.Arguments) > 256<<10 {
+			return toolError(model.Error("INVALID_INPUT", "invalid tool arguments")), nil
+		}
+		args := bytes.TrimSpace(r.Params.Arguments)
 		if len(args) == 0 {
 			args = []byte("{}")
 		}
@@ -647,7 +685,7 @@ func add[I any](s *mcp.Server, e *orchestration.Engine, name, description string
 		}
 		out, err := fn(ctx, in)
 		if err != nil {
-			return toolError(err), nil
+			return toolError(err, out), nil
 		}
 		out["schema_version"] = 1
 		summary := "Ahenk " + name
@@ -667,25 +705,86 @@ func add[I any](s *mcp.Server, e *orchestration.Engine, name, description string
 	})
 }
 
-func closeObjects(node map[string]any) {
-	if node["type"] == "object" {
-		node["additionalProperties"] = false
+// delegateDualFormSchema advertises the string-or-object forms that
+// DelegateTaskInput's custom decoder accepts. Reflection-based inference only
+// sees the Go field types (string and *TargetSpec), so without this adjustment
+// discovery would reject the documented nested-task and string-target forms.
+func delegateDualFormSchema(wire map[string]any) {
+	props, ok := wire["properties"].(map[string]any)
+	if !ok {
+		return
 	}
-	for _, key := range []string{"properties", "$defs"} {
-		if props, ok := node[key].(map[string]any); ok {
-			for _, v := range props {
-				if child, ok := v.(map[string]any); ok {
-					closeObjects(child)
-				}
-			}
+	if task, ok := props["task"].(map[string]any); ok {
+		objectForm := schemaWire[model.Task]()
+		// The decoder accepts partial task objects and Normalize fills defaults.
+		delete(objectForm, "required")
+		dual := map[string]any{
+			"anyOf": []any{
+				map[string]any{"type": []any{"string", "null"}},
+				objectForm,
+			},
 		}
+		if description, ok := task["description"]; ok {
+			dual["description"] = description
+		}
+		props["task"] = dual
 	}
-	if child, ok := node["items"].(map[string]any); ok {
-		closeObjects(child)
+	if target, ok := props["target"].(map[string]any); ok {
+		description, hasDescription := target["description"]
+		delete(target, "description")
+		dual := map[string]any{
+			"anyOf": []any{
+				map[string]any{"type": []any{"string", "null"}},
+				target,
+			},
+		}
+		if hasDescription {
+			dual["description"] = description
+		}
+		props["target"] = dual
 	}
 }
 
-func toolError(err error) *mcp.CallToolResult {
+func schemaWire[T any]() map[string]any {
+	schema, err := jsonschema.For[T](nil)
+	if err != nil {
+		panic(err)
+	}
+	b, err := json.Marshal(schema)
+	if err != nil {
+		panic(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(b, &wire); err != nil {
+		panic(err)
+	}
+	return wire
+}
+
+// errorMetadataKeys are the non-sensitive handler fields retained alongside a
+// structured tool error so callers can correlate failures with a dispatched job
+// or route decision. Results, diffs, and repository metadata stay out.
+var errorMetadataKeys = []string{"job_id", "route_decision"}
+
+// preserveErrorMetadata copies allowlisted correlation fields into an error
+// response without overwriting structured error fields.
+func preserveErrorMetadata(wire, metadata response) {
+	for _, key := range errorMetadataKeys {
+		value, ok := metadata[key]
+		if !ok || value == nil {
+			continue
+		}
+		if s, ok := value.(string); ok && s == "" {
+			continue
+		}
+		if _, exists := wire[key]; exists {
+			continue
+		}
+		wire[key] = value
+	}
+}
+
+func toolError(err error, metadata ...response) *mcp.CallToolResult {
 	var f *model.Fault
 	if !errors.As(err, &f) {
 		f = model.Error("INTERNAL", "Ahenk could not complete the operation")
@@ -696,6 +795,9 @@ func toolError(err error) *mcp.CallToolResult {
 	}
 	if f.NextAction != "" {
 		wire["next_action"] = f.NextAction
+	}
+	if len(metadata) > 0 && metadata[0] != nil {
+		preserveErrorMetadata(wire, metadata[0])
 	}
 	return &mcp.CallToolResult{IsError: true, StructuredContent: wire,
 		Content: []mcp.Content{&mcp.TextContent{Text: f.Message}}}

@@ -10,9 +10,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -56,6 +58,7 @@ type Engine struct {
 }
 
 func New(c model.Config, db *store.Store, reg providers.Registry) (*Engine, error) {
+	c.Repositories = maps.Clone(c.Repositories)
 	ctx, stop := context.WithCancel(context.Background())
 	e := &Engine{cfg: c, db: db, reg: reg, ctx: ctx, stop: stop, jobs: map[string]model.Job{}, active: map[string]context.CancelFunc{},
 		orphaned: map[string]string{}, cooldown: map[string]time.Time{}, transient: map[string][]time.Time{}, quotas: map[string][]providers.Quota{},
@@ -179,6 +182,135 @@ func (e *Engine) IsExecutable(provider string) bool {
 	return false
 }
 
+func (e *Engine) Repo(id string) (model.Repo, bool) {
+	if e == nil {
+		return model.Repo{}, false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	r, ok := e.cfg.Repositories[id]
+	if ok {
+		r.AllowedPaths = slices.Clone(r.AllowedPaths)
+		r.Providers = slices.Clone(r.Providers)
+	}
+	return r, ok
+}
+
+func (e *Engine) HasRepo(id string) bool {
+	if e == nil {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, ok := e.cfg.Repositories[id]
+	return ok
+}
+
+func (e *Engine) RepoProviders(id string) []string {
+	if e == nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	r, ok := e.cfg.Repositories[id]
+	if !ok {
+		return nil
+	}
+	return slices.Clone(r.Providers)
+}
+
+func (e *Engine) LocalRunners() []model.LocalRunnerCapability {
+	var xcodeCfg *model.XcodeSchemeRunnerConfig
+	if e != nil {
+		e.mu.Lock()
+		if e.cfg.LocalXcodeRunner != nil {
+			cp := *e.cfg.LocalXcodeRunner
+			cp.Schemes = slices.Clone(cp.Schemes)
+			cp.AcceptanceModes = slices.Clone(cp.AcceptanceModes)
+			xcodeCfg = &cp
+		}
+		e.mu.Unlock()
+	}
+	swiftStatus := "unavailable"
+	swiftReason := "DARWIN_SANDBOX_OR_SWIFT_UNAVAILABLE"
+	if runtime.GOOS == "darwin" {
+		if _, err := os.Stat("/usr/bin/sandbox-exec"); err == nil {
+			if _, err := os.Stat("/usr/bin/swift"); err == nil {
+				swiftStatus = "available"
+				swiftReason = "DIGEST_PINNED_SWIFTPM_HEAD_ONLY"
+			}
+		}
+	}
+	simStatus := "unavailable"
+	simReason := "XCRUN_OR_SANDBOX_UNAVAILABLE"
+	if swiftStatus == "available" {
+		if _, err := os.Stat("/usr/bin/xcrun"); err == nil {
+			simStatus = "available"
+			simReason = "INNER_SIMULATOR_SANDBOX_VERIFIED_AT_DISPATCH"
+		}
+	}
+	xcodeRunner := model.LocalRunnerCapability{
+		Runner:          "xcode-scheme",
+		Status:          "unavailable",
+		Reason:          "XCODE_SCHEME_RUNNER_UNVERIFIED",
+		NextAction:      "route_xcode_scheme_and_ui_acceptance_to_authorized_local_owner",
+		NetworkBoundary: "UNVERIFIED",
+	}
+	if xcodeCfg != nil && xcodeCfg.Verified && len(xcodeCfg.Schemes) > 0 {
+		xcodeRunner = model.LocalRunnerCapability{
+			Runner:          "xcode-scheme",
+			Status:          "available",
+			Reason:          "VERIFIED_LOCAL_XCODE_SCHEME_RUNNER",
+			NetworkBoundary: "VERIFIED_LOCAL_RUNNER",
+			Schemes:         xcodeCfg.Schemes,
+			AcceptanceModes: xcodeCfg.AcceptanceModes,
+		}
+	}
+	return []model.LocalRunnerCapability{
+		{
+			Runner:          "swiftpm",
+			Status:          swiftStatus,
+			Reason:          swiftReason,
+			NetworkBoundary: "HOST_IP_DENIED",
+			AcceptanceModes: []string{"unit"},
+		},
+		{
+			Runner:          "simulator-xctest",
+			Status:          simStatus,
+			Reason:          simReason,
+			NetworkBoundary: "SIMULATOR_INNER_IP_DENIED",
+			AcceptanceModes: []string{"standalone_xctest"},
+		},
+		xcodeRunner,
+	}
+}
+
+func (e *Engine) SyncTerminalAudit(j model.Job) {
+	if e == nil {
+		return
+	}
+	e.syncTerminalAudit(j)
+}
+
+func (e *Engine) syncTerminalAudit(j model.Job) {
+	if !model.Terminal(j.Status) || j.ID == "" || e.db == nil {
+		return
+	}
+	status := "FAILED"
+	if j.Status == model.Completed {
+		status = "SUCCESS"
+	}
+	var latency int64
+	if !j.CreatedAt.IsZero() {
+		latency = max(0, time.Since(j.CreatedAt).Milliseconds())
+	}
+	// Routing audit rows are written once at dispatch with attempt_number 1, while
+	// retries only append model.Attempt entries to the job. Scope the terminal update
+	// to every non-terminal row for the job (attemptNumber <= 0 in the store API);
+	// deriving the attempt from len(j.Attempts) leaves the dispatched row pending.
+	_ = e.db.UpdateRoutingAuditStatus(j.ID, 0, status, latency)
+}
+
 func (e *Engine) persist(j model.Job) {
 	if e.fatal != nil {
 		return
@@ -190,18 +322,7 @@ func (e *Engine) persist(j model.Job) {
 			return
 		}
 	}
-	if model.Terminal(j.Status) && j.ID != "" && e.db != nil {
-		status := "FAILED"
-		if j.Status == model.Completed {
-			status = "SUCCESS"
-		}
-		latency := time.Since(j.CreatedAt).Milliseconds()
-		attemptNumber := len(j.Attempts)
-		if attemptNumber == 0 {
-			attemptNumber = 1
-		}
-		_ = e.db.UpdateRoutingAuditStatus(j.ID, attemptNumber, status, latency)
-	}
+	e.syncTerminalAudit(j)
 	if e.jobs != nil {
 		e.jobs[j.ID] = j
 	}
@@ -225,12 +346,15 @@ func (e *Engine) Submit(s model.Submission) (model.Job, error) {
 		}
 		s.RepoID = resolved
 	}
+	e.mu.Lock()
 	repo, ok := e.cfg.Repositories[s.RepoID]
+	if ok && s.RequestID == "" {
+		_ = s.Normalize("", &e.cfg)
+	}
+	capPolicy := e.cfg.CapacityPolicy
+	e.mu.Unlock()
 	if !ok {
 		return model.Job{}, model.GateError("REPO_NOT_REGISTERED", "REPO_NOT_REGISTERED", "repository is not registered", "register_repository_in_config")
-	}
-	if s.RequestID == "" {
-		_ = s.Normalize("", &e.cfg)
 	}
 	if !model.ValidID(s.RequestID) {
 		return model.Job{}, model.Error("INVALID_INPUT", "invalid request ID")
@@ -238,7 +362,7 @@ func (e *Engine) Submit(s model.Submission) (model.Job, error) {
 	if s.ExecutionProfile == "review" {
 		return model.Job{}, model.Error("INVALID_INPUT", "artifact review requires a batch with an independent verified diff handoff; use analysis for standalone reading")
 	}
-	role, mode := routingRole(s.Task), routingMode(s.Strategy, e.cfg.CapacityPolicy)
+	role, mode := routingRole(s.Task), routingMode(s.Strategy, capPolicy)
 	if s.Decompose {
 		role = "planning"
 	}
@@ -370,7 +494,8 @@ func (e *Engine) WaitJobs(ctx context.Context, jobIDs []string, mode string, tim
 	defer e.mu.Unlock()
 
 	for _, id := range jobIDs {
-		if _, ok := e.jobs[id]; !ok {
+		j, ok := e.jobs[id]
+		if !ok || !e.repoAllowed(j) {
 			return nil, model.Error("NOT_FOUND", fmt.Sprintf("job not found: %s", id))
 		}
 	}
@@ -450,7 +575,10 @@ func (e *Engine) SubmitM1Batch(b model.Batch, routes []model.OpenCodeRoute, admi
 }
 
 func (e *Engine) submitBatch(b model.Batch, routes []model.OpenCodeRoute, admissionErr error) (model.Job, error) {
+	e.mu.Lock()
 	repo, ok := e.cfg.Repositories[b.RepoID]
+	capPolicy := e.cfg.CapacityPolicy
+	e.mu.Unlock()
 	if !ok {
 		return model.Job{}, model.GateError("REPO_NOT_REGISTERED", "REPO_NOT_REGISTERED", "repository is not registered", "register_repository_in_config")
 	}
@@ -510,7 +638,7 @@ func (e *Engine) submitBatch(b model.Batch, routes []model.OpenCodeRoute, admiss
 		if it.WorkspaceMode != "" || len(it.UntrackedPaths) != 0 {
 			return model.Job{}, model.Error("INVALID_INPUT", "select workspace at batch level")
 		}
-		role, mode := routingRole(it.Task), routingMode(it.Strategy, e.cfg.CapacityPolicy)
+		role, mode := routingRole(it.Task), routingMode(it.Strategy, capPolicy)
 		if fault := it.Task.Validate(repo); fault != nil {
 			return model.Job{}, fault
 		}
@@ -548,7 +676,7 @@ func (e *Engine) submitBatch(b model.Batch, routes []model.OpenCodeRoute, admiss
 	if parent.Distinct {
 		families := map[string]bool{}
 		for _, c := range e.reg.Candidates {
-			if c.Status == "available" && slices.Contains(repo.Providers, c.Provider) {
+			if c.Status == "available" && repoAllowsProvider(repo, c.Provider) {
 				families[providers.Family(c.Provider)] = true
 			}
 		}
@@ -687,10 +815,14 @@ func (e *Engine) Cancel(id string) (model.Job, error) {
 		return j, err
 	}
 	for _, job := range targets {
+		e.syncTerminalAudit(job)
 		e.jobs[job.ID] = job
 		if cancel := e.active[job.ID]; cancel != nil {
 			cancel()
 		}
+	}
+	if e.jobCond != nil {
+		e.jobCond.Broadcast()
 	}
 	return e.jobs[id], nil
 }
@@ -1019,7 +1151,7 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 	}()
 	var s execution.Snapshot
 	var err error
-	repo := e.cfg.Repositories[j.RepoID]
+	repo, _ := e.Repo(j.RepoID)
 	if j.Task.DataClass == model.PrivateSourceData {
 		// Do not persist copies of private source. An automatic retry may only
 		// use the same approved snapshot, even after unrelated HEAD changes.
@@ -1069,7 +1201,7 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 	implementation := !planning && (j.Task.ExecutionProfile == "implementation" || (j.Task.Mode == "patch" && (j.Task.PreferredProvider == "codex" || j.Task.PreferredProvider == "claude")))
 	privateWrite := !planning && j.Task.DataClass == model.PrivateSourceData && j.Task.Mode == "patch"
 	subagent := implementation || (!trusted && !privateWrite && j.Task.Mode == "patch" && slices.ContainsFunc(e.reg.Candidates, func(c model.Capability) bool {
-		return (c.Provider == "codex" || c.Provider == "claude") && c.Status == "available"
+		return (c.Provider == "codex" || c.Provider == "claude") && c.Status == "available" && repoAllowsProvider(repo, c.Provider)
 	}))
 	if implementation && !privateWrite && !slices.ContainsFunc(e.reg.Candidates, func(c model.Capability) bool {
 		if c.Mode == "fixture" && (j.Task.PreferredProvider == "" || c.Provider == j.Task.PreferredProvider) {
@@ -1173,6 +1305,9 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 	e.recordCapacityCodes(&j, now)
 	e.persist(j)
 	if e.fatal != nil {
+		if e.cb != nil && c.Provider != "" {
+			e.cb.Release(c.Provider)
+		}
 		e.mu.Unlock()
 		return
 	}
@@ -1197,9 +1332,9 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 			out, worktree, checks, err = e.runTrustedImplementation(runCtx, dir, c, j.Task, s, files, repo.TrustedLocal, checkpoint)
 		} else if privateWrite {
 			out, worktree, checks, err = e.runPrivateWriteImplementation(runCtx, dir, c, j.Task, s, files, handoffs, repo.PrivateSource)
-		} else if implementation || (j.Task.Mode == "patch" && (c.Provider == "codex" || c.Provider == "claude")) {
-			if c.Provider == "codex" || c.Provider == "claude" {
-				out, worktree, checks, err = e.runSubagentImplementation(runCtx, dir, c, j.Task, s, files, repo)
+		} else if implementation || (j.Task.Mode == "patch" && (c.Provider == "codex" || c.Provider == "claude" || hasCheck)) {
+			if c.Provider == "codex" || c.Provider == "claude" || hasCheck {
+				out, worktree, checks, err = e.runSubagentImplementation(runCtx, dir, c, j.Task, s, files, handoffs, repo)
 			} else {
 				out, worktree, err = e.runFixtureImplementation(runCtx, dir, c, j.Task, s, files, handoffs)
 			}
@@ -1386,14 +1521,7 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 	} else {
 		e.rememberRateLimit(*a)
 	}
-	if a.Code == reserveReason && j.Status != model.Cancelling && end.Before(j.DeadlineAt) {
-		j.Status, j.Reason, j.ReadyAt = model.RetryWait, reserveReason, end
-		e.persist(j)
-		return
-	}
-	if a.Checkpoint != nil && j.Status != model.Cancelling && end.Before(j.DeadlineAt) {
-		j.Status, j.Reason = model.Paused, "CHECKPOINT_AVAILABLE"
-		e.persist(j)
+	if e.settleEarlyAttempt(&j, a, end) {
 		return
 	}
 	if err == nil && ctx.Err() == nil && j.Status != model.Cancelling && end.Before(j.DeadlineAt) {
@@ -1438,11 +1566,35 @@ func (e *Engine) run(ctx context.Context, j model.Job) {
 	}
 }
 
+func (e *Engine) settleEarlyAttempt(j *model.Job, a *model.Attempt, end time.Time) bool {
+	if a.Code == reserveReason && j.Status != model.Cancelling && end.Before(j.DeadlineAt) {
+		if e.cb != nil && a.Provider != "" {
+			e.cb.Release(a.Provider)
+		}
+		j.Status, j.Reason, j.ReadyAt = model.RetryWait, reserveReason, end
+		e.persist(*j)
+		return true
+	}
+	if a.Checkpoint != nil && j.Status != model.Cancelling && end.Before(j.DeadlineAt) {
+		if e.cb != nil && a.Provider != "" {
+			e.cb.Release(a.Provider)
+		}
+		j.Status, j.Reason = model.Paused, "CHECKPOINT_AVAILABLE"
+		e.persist(*j)
+		return true
+	}
+	return false
+}
+
 func (e *Engine) attemptDir(id string, n int) string {
 	return filepath.Join(e.scratch, fmt.Sprintf("%s-%d", id, n))
 }
 
 func (e *Engine) route(j *model.Job, now time.Time) (model.Capability, time.Duration) {
+	return e.routeWithMode(j, now, false)
+}
+
+func (e *Engine) routeWithMode(j *model.Job, now time.Time, dryRun bool) (model.Capability, time.Duration) {
 	type candidate struct {
 		capability       model.Capability
 		estimate, budget time.Duration
@@ -1458,7 +1610,7 @@ func (e *Engine) route(j *model.Job, now time.Time) (model.Capability, time.Dura
 	}
 	recoveryFamily := checkpointProvider(*j)
 	role, mode := jobQualityRole(*j), j.RoutingMode
-	liveRepo := e.cfg.EnableFixture && (slices.Contains(repo.Providers, "agy") || slices.Contains(repo.Providers, "opencode"))
+	liveRepo := e.cfg.EnableFixture && (repoAllowsProvider(repo, "agy") || repoAllowsProvider(repo, "opencode"))
 	if mode == "" {
 		mode = routingMode(j.Task.Strategy, e.cfg.CapacityPolicy)
 	}
@@ -1476,6 +1628,7 @@ func (e *Engine) route(j *model.Job, now time.Time) (model.Capability, time.Dura
 	allowedProviders := make(map[string]bool)
 	for _, c := range e.reg.Candidates {
 		reason := ""
+		normProvider := normalizeProvider(c.Provider)
 		quality := e.routeQuality(c, role, now)
 		free := c.Provider == "opencode" && c.Mode != "fixture"
 		family := ""
@@ -1485,7 +1638,7 @@ func (e *Engine) route(j *model.Job, now time.Time) (model.Capability, time.Dura
 		estimate := providers.Estimate(c, j.Task)
 		budget, fits := providers.Budget(now, j.DeadlineAt, j.Task, estimate)
 		switch {
-		case !slices.Contains(repo.Providers, c.Provider):
+		case !repoAllowsProvider(repo, c.Provider):
 			reason = "REPO_PROVIDER_POLICY"
 		case c.Status != "available":
 			reason = c.Reason
@@ -1540,17 +1693,19 @@ func (e *Engine) route(j *model.Job, now time.Time) (model.Capability, time.Dura
 			reason = "DISTINCT_PROVIDER_REQUIRED"
 		case recoveryFamily != "" && providers.Family(c.Provider) == recoveryFamily:
 			reason = "CHECKPOINT_DISTINCT_PROVIDER_REQUIRED"
-		case e.cb != nil && !allowedProviders[c.Provider] && !e.cb.Allow(c.Provider):
+		case e.cb != nil && dryRun && !e.cb.Eligible(c.Provider):
+			reason = "CIRCUIT_BREAKER_OPEN"
+		case e.cb != nil && !dryRun && !allowedProviders[normProvider] && !e.cb.Allow(c.Provider):
 			reason = "CIRCUIT_BREAKER_OPEN"
 		}
-		if reason == "" && e.cb != nil {
-			allowedProviders[c.Provider] = true
+		if !dryRun && reason == "" && e.cb != nil {
+			allowedProviders[normProvider] = true
 		}
 
 		d := model.Decision{Provider: c.Provider, Model: c.Model, Fingerprint: c.Fingerprint, Cost: c.Cost,
 			OpenCodeAccount: c.OpenCodeAccount, OpenCodeTransport: c.OpenCodeTransport, EstimateSeconds: int(estimate.Seconds()),
 			ControllerRemaining: controllerRemaining, TaskClass: j.Task.TaskClass, QualityRole: role, QualityTier: quality.Tier, QualitySource: quality.Source,
-			FPTier: providers.FPTier(c.Provider, c.Model)}
+			FPTier: providers.FPTier(normProvider, c.Model)}
 		if reason != "" {
 			d.Reason = reason
 			j.Route = append(j.Route, d)
@@ -1656,13 +1811,13 @@ func (e *Engine) route(j *model.Job, now time.Time) (model.Capability, time.Dura
 			d.HeadroomPercent, d.HeadroomState = 100, headroomHealthy
 		}
 		if reason != "" {
-			if e.cb != nil && allowedProviders[c.Provider] {
+			if !dryRun && e.cb != nil && allowedProviders[normProvider] {
 				hasOtherOption := slices.ContainsFunc(options, func(opt candidate) bool {
-					return opt.capability.Provider == c.Provider
+					return normalizeProvider(opt.capability.Provider) == normProvider
 				})
 				if !hasOtherOption {
-					e.cb.Release(c.Provider)
-					delete(allowedProviders, c.Provider)
+					e.cb.Release(normProvider)
+					delete(allowedProviders, normProvider)
 				}
 			}
 			d.Reason = reason
@@ -1691,23 +1846,9 @@ func (e *Engine) route(j *model.Job, now time.Time) (model.Capability, time.Dura
 			j.Route = append(j.Route, d)
 		}
 		options = slices.DeleteFunc(options, func(c candidate) bool {
-			tier := c.decision.QualityTier
-			switch targetTier {
-			case "free":
-				if tier != 0 {
-					reject(c, "TARGET_TIER_MISMATCH_FREE_ONLY")
-					return true
-				}
-			case "cheap":
-				if tier > 1 {
-					reject(c, "TARGET_TIER_CONSERVE_PREMIUM")
-					return true
-				}
-			case "hard", "frontier":
-				if tier < 2 {
-					reject(c, "TARGET_TIER_INSUFFICIENT_QUALITY")
-					return true
-				}
+			if code := targetTierViolation(targetTier, c.decision.FPTier, c.decision.QualityTier); code != "" {
+				reject(c, code)
+				return true
 			}
 			return false
 		})
@@ -1716,21 +1857,21 @@ func (e *Engine) route(j *model.Job, now time.Time) (model.Capability, time.Dura
 				options[i].decision.WarningCodes = append(options[i].decision.WarningCodes, "FALLBACK_TO_CHEAP_TIER")
 			}
 		}
-		if e.cb != nil {
+		if !dryRun && e.cb != nil {
 			for p := range allowedProviders {
 				normP := normalizeProvider(p)
 				hasOpt := slices.ContainsFunc(options, func(opt candidate) bool {
 					return normalizeProvider(opt.capability.Provider) == normP
 				})
 				if !hasOpt {
-					e.cb.Release(p)
+					e.cb.Release(normP)
 					delete(allowedProviders, p)
 				}
 			}
 		}
 	}
 	if len(options) == 0 || len(j.Attempts) >= 3 {
-		if e.cb != nil {
+		if !dryRun && e.cb != nil {
 			for p := range allowedProviders {
 				e.cb.Release(p)
 			}
@@ -1833,7 +1974,7 @@ func (e *Engine) route(j *model.Job, now time.Time) (model.Capability, time.Dura
 		j.Route = append(j.Route, d)
 	}
 	selectedProvider := normalizeProvider(options[0].capability.Provider)
-	if e.cb != nil {
+	if !dryRun && e.cb != nil {
 		for p := range allowedProviders {
 			if normalizeProvider(p) != selectedProvider {
 				e.cb.Release(p)
@@ -1939,7 +2080,7 @@ func (e *Engine) finish(ctx context.Context, j model.Job, err error) {
 	j.Status, j.Reason = model.Failed, code
 	if e.cb != nil && len(j.Attempts) > 0 {
 		last := j.Attempts[len(j.Attempts)-1]
-		if last.Provider != "" && (code != "RATE_LIMIT" || last.Provider == "opencode") {
+		if last.Provider != "" {
 			e.cb.Release(last.Provider)
 		}
 	}
@@ -1978,6 +2119,9 @@ func (e *Engine) finish(ctx context.Context, j model.Job, err error) {
 				if until.After(e.cooldown[p]) {
 					e.cooldown[p] = until
 				}
+				if e.cb != nil {
+					e.cb.TripUntil(j.Attempts[len(j.Attempts)-1].Provider, until)
+				}
 			}
 		}
 		j.Status, j.ReadyAt = model.RetryWait, now.Add(time.Duration(len(j.Attempts))*time.Second)
@@ -1996,7 +2140,7 @@ func (e *Engine) rememberRateLimit(attempt model.Attempt) {
 		e.cooldown[family] = until
 	}
 	if e.cb != nil {
-		e.cb.Trip(attempt.Provider, delay)
+		e.cb.TripUntil(attempt.Provider, until)
 	}
 }
 
@@ -2112,8 +2256,17 @@ func (e *Engine) CompleteRunningJobsForTest(summary string) {
 }
 
 // SetQuotaForTest sets cached provider quotas for testing purposes.
+// Rows with Remaining != nil and zero ObservedAt default to time.Now().UTC()
+// so test fixtures remain fresh under Quota.At(now).
 func (e *Engine) SetQuotaForTest(provider string, rows []providers.Quota) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.quotas[provider] = rows
+	now := time.Now().UTC()
+	cloned := slices.Clone(rows)
+	for i := range cloned {
+		if cloned[i].Remaining != nil && cloned[i].ObservedAt.IsZero() {
+			cloned[i].ObservedAt = now
+		}
+	}
+	e.quotas[provider] = cloned
 }

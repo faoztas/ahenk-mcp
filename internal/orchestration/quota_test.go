@@ -716,15 +716,16 @@ func openCodeFixture(now time.Time) (*Engine, model.Job) {
 }
 
 func TestQuotaHealthNormalizationAndNonBlocking(t *testing.T) {
+	now := time.Now().UTC()
 	e := &Engine{
 		quotas:           map[string][]providers.Quota{},
-		quotaRefreshedAt: time.Now().UTC(),
+		quotaRefreshedAt: now,
 	}
 	remaining75 := 75.0
 	remaining20 := 20.0
 	e.quotas["codex"] = []providers.Quota{
-		{Bucket: providers.BarCodexBurst, Remaining: &remaining75, State: "KNOWN"},
-		{Bucket: providers.BarCodexWeekly, Remaining: &remaining20, State: "KNOWN"},
+		{Bucket: providers.BarCodexBurst, Remaining: &remaining75, State: "KNOWN", ObservedAt: now},
+		{Bucket: providers.BarCodexWeekly, Remaining: &remaining20, State: "KNOWN", ObservedAt: now},
 	}
 	if h := e.HealthPercent(providers.BarCodexBurst); h != 0.75 {
 		t.Fatalf("expected health 0.75, got %v", h)
@@ -752,5 +753,51 @@ func TestQuotaHealthNormalizationAndNonBlocking(t *testing.T) {
 	wg.Wait()
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Errorf("quota read took too long: %v", elapsed)
+	}
+}
+
+func TestHealthPercentStaleAndArgon(t *testing.T) {
+	now := time.Now().UTC()
+	staleAt := now.Add(-30 * time.Minute)
+	expiredReset := now.Add(-1 * time.Minute)
+	freshAt := now.Add(-1 * time.Minute)
+	futureReset := now.Add(2 * time.Hour)
+
+	rem10 := 10.0
+	rem40 := 40.0
+	remZero := 0.0
+
+	e := &Engine{
+		quotas: map[string][]providers.Quota{
+			"codex": {
+				{Bucket: providers.BarCodexBurst, Remaining: &remZero, State: "EXHAUSTED", ObservedAt: staleAt},
+			},
+			"agy": {
+				{Bucket: providers.BarAgyGemini, Remaining: &rem10, State: "KNOWN", ObservedAt: freshAt, ResetAt: &expiredReset},
+				{Bucket: providers.BarAgyArgon, Family: "gemini_argon", Remaining: &rem40, State: "KNOWN", ObservedAt: freshAt, ResetAt: &futureReset},
+			},
+		},
+		quotaRefreshedAt: now,
+	}
+
+	// Stale ObservedAt (> 15m) must normalize via q.At(now) and fall back to 1.0.
+	if h := e.HealthPercent(providers.BarCodexBurst); h != 1.0 {
+		t.Fatalf("expected stale codex quota to return 1.0, got %v", h)
+	}
+
+	// Expired ResetAt (<= now) must normalize via q.At(now) and fall back to 1.0.
+	if h := e.HealthPercent(providers.BarAgyGemini); h != 1.0 {
+		t.Fatalf("expected expired ResetAt agy gemini quota to return 1.0, got %v", h)
+	}
+
+	// Fresh BarAgyArgon ("gemini-argon-wtu-weekly") must return 0.40.
+	if h := e.HealthPercent(providers.BarAgyArgon); h != 0.40 {
+		t.Fatalf("expected fresh BarAgyArgon health 0.40, got %v", h)
+	}
+
+	// Once BarAgyArgon becomes stale, it must also return 1.0.
+	e.quotas["agy"][1].ObservedAt = staleAt
+	if h := e.HealthPercent(providers.BarAgyArgon); h != 1.0 {
+		t.Fatalf("expected stale BarAgyArgon health 1.0, got %v", h)
 	}
 }

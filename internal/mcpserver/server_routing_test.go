@@ -48,7 +48,13 @@ func setupTestMCPServer(t *testing.T) (*mcp.ClientSession, *store.Store) {
 	testReg := providers.Registry{
 		Candidates: []model.Capability{
 			{Provider: "codex", Model: "gpt-6.1-sol", Status: "available"},
-			{Provider: "agy", Model: "gemini-4-argon", Status: "available"},
+			{
+				Provider: "agy", Model: "gemini-4-argon", Status: "available",
+				Profiles: []model.ExecutionProfile{
+					{Name: "restricted", Status: "preflight_required"},
+					{Name: "analysis", Status: "verified"},
+				},
+			},
 			{Provider: "opencode", Model: "kimi-k2.5", Status: "available"},
 		},
 	}
@@ -157,7 +163,13 @@ func TestDelegateTaskCodexQuotaExhaustedFailover(t *testing.T) {
 	testReg := providers.Registry{
 		Candidates: []model.Capability{
 			{Provider: "codex", Model: "gpt-6.1-sol", Status: "available"},
-			{Provider: "agy", Model: "gemini-4-argon", Status: "available"},
+			{
+				Provider: "agy", Model: "gemini-4-argon", Status: "available",
+				Profiles: []model.ExecutionProfile{
+					{Name: "restricted", Status: "preflight_required"},
+					{Name: "analysis", Status: "verified"},
+				},
+			},
 			{Provider: "opencode", Model: "kimi-k2.5", Status: "available"},
 		},
 	}

@@ -124,7 +124,7 @@ func (s *Store) GetQuotaStates() ([]ProviderQuotaState, error) {
 	return states, rows.Err()
 }
 
-// RecordRoutingAudit inserts a routing audit record for a job attempt.
+// RecordRoutingAudit records the original routing decision for a job attempt.
 func (s *Store) RecordRoutingAudit(audit JobRoutingAudit) error {
 	now := time.Now().UTC()
 	if audit.CreatedAt.IsZero() {
@@ -137,15 +137,7 @@ func (s *Store) RecordRoutingAudit(audit JobRoutingAudit) error {
 		job_id, task_category, attempt_number, assigned_model, assigned_effort,
 		route_reason, quota_pressure_at_dispatch, dispatch_status, latency_ms, created_at
 	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	ON CONFLICT(job_id, attempt_number) DO UPDATE SET
-		task_category=excluded.task_category,
-		assigned_model=excluded.assigned_model,
-		assigned_effort=excluded.assigned_effort,
-		route_reason=excluded.route_reason,
-		quota_pressure_at_dispatch=excluded.quota_pressure_at_dispatch,
-		dispatch_status=excluded.dispatch_status,
-		latency_ms=excluded.latency_ms,
-		created_at=excluded.created_at;`
+	ON CONFLICT(job_id, attempt_number) DO NOTHING;`
 
 	_, err := s.db.Exec(query,
 		audit.JobID,
@@ -162,20 +154,20 @@ func (s *Store) RecordRoutingAudit(audit JobRoutingAudit) error {
 	return err
 }
 
-// UpdateRoutingAuditStatus updates the dispatch status and latency of existing routing audit records for a job ID and attempt number.
+// UpdateRoutingAuditStatus updates the dispatch status and latency of active (non-terminal) routing audit records for a job ID and attempt number.
 func (s *Store) UpdateRoutingAuditStatus(jobID string, attemptNumber int, status string, latencyMs int64) error {
 	if attemptNumber <= 0 {
 		query := `
 		UPDATE job_routing_audit
 		SET dispatch_status = ?, latency_ms = ?
-		WHERE job_id = ?;`
+		WHERE job_id = ? AND dispatch_status NOT IN ('SUCCESS', 'FAILED');`
 		_, err := s.db.Exec(query, status, latencyMs, jobID)
 		return err
 	}
 	query := `
 	UPDATE job_routing_audit
 	SET dispatch_status = ?, latency_ms = ?
-	WHERE job_id = ? AND attempt_number = ?;`
+	WHERE job_id = ? AND attempt_number = ? AND dispatch_status NOT IN ('SUCCESS', 'FAILED');`
 	_, err := s.db.Exec(query, status, latencyMs, jobID, attemptNumber)
 	return err
 }

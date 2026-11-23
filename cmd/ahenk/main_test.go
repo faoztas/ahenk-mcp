@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -875,5 +876,322 @@ func TestStdioWaitJobsParallel(t *testing.T) {
 	waitOut := waitRes.StructuredContent.(map[string]any)
 	if waitOut["jobs"] == nil {
 		t.Fatalf("expected jobs list, got %+v", waitOut)
+	}
+}
+
+func TestServeLeaderWaitsForActiveProxyClients(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(root, "repo")
+	if err := os.Mkdir(repo, 0700); err != nil {
+		t.Fatal(err)
+	}
+	gitAt := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("/usr/bin/git", append([]string{"-C", dir, "-c", "user.name=Ahenk Fixture", "-c", "user.email=fixture@example.invalid",
+			"-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"}, args...)...)
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=/var/empty", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("fixture git: %v %s", err, out)
+		}
+	}
+	gitAt(repo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "fixture.txt"), []byte("before\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(repo, "add", "fixture.txt")
+	gitAt(repo, "commit", "-m", "init")
+
+	stateDir := filepath.Join(root, "state")
+	cfgPath := filepath.Join(root, "config.json")
+	b, err := json.Marshal(model.Config{
+		StateDir:      stateDir,
+		EnableFixture: true,
+		Repositories: map[string]model.Repo{
+			"demo": {Root: repo, AllowedPaths: []string{"fixture.txt"}, Providers: []string{"fixture-a"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	// Start leader with explicit stdio pipes so we can send stdin EOF without killing it.
+	leaderCmd := exec.Command(os.Args[0], "serve", "--stdio", "--config", cfgPath)
+	leaderCmd.Stderr = os.Stderr
+	leaderIn, err := leaderCmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaderOut, err := leaderCmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := leaderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderDone := make(chan struct{})
+	var leaderErr error
+	go func() {
+		leaderErr = leaderCmd.Wait()
+		close(leaderDone)
+	}()
+	t.Cleanup(func() {
+		_ = leaderIn.Close()
+		select {
+		case <-leaderDone:
+		case <-time.After(2 * time.Second):
+			if leaderCmd.Process != nil {
+				_ = leaderCmd.Process.Kill()
+			}
+			<-leaderDone
+		}
+	})
+
+	leaderClient := mcp.NewClient(&mcp.Implementation{Name: "ahenk-leader-client", Version: "1.0"}, nil)
+	_, err = leaderClient.Connect(ctx, &mcp.IOTransport{Reader: leaderOut, Writer: leaderIn}, nil)
+	if err != nil {
+		t.Fatalf("leader connect: %v", err)
+	}
+
+	// Start a proxy client while leader is running.
+	proxyCmd := exec.Command(os.Args[0], "serve", "--stdio", "--config", cfgPath)
+	proxyCmd.Stderr = os.Stderr
+	proxyClient := mcp.NewClient(&mcp.Implementation{Name: "ahenk-proxy-client", Version: "1.0"}, nil)
+	proxySession, err := proxyClient.Connect(ctx, &mcp.CommandTransport{Command: proxyCmd}, nil)
+	if err != nil {
+		t.Fatalf("proxy connect: %v", err)
+	}
+	t.Cleanup(func() { _ = proxySession.Close() })
+
+	// Verify proxy works initially.
+	res, err := proxySession.CallTool(ctx, &mcp.CallToolParams{Name: "list_capabilities"})
+	if err != nil {
+		t.Fatalf("initial proxy list_capabilities: %v", err)
+	}
+	if out, ok := res.StructuredContent.(map[string]any); !ok || out["scheduler_status"] != "active" {
+		t.Fatalf("unexpected initial proxy response: %+v", res)
+	}
+
+	// Close leader stdin (EOF) while proxy client is still connected.
+	if err := leaderIn.Close(); err != nil {
+		t.Fatalf("close leader stdin: %v", err)
+	}
+
+	// Leader must stay alive to serve the active proxy client.
+	select {
+	case <-leaderDone:
+		t.Fatalf("leader exited prematurely while proxy client was active (err=%v)", leaderErr)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Proxy client must still succeed after leader's stdio closed.
+	res2, err := proxySession.CallTool(ctx, &mcp.CallToolParams{Name: "list_capabilities"})
+	if err != nil {
+		t.Fatalf("proxy list_capabilities after leader stdin EOF: %v", err)
+	}
+	if out, ok := res2.StructuredContent.(map[string]any); !ok || out["scheduler_status"] != "active" {
+		t.Fatalf("unexpected proxy response after leader stdin EOF: %+v", res2)
+	}
+
+	// Now disconnect the proxy client; leader should exit cleanly.
+	if err := proxySession.Close(); err != nil {
+		t.Fatalf("proxy close: %v", err)
+	}
+
+	select {
+	case <-leaderDone:
+		if leaderErr != nil {
+			t.Fatalf("leader exited with error after proxy disconnected: %v", leaderErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("leader did not exit promptly after all proxy clients disconnected")
+	}
+}
+
+func TestServeReconnectsAfterIPCLeaderCrash(t *testing.T) {
+	root := t.TempDir()
+	cfgPath := filepath.Join(root, "config.json")
+	repoDir := filepath.Join(root, "repo")
+	if err := os.Mkdir(repoDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := json.Marshal(model.Config{
+		StateDir: filepath.Join(root, "state"),
+		Repositories: map[string]model.Repo{
+			"demo": {Root: repoDir, AllowedPaths: []string{"."}, Providers: []string{"fixture-a"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, cfg, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	type serverProcess struct {
+		cmd     *exec.Cmd
+		session *mcp.ClientSession
+		done    chan struct{}
+		stderr  bytes.Buffer
+		err     error
+	}
+	start := func() *serverProcess {
+		t.Helper()
+		p := &serverProcess{cmd: exec.CommandContext(ctx, os.Args[0], "serve", "--stdio", "--config", cfgPath), done: make(chan struct{})}
+		p.cmd.Stderr = &p.stderr
+		in, err := p.cmd.StdinPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := p.cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := p.cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = in.Close()
+			_ = p.cmd.Process.Kill()
+			<-p.done
+		})
+		go func() {
+			p.err = p.cmd.Wait()
+			close(p.done)
+		}()
+		client := mcp.NewClient(&mcp.Implementation{Name: "reconnect-test", Version: "1.0"}, nil)
+		p.session, err = client.Connect(ctx, &mcp.IOTransport{Reader: out, Writer: in}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = p.session.Close() })
+		return p
+	}
+	call := func(p *serverProcess, name string, args map[string]any) map[string]any {
+		t.Helper()
+		result, err := p.session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+		if err != nil || result == nil || result.IsError {
+			t.Fatalf("%s returned %+v, %v", name, result, err)
+		}
+		return result.StructuredContent.(map[string]any)
+	}
+	leader, proxy := start(), start()
+	job := call(proxy, "spawn_subagent", map[string]any{
+		"repo_id": "demo", "task": "Inspect fixture", "execution_mode": "async",
+	})
+	if err := leader.cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	<-leader.done
+
+	select {
+	case <-proxy.done:
+		if proxy.err == nil || !strings.Contains(proxy.stderr.String(), "Reconnect to start a new MCP session") {
+			t.Fatalf("proxy did not report the reconnect boundary: %v, %q", proxy.err, proxy.stderr.String())
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("proxy kept a disconnected MCP session open")
+	}
+	replacement := start()
+	if status := call(replacement, "get_job_status", map[string]any{"job_id": job["job_id"]}); status["job_id"] != job["job_id"] {
+		t.Fatalf("new session did not recover the persisted job: %+v", status)
+	}
+}
+
+func TestLocalTestTimeoutPolicy(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "swift.json")
+	if err := os.WriteFile(cfgPath, []byte(`{}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := localTest([]string{"--config", cfgPath, "--timeout", "18m"}); err == nil || !strings.Contains(err.Error(), "canonical Git root") {
+		t.Fatalf("18-minute request should reach Swift config validation, got %v", err)
+	}
+	if err := localTest([]string{"--config", cfgPath, "--timeout", "18m1s"}); err == nil || !strings.Contains(err.Error(), "18 minutes") {
+		t.Fatalf("expected 18-minute timeout limit in the error, got %v", err)
+	}
+}
+
+func TestUsageListsPublicCommands(t *testing.T) {
+	err := run(nil)
+	if err == nil {
+		t.Fatal("expected usage for an empty command line")
+	}
+	for _, command := range []string{"serve", "readiness", "m1-request", "verify-m1", "local-test", "private-brief-digest",
+		"audit-models", "probe-agy", "probe-codexbar", "probe-opencode-catalog", "import-opencode-cooldown", "decode-quota", "version"} {
+		if !strings.Contains(err.Error(), "ahenk "+command) {
+			t.Errorf("usage omits %q: %v", command, err)
+		}
+	}
+}
+
+func TestProbeAGYChecksEveryConfiguredEntry(t *testing.T) {
+	state := t.TempDir()
+	cfgPath := filepath.Join(state, "config.json")
+	b, err := json.Marshal(model.Config{StateDir: state, Providers: []model.ProviderConfig{
+		{ID: "agy", Model: "gemini-3.8-flash-medium"},
+		{ID: "opencode"},
+		{ID: "agy"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	err = run([]string{"probe-agy", "--config", cfgPath})
+	if err == nil || !strings.Contains(err.Error(), "supported pinned distribution") || !strings.Contains(err.Error(), "requires an exact model") {
+		t.Fatalf("expected validation errors from both AGY entries, got %v", err)
+	}
+}
+
+func TestPrivateBriefDigestValidation(t *testing.T) {
+	runDigest := func(payload string) error {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.WriteString(payload); err != nil {
+			t.Fatal(err)
+		}
+		_ = w.Close()
+		origStdin := os.Stdin
+		os.Stdin = r
+		defer func() {
+			os.Stdin = origStdin
+			_ = r.Close()
+		}()
+		return privateBriefDigest(nil)
+	}
+
+	if err := runDigest(`{"objective":"Valid scoped summary","acceptance":[{"id":"ok","description":"Give one fact"}]}`); err != nil {
+		t.Fatalf("expected valid brief to succeed, got: %v", err)
+	}
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{"secret in objective", `{"objective":"Use sk-proj-1234567890abcdefghij","acceptance":[{"id":"ok","description":"fact"}]}`},
+		{"personal data in objective", `{"objective":"Email user@gmail.com","acceptance":[{"id":"ok","description":"fact"}]}`},
+		{"secret in acceptance", `{"objective":"Valid summary","acceptance":[{"id":"ok","description":"Use sk-proj-1234567890abcdefghij"}]}`},
+		{"personal data in acceptance", `{"objective":"Valid summary","acceptance":[{"id":"ok","description":"Mail user@yarinlik.com"}]}`},
+		{"invalid acceptance id", `{"objective":"Valid summary","acceptance":[{"id":"bad id!","description":"fact"}]}`},
+		{"duplicate acceptance id", `{"objective":"Valid summary","acceptance":[{"id":"dup","description":"one"},{"id":"dup","description":"two"}]}`},
+		{"invalid check_id", `{"objective":"Valid summary","acceptance":[{"id":"ok","description":"fact","check_id":"bad id!"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := runDigest(tc.payload); err == nil {
+				t.Fatalf("expected invalid brief %q to be rejected", tc.name)
+			}
+		})
 	}
 }

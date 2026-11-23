@@ -3,6 +3,7 @@ package orchestration
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/faoztas/ahenk-mcp/internal/providers"
 )
@@ -71,6 +72,7 @@ func TestOpusScarcityGuardAndLunaRepositioning(t *testing.T) {
 
 func TestOpusDualWindowScarcityMin(t *testing.T) {
 	// P0-3: Validate that when evaluating Opus reserve health, the most restrictive (min) window is used.
+	now := time.Now().UTC()
 	e := &Engine{
 		quotas: make(map[string][]providers.Quota),
 	}
@@ -81,8 +83,8 @@ func TestOpusDualWindowScarcityMin(t *testing.T) {
 
 	// Case 1: 5h is healthy (80%), weekly is depleted (10%) -> HealthPercent should return 0.10
 	e.quotas["agy"] = []providers.Quota{
-		{Bucket: providers.BarAgyOpus5h, Remaining: &h80},
-		{Bucket: providers.BarAgyOpus, Remaining: &h10},
+		{Bucket: providers.BarAgyOpus5h, Remaining: &h80, ObservedAt: now},
+		{Bucket: providers.BarAgyOpus, Remaining: &h10, ObservedAt: now},
 	}
 	health := e.HealthPercent(providers.BarAgyOpus)
 	if health != 0.10 {
@@ -94,8 +96,8 @@ func TestOpusDualWindowScarcityMin(t *testing.T) {
 
 	// Case 2: 5h is depleted (10%), weekly is healthy (80%) -> HealthPercent should return 0.10
 	e.quotas["agy"] = []providers.Quota{
-		{Bucket: providers.BarAgyOpus5h, Remaining: &h10},
-		{Bucket: providers.BarAgyOpus, Remaining: &h80},
+		{Bucket: providers.BarAgyOpus5h, Remaining: &h10, ObservedAt: now},
+		{Bucket: providers.BarAgyOpus, Remaining: &h80, ObservedAt: now},
 	}
 	health = e.HealthPercent(providers.BarAgyOpus)
 	if health != 0.10 {
@@ -107,8 +109,8 @@ func TestOpusDualWindowScarcityMin(t *testing.T) {
 
 	// Case 3: Both windows healthy (50% and 80%) -> min health is 0.50, admission passes
 	e.quotas["agy"] = []providers.Quota{
-		{Bucket: providers.BarAgyOpus5h, Remaining: &h50},
-		{Bucket: providers.BarAgyOpus, Remaining: &h80},
+		{Bucket: providers.BarAgyOpus5h, Remaining: &h50, ObservedAt: now},
+		{Bucket: providers.BarAgyOpus, Remaining: &h80, ObservedAt: now},
 	}
 	health = e.HealthPercent(providers.BarAgyOpus)
 	if health != 0.50 {

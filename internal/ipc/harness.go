@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -22,7 +23,7 @@ import (
 	"github.com/faoztas/ahenk-mcp/internal/providers"
 )
 
-var chdirHarnessMu sync.Mutex
+const maxHarnessReadBytes = 4 << 20
 
 // HarnessConfig specifies the sandbox boundary and policy for an isolated subagent harness.
 type HarnessConfig struct {
@@ -73,6 +74,8 @@ type jsonRPCResponse struct {
 	ID      any              `json:"id"`
 	Result  any              `json:"result,omitempty"`
 	Error   *HarnessRPCError `json:"error,omitempty"`
+	Success bool             `json:"success"`
+	Data    string           `json:"data,omitempty"`
 }
 
 // HarnessServer serves an isolated two-way tool harness over a Unix domain socket.
@@ -85,6 +88,9 @@ type HarnessServer struct {
 	finished    bool
 	success     bool
 	mu          sync.Mutex
+	connMu      sync.Mutex
+	conns       map[net.Conn]struct{}
+	closed      bool
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
@@ -104,6 +110,7 @@ func NewHarnessServer(cfg HarnessConfig) *HarnessServer {
 			SocketPath:   cfg.SocketPath,
 			Env:          slices.Clone(cfg.Env),
 		},
+		conns: make(map[net.Conn]struct{}),
 	}
 }
 
@@ -205,6 +212,12 @@ func (s *HarnessServer) Close() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	s.connMu.Lock()
+	s.closed = true
+	for conn := range s.conns {
+		_ = conn.Close()
+	}
+	s.connMu.Unlock()
 	var err error
 	if s.listener != nil {
 		err = s.listener.Close()
@@ -224,17 +237,39 @@ func (s *HarnessServer) acceptLoop() {
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
-			if s.ctx.Err() != nil {
+			s.connMu.Lock()
+			closed := s.closed
+			s.connMu.Unlock()
+			if s.ctx.Err() != nil || closed {
 				return
 			}
 			continue
 		}
+		s.connMu.Lock()
+		if s.closed {
+			s.connMu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		if s.conns == nil {
+			s.conns = make(map[net.Conn]struct{})
+		}
+		s.conns[conn] = struct{}{}
+		s.connMu.Unlock()
+
+		s.wg.Add(1)
 		go s.handleConn(conn)
 	}
 }
 
 func (s *HarnessServer) handleConn(conn net.Conn) {
-	defer conn.Close()
+	defer s.wg.Done()
+	defer func() {
+		s.connMu.Lock()
+		delete(s.conns, conn)
+		s.connMu.Unlock()
+		_ = conn.Close()
+	}()
 	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
 
@@ -245,16 +280,50 @@ func (s *HarnessServer) handleConn(conn net.Conn) {
 		}
 		resp := s.dispatch(req)
 		if req.JSONRPC != "" || req.ID != nil {
-			resp.JSONRPC = "2.0"
-			resp.ID = req.ID
-			if resp.Success {
-				resp.Result = map[string]any{"data": resp.Data, "success": true}
+			rpcResp := jsonRPCResponse{
+				JSONRPC: "2.0",
+				ID:      req.ID,
+				Success: resp.Success,
+				Data:    resp.Data,
 			}
+			if resp.Success {
+				rpcResp.Result = map[string]any{"data": resp.Data, "success": true}
+			} else {
+				rpcResp.Error = &HarnessRPCError{
+					Code:    harnessRPCErrorCode(resp.Error),
+					Message: resp.Error,
+				}
+			}
+			if err := encoder.Encode(rpcResp); err != nil {
+				return
+			}
+			continue
 		}
 		if err := encoder.Encode(resp); err != nil {
 			return
 		}
 	}
+}
+
+func harnessRPCErrorCode(msg string) int {
+	switch {
+	case strings.HasPrefix(msg, "UNKNOWN_TOOL:"):
+		return -32601
+	case strings.HasPrefix(msg, "POLICY_DENIED:"), strings.Contains(msg, "RECURSIVE_DELEGATION_DENIED"):
+		return -32001
+	case strings.HasPrefix(msg, "PRECONDITION_FAILED:"):
+		return -32002
+	default:
+		return -32000
+	}
+}
+
+func (s *HarnessServer) canonicalWorktreeRoot() string {
+	canonicalRoot, err := filepath.EvalSymlinks(s.cfg.WorktreeRoot)
+	if err != nil {
+		return filepath.Clean(s.cfg.WorktreeRoot)
+	}
+	return canonicalRoot
 }
 
 // ReadFile safely reads a file from within the worktree boundary.
@@ -263,45 +332,84 @@ func (s *HarnessServer) ReadFile(relPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	data, err := os.ReadFile(resolvedPath)
+	canonicalRoot := s.canonicalWorktreeRoot()
+	relTarget, err := filepath.Rel(canonicalRoot, resolvedPath)
+	if err != nil || strings.HasPrefix(relTarget, "..") || filepath.IsAbs(relTarget) {
+		return "", fmt.Errorf("POLICY_DENIED: path outside sandbox boundary")
+	}
+
+	root, err := os.OpenRoot(canonicalRoot)
 	if err != nil {
 		return "", err
+	}
+	defer root.Close()
+
+	f, err := root.Open(relTarget)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, maxHarnessReadBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxHarnessReadBytes {
+		return "", fmt.Errorf("POLICY_DENIED: file exceeds maximum read size (%d bytes)", maxHarnessReadBytes)
 	}
 	return string(data), nil
 }
 
 // EditFile safely modifies or creates a file within the AllowedPaths boundary.
 func (s *HarnessServer) EditFile(relPath, content, oldContent string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	resolvedPath, err := s.validatePath(relPath, true)
 	if err != nil {
 		return err
 	}
 
-	canonicalRoot, err := filepath.EvalSymlinks(s.cfg.WorktreeRoot)
-	if err != nil {
-		canonicalRoot = filepath.Clean(s.cfg.WorktreeRoot)
+	canonicalRoot := s.canonicalWorktreeRoot()
+	cleanRel := filepath.Clean(relPath)
+	relTarget, err := filepath.Rel(canonicalRoot, resolvedPath)
+	if err != nil || strings.HasPrefix(relTarget, "..") || filepath.IsAbs(relTarget) {
+		return fmt.Errorf("POLICY_DENIED: path outside sandbox boundary")
 	}
-	lexicalTarget := filepath.Join(canonicalRoot, filepath.Clean(relPath))
+
+	root, err := os.OpenRoot(canonicalRoot)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
 
 	// Reject if lexical path is a symlink
-	if fi, err := os.Lstat(lexicalTarget); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+	if fi, err := root.Lstat(cleanRel); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("POLICY_DENIED: symlink target not allowed")
 	}
 
 	if oldContent != "" {
-		existing, err := os.ReadFile(resolvedPath)
+		rf, err := root.Open(relTarget)
 		if err != nil {
 			return fmt.Errorf("PRECONDITION_FAILED: target file does not exist: %w", err)
 		}
-		if string(existing) != oldContent {
+		maxOld := max(maxHarnessReadBytes, len(oldContent))
+		existing, readErr := io.ReadAll(io.LimitReader(rf, int64(maxOld)+1))
+		_ = rf.Close()
+		if readErr != nil {
+			return fmt.Errorf("PRECONDITION_FAILED: target file does not exist: %w", readErr)
+		}
+		if len(existing) > maxOld || string(existing) != oldContent {
 			return fmt.Errorf("PRECONDITION_FAILED: existing content does not match old_content")
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(resolvedPath), 0700); err != nil {
-		return err
+	if dir := filepath.Dir(relTarget); dir != "." && dir != "" {
+		if err := root.MkdirAll(dir, 0700); err != nil {
+			return err
+		}
 	}
 
-	f, err := os.OpenFile(resolvedPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0644)
+	f, err := root.OpenFile(relTarget, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0644)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return fmt.Errorf("POLICY_DENIED: symlink target not allowed")
@@ -406,7 +514,14 @@ func (s *HarnessServer) CheckRecursion(env []string) error {
 			"complete_task_directly_in_subagent")
 	}
 	if len(env) > 0 {
-		return providers.CheckRecursionGuard(env, maxDepth)
+		if err := providers.CheckRecursionGuard(env, maxDepth); err != nil {
+			return err
+		}
+	}
+	if len(s.cfg.Env) > 0 {
+		if err := providers.CheckRecursionGuard(s.cfg.Env, maxDepth); err != nil {
+			return err
+		}
 	}
 	return providers.CheckRecursionGuard(os.Environ(), maxDepth)
 }
@@ -559,14 +674,14 @@ func determineSocketPath(cfg HarnessConfig) string {
 	return filepath.Join(cfg.WorktreeRoot, ".harness.sock")
 }
 
-func listenHarnessUnix(sockPath string) (net.Listener, error) {
+func listenHarnessUnix(sockPath string) (ln net.Listener, err error) {
 	if len(sockPath) < 104 {
 		return net.Listen("unix", sockPath)
 	}
 	dir := filepath.Dir(sockPath)
 	base := filepath.Base(sockPath)
-	chdirHarnessMu.Lock()
-	defer chdirHarnessMu.Unlock()
+	chdirMu.Lock()
+	defer chdirMu.Unlock()
 	wd, err := os.Getwd()
 	if err != nil {
 		return nil, err
@@ -575,20 +690,26 @@ func listenHarnessUnix(sockPath string) (net.Listener, error) {
 		return nil, err
 	}
 	defer func() {
-		_ = os.Chdir(wd)
+		if chErr := os.Chdir(wd); chErr != nil && err == nil {
+			if ln != nil {
+				_ = ln.Close()
+				ln = nil
+			}
+			err = chErr
+		}
 	}()
 	return net.Listen("unix", base)
 }
 
 // DialHarness connects to a harness socket, handling long path constraints on macOS.
-func DialHarness(sockPath string, timeout time.Duration) (net.Conn, error) {
+func DialHarness(sockPath string, timeout time.Duration) (conn net.Conn, err error) {
 	if len(sockPath) < 104 {
 		return net.DialTimeout("unix", sockPath, timeout)
 	}
 	dir := filepath.Dir(sockPath)
 	base := filepath.Base(sockPath)
-	chdirHarnessMu.Lock()
-	defer chdirHarnessMu.Unlock()
+	chdirMu.Lock()
+	defer chdirMu.Unlock()
 	wd, err := os.Getwd()
 	if err != nil {
 		return nil, err
@@ -597,7 +718,13 @@ func DialHarness(sockPath string, timeout time.Duration) (net.Conn, error) {
 		return nil, err
 	}
 	defer func() {
-		_ = os.Chdir(wd)
+		if chErr := os.Chdir(wd); chErr != nil && err == nil {
+			if conn != nil {
+				_ = conn.Close()
+				conn = nil
+			}
+			err = chErr
+		}
 	}()
 	return net.DialTimeout("unix", base, timeout)
 }

@@ -78,6 +78,10 @@ func agyProfiles() []model.ExecutionProfile {
 }
 
 func AllowsAGYProfile(c model.Capability, t model.Task) bool {
+	if c.Fingerprint == agy154Fingerprint && t.ExecutionProfile != model.TrustedLocalProfile &&
+		(t.Mode != "read_only" || t.ExecutionProfile == "review") {
+		return false
+	}
 	name := t.ExecutionProfile
 	if name == "" {
 		switch {
@@ -92,6 +96,9 @@ func AllowsAGYProfile(c model.Capability, t model.Task) bool {
 		}
 	}
 	if t.DataClass != "synthetic" || (name == "analysis" || name == "review") && t.Mode != "read_only" {
+		return false
+	}
+	if name == "restricted" && t.Mode == "patch" && c.Fingerprint != "" && !AGYIdentityMatches(c.Model, c.Fingerprint) {
 		return false
 	}
 	return slices.ContainsFunc(c.Profiles, func(p model.ExecutionProfile) bool {

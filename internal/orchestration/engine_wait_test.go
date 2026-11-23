@@ -54,6 +54,11 @@ func insertTestJob(t *testing.T, e *Engine, job model.Job) {
 	t.Helper()
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if job.PolicyDigest == "" {
+		if r, ok := e.cfg.Repositories[job.RepoID]; ok {
+			job.PolicyDigest = model.Digest(r)
+		}
+	}
 	if _, err := e.db.Insert([]model.Job{job}, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -227,4 +232,135 @@ func TestEngine_WaitJobs_Any(t *testing.T) {
 	if !hasCompleted {
 		t.Fatalf("expected at least one completed job in mode:any")
 	}
+}
+
+func TestEnginePersist_TerminalAuditStatusMapping(t *testing.T) {
+	e, _ := setupTestEngine(t)
+	now := time.Now().UTC()
+
+	cases := []struct {
+		jobID     string
+		status    string
+		wantAudit string
+	}{
+		{"job-persist-ok", model.Completed, "SUCCESS"},
+		{"job-persist-fail", model.Failed, "FAILED"},
+		{"job-persist-cancel", model.Cancelled, "FAILED"},
+		{"job-persist-timeout", model.TimedOut, "FAILED"},
+		{"job-persist-blocked", model.Blocked, "FAILED"},
+	}
+
+	for _, tc := range cases {
+		j := model.Job{
+			ID:         tc.jobID,
+			RepoID:     "test-repo",
+			RequestID:  "req-" + tc.jobID,
+			CreatedAt:  now,
+			DeadlineAt: now.Add(time.Hour),
+			Status:     model.Running,
+		}
+		insertTestJob(t, e, j)
+		if err := e.db.RecordRoutingAudit(store.JobRoutingAudit{
+			JobID:          tc.jobID,
+			TaskCategory:   "coding",
+			AttemptNumber:  1,
+			AssignedModel:  "codex/gpt-6.1-sol",
+			AssignedEffort: "medium",
+			RouteReason:    "TEST",
+			DispatchStatus: "DISPATCHED",
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		e.mu.Lock()
+		j.Status = tc.status
+		e.persist(j)
+		e.mu.Unlock()
+
+		rows, err := e.db.GetRoutingAudit(tc.jobID)
+		if err != nil || len(rows) != 1 || rows[0].DispatchStatus != tc.wantAudit {
+			t.Fatalf("%s: expected audit status %s, got %+v err=%v", tc.status, tc.wantAudit, rows, err)
+		}
+	}
+}
+
+func TestEngine_WaitJobs_EnforcesRepoAllowed(t *testing.T) {
+	e, _ := setupTestEngine(t)
+	now := time.Now().UTC()
+
+	// Insert a job whose RepoID / PolicyDigest is not allowed under current repo policy.
+	insertTestJob(t, e, model.Job{
+		ID:           "job-foreign-1",
+		RepoID:       "other-repo",
+		PolicyDigest: "stale-digest",
+		RequestID:    "req-foreign-1",
+		CreatedAt:    now,
+		DeadlineAt:   now.Add(time.Hour),
+		Status:       model.Completed,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if _, err := e.WaitJobs(ctx, []string{"job-foreign-1"}, "all", time.Second); err == nil {
+		t.Fatalf("expected WaitJobs to reject job outside current repository policy")
+	}
+
+	// Also insert a job in test-repo with mismatched PolicyDigest.
+	insertTestJob(t, e, model.Job{
+		ID:           "job-stale-policy-1",
+		RepoID:       "test-repo",
+		PolicyDigest: "mismatched-digest",
+		RequestID:    "req-stale-1",
+		CreatedAt:    now,
+		DeadlineAt:   now.Add(time.Hour),
+		Status:       model.Completed,
+	})
+	if _, err := e.WaitJobs(ctx, []string{"job-stale-policy-1"}, "all", time.Second); err == nil {
+		t.Fatalf("expected WaitJobs to reject job with mismatched PolicyDigest")
+	}
+}
+
+func TestEngine_ConcurrentResolveRepoAndAccessors(t *testing.T) {
+	e, repoDir := setupTestEngine(t)
+
+	// Verify mutex-safe accessors reflect dynamic repos immediately.
+	if !e.HasRepo("test-repo") {
+		t.Fatalf("expected HasRepo(test-repo) == true")
+	}
+	if _, ok := e.Repo("test-repo"); !ok {
+		t.Fatalf("expected Repo(test-repo) == true")
+	}
+	if provs := e.RepoProviders("test-repo"); len(provs) == 0 {
+		t.Fatalf("expected non-empty RepoProviders(test-repo)")
+	}
+	if runners := e.LocalRunners(); len(runners) == 0 {
+		t.Fatalf("expected non-empty LocalRunners()")
+	}
+
+	dynDir := t.TempDir()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 20; i++ {
+			_, _ = e.ResolveRepo(dynDir)
+			_ = e.HasRepo("test-repo")
+			_ = e.RepoProviders("test-repo")
+			_, _ = e.Repo("test-repo")
+		}
+	}()
+	for i := 0; i < 20; i++ {
+		_, _ = e.Submit(model.Submission{
+			RepoID:    "test-repo",
+			RequestID: "conc-req-" + string(rune('a'+i)),
+			Task: model.Task{
+				Objective:    "Concurrent submit test in " + repoDir,
+				Acceptance:   []model.Check{{ID: "c1", Description: "ok"}},
+				AllowedPaths: []string{"."},
+				Mode:         "read_only",
+				DataClass:    "synthetic",
+			},
+		})
+	}
+	<-done
 }

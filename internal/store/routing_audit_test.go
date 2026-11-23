@@ -90,3 +90,65 @@ func TestUpdateRoutingAuditStatus_AttemptScoped(t *testing.T) {
 		t.Errorf("attempt 2 was not properly updated: %+v", history2[1])
 	}
 }
+
+func TestRoutingAuditTerminalStatusNotOverwritten(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer s.Close()
+
+	_, err = s.db.Exec("INSERT INTO jobs(id, repo, body) VALUES ('job-terminal-guard', 'repo-1', '{}')")
+	if err != nil {
+		t.Fatalf("insert parent job failed: %v", err)
+	}
+
+	if err := s.RecordRoutingAudit(JobRoutingAudit{
+		JobID:          "job-terminal-guard",
+		TaskCategory:   "coding",
+		AttemptNumber:  1,
+		AssignedModel:  "codex/gpt-6.1-sol",
+		AssignedEffort: "high",
+		RouteReason:    "NOMINAL_HIGH_EFFORT",
+		DispatchStatus: "DISPATCHED",
+	}); err != nil {
+		t.Fatalf("initial RecordRoutingAudit failed: %v", err)
+	}
+
+	// Engine transitions attempt 1 to terminal FAILED.
+	if err := s.UpdateRoutingAuditStatus("job-terminal-guard", 1, "FAILED", 420); err != nil {
+		t.Fatalf("UpdateRoutingAuditStatus FAILED failed: %v", err)
+	}
+
+	// Duplicate/racing UpdateRoutingAuditStatus with SUCCESS must NOT overwrite terminal FAILED.
+	if err := s.UpdateRoutingAuditStatus("job-terminal-guard", 1, "SUCCESS", 999); err != nil {
+		t.Fatalf("second UpdateRoutingAuditStatus failed: %v", err)
+	}
+
+	// A retried request must preserve the original route as well as its terminal status.
+	if err := s.RecordRoutingAudit(JobRoutingAudit{
+		JobID:          "job-terminal-guard",
+		TaskCategory:   "research",
+		AttemptNumber:  1,
+		AssignedModel:  "agy/gemini-4-argon",
+		AssignedEffort: "medium",
+		RouteReason:    "QUOTA_PRESSURE_THROTTLED",
+		DispatchStatus: "SUCCESS",
+		LatencyMs:      1234,
+	}); err != nil {
+		t.Fatalf("racing RecordRoutingAudit failed: %v", err)
+	}
+
+	history, err := s.GetRoutingAudit("job-terminal-guard")
+	if err != nil || len(history) != 1 {
+		t.Fatalf("GetRoutingAudit failed: err=%v len=%d", err, len(history))
+	}
+	if history[0].DispatchStatus != "FAILED" || history[0].LatencyMs != 420 {
+		t.Fatalf("terminal FAILED status was corrupted: %+v", history[0])
+	}
+	if history[0].AssignedModel != "codex/gpt-6.1-sol" || history[0].AssignedEffort != "high" ||
+		history[0].RouteReason != "NOMINAL_HIGH_EFFORT" || history[0].TaskCategory != "coding" {
+		t.Fatalf("original dispatch evidence was overwritten: %+v", history[0])
+	}
+}
