@@ -23,8 +23,24 @@ func (r *Registry) addAuditedModels(inventory *model.ModelInventory, now time.Ti
 		if row.Inference != "PASS" || !row.Terminal || row.Actual != row.Model {
 			continue
 		}
+		speed := "fast"
+		if row.Provider == "agy" && r.agy.Speed != "" {
+			speed = r.agy.Speed
+		} else if row.Provider == "opencode" {
+			for _, base := range baseline {
+				if base.Provider == "opencode" && (base.Model == "" || base.Model == row.Model) && base.Speed != "" {
+					speed = base.Speed
+					if base.Model == row.Model {
+						break
+					}
+				}
+			}
+		}
+		if row.LatencyMS >= 30000 {
+			speed = "slow"
+		}
 		c := model.Capability{Provider: row.Provider, Model: row.Model, Fingerprint: row.Binary, Status: "available",
-			Reason: "AUDIT_VERIFIED_READ_ONLY", AuditValidUntil: &expiry, AuditLatencyMS: row.LatencyMS}
+			Reason: "AUDIT_VERIFIED_READ_ONLY", AuditValidUntil: &expiry, AuditLatencyMS: row.LatencyMS, Speed: speed}
 		switch row.Provider {
 		case "agy":
 			if !r.agy.EnableSynthetic || r.agy.ExpectedBinarySHA256 != row.Binary || row.Binary != agy153Fingerprint ||

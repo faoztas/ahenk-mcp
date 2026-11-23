@@ -68,10 +68,10 @@ func (e *Engine) readQuotasOnce() {
 	e.mu.Unlock()
 }
 
-// refreshQuotasAsync triggers at most one background refresh when the cached
-// quota snapshot is older than the TTL. It never blocks the caller.
+// refreshQuotasAsync refreshes stale quota snapshots in the background for
+// engines with CodexBar enabled.
 func (e *Engine) refreshQuotasAsync() {
-	if e.readQuotas == nil || e.quotaRefreshing.Load() {
+	if !e.cfg.EnableCodexBar || e.readQuotas == nil || e.quotaRefreshing.Load() {
 		return
 	}
 	if e.ctx != nil && e.ctx.Err() != nil {
@@ -114,13 +114,34 @@ func (e *Engine) Quota(provider string) []providers.Quota {
 }
 
 func (e *Engine) HealthPercent(bar string) float64 {
+	if e == nil {
+		return 1.0
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	now := time.Now().UTC()
+	return e.healthPercentLocked(bar, now)
+}
+
+func (e *Engine) hasFreshQuotaLocked(bar string, now time.Time) bool {
+	for _, rows := range e.quotas {
+		for _, raw := range rows {
+			q := raw.At(now)
+			if q.Bucket == bar && q.Remaining != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (e *Engine) healthPercentLocked(bar string, now time.Time) float64 {
 	if bar == providers.BarAgyOpus || bar == providers.BarAgyOpus5h {
 		minHealth := 1.0
 		found := false
 		for _, rows := range e.quotas {
-			for _, q := range rows {
+			for _, raw := range rows {
+				q := raw.At(now)
 				if (q.Bucket == providers.BarAgyOpus || q.Bucket == providers.BarAgyOpus5h) && q.Remaining != nil {
 					pct := *q.Remaining / 100.0
 					if pct < 0 {
@@ -141,24 +162,33 @@ func (e *Engine) HealthPercent(bar string) float64 {
 		return 1.0
 	}
 
+	minHealth := 1.0
+	found := false
 	for _, rows := range e.quotas {
-		for _, q := range rows {
+		for _, raw := range rows {
+			q := raw.At(now)
 			if q.Bucket == bar && q.Remaining != nil {
 				pct := *q.Remaining / 100.0
 				if pct < 0 {
-					return 0.0
+					pct = 0.0
+				} else if pct > 1.0 {
+					pct = 1.0
 				}
-				if pct > 1.0 {
-					return 1.0
+				if !found || pct < minHealth {
+					minHealth = pct
+					found = true
 				}
-				return pct
 			}
 		}
 	}
+	if found {
+		return minHealth
+	}
+
 	if bar == providers.BarOpenCodeFree {
-		now := time.Now().UTC()
 		rows := e.openCodeQuota(now)
-		for _, q := range rows {
+		for _, raw := range rows {
+			q := raw.At(now)
 			if q.Bucket == bar && q.Remaining != nil {
 				pct := *q.Remaining / 100.0
 				if pct < 0 {
@@ -273,19 +303,54 @@ func (e *Engine) openCodeQuota(now time.Time) []providers.Quota {
 	return rows
 }
 
-// ActiveCircuitBreakers lists every currently open provider cooldown and
-// OpenCode health gate for the routing summary.
+// ActiveCircuitBreakers lists every currently open provider cooldown,
+// circuit breaker, and OpenCode health gate for diagnostics and routing summary.
 func (e *Engine) ActiveCircuitBreakers() []map[string]any {
+	if e == nil {
+		return []map[string]any{}
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := time.Now().UTC()
-	var out []map[string]any
+	out := make([]map[string]any, 0)
+	type breakerKey struct {
+		provider string
+		model    string
+		scope    string
+	}
+	seen := make(map[breakerKey]int)
 	add := func(provider, modelID, scope, code string, until time.Time) {
-		out = append(out, map[string]any{"provider": provider, "model": modelID, "scope": scope, "code": code, "until": until})
+		norm := normalizeProvider(provider)
+		k := breakerKey{provider: norm, model: modelID, scope: scope}
+		entry := map[string]any{
+			"provider": norm,
+			"model":    modelID,
+			"scope":    scope,
+			"code":     code,
+			"state":    "OPEN",
+			"until":    until.UTC().Format(time.RFC3339),
+		}
+		if idx, exists := seen[k]; exists {
+			if prev, ok := out[idx]["until"].(string); ok {
+				if prevTime, err := time.Parse(time.RFC3339, prev); err == nil && until.After(prevTime) {
+					out[idx] = entry
+				}
+			}
+			return
+		}
+		seen[k] = len(out)
+		out = append(out, entry)
 	}
 	for _, p := range []string{"agy", "codex", "claude", "copilot"} {
 		if until := e.cooldown[p]; until.After(now) {
 			add(p, "", "provider", "COOLDOWN", until)
+		}
+	}
+	if e.cb != nil {
+		for p, until := range e.cb.ActiveTripped() {
+			if until.After(now) {
+				add(p, "", "provider", "CIRCUIT_OPEN", until)
+			}
 		}
 	}
 	for key, gate := range e.openCodeHealth {

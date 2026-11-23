@@ -24,7 +24,7 @@ func localTest(args []string) error {
 		return err
 	}
 	if *config == "" || *timeout <= 0 || *timeout > 18*time.Minute || flags.NArg() != 0 {
-		return errors.New("local-test requires --config and a timeout up to 15 minutes")
+		return errors.New("local-test requires --config and a timeout up to 18 minutes")
 	}
 	owner, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()

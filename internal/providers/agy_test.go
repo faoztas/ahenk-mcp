@@ -217,3 +217,42 @@ func TestAGY154WorkerPinDoesNotInheritEarlierEvidence(t *testing.T) {
 		t.Fatal("AGY 1.5.4 identity crossed its verified base-model boundary")
 	}
 }
+
+func TestAllowsAGYProfileRestrictedPatchRequiresM2A(t *testing.T) {
+	profiles := []model.ExecutionProfile{
+		{Name: "restricted", Status: "preflight_required"},
+		{Name: "analysis", Status: "preflight_required"},
+		{Name: model.TrustedLocalProfile, Status: "preflight_required"},
+	}
+	patchTask := model.Task{Mode: "patch", DataClass: "synthetic"}
+	explicitRestrictedPatch := model.Task{Mode: "patch", DataClass: "synthetic", ExecutionProfile: "restricted"}
+	trustedPatch := model.Task{Mode: "patch", DataClass: "synthetic", ExecutionProfile: model.TrustedLocalProfile}
+	readTask := model.Task{Mode: "read_only", DataClass: "synthetic"}
+
+	// Worker-only 1.5.4 binary must NOT allow restricted patch mode (implicit or explicit).
+	cap154 := model.Capability{Provider: "agy", Model: agySyntheticModel, Fingerprint: agy154Fingerprint, Profiles: profiles}
+	if AllowsAGYProfile(cap154, patchTask) {
+		t.Fatal("expected agy154 to be rejected for implicit restricted patch task")
+	}
+	if AllowsAGYProfile(cap154, explicitRestrictedPatch) {
+		t.Fatal("expected agy154 to be rejected for explicit restricted patch task")
+	}
+	if !AllowsAGYProfile(cap154, readTask) {
+		t.Fatal("expected agy154 to allow synthetic read_only task")
+	}
+	if !AllowsAGYProfile(cap154, trustedPatch) {
+		t.Fatal("expected agy154 to allow trusted-local patch task")
+	}
+
+	// Non-M2A model on 1.5.3 binary must also be rejected for restricted patch mode.
+	cap153NonM2A := model.Capability{Provider: "agy", Model: "gemini-4-argon-low", Fingerprint: agy153Fingerprint, Profiles: profiles}
+	if AllowsAGYProfile(cap153NonM2A, patchTask) {
+		t.Fatal("expected non-M2A agy153 model to be rejected for restricted patch task")
+	}
+
+	// M2A model on 1.5.3 binary legitimately executes restricted patch mode.
+	capM2A := model.Capability{Provider: "agy", Model: agySyntheticModel, Fingerprint: agy153Fingerprint, Profiles: profiles}
+	if !AllowsAGYProfile(capM2A, patchTask) || !AllowsAGYProfile(capM2A, explicitRestrictedPatch) {
+		t.Fatal("expected M2A agy153 model to allow restricted patch task")
+	}
+}

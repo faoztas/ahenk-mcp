@@ -149,3 +149,74 @@ func TestPrivateStatePhysicalOverlap(t *testing.T) {
 		t.Fatal("case alias bypassed the private state boundary")
 	}
 }
+
+func TestPrivateSourceCriticalKeywordRejectedInReadOnly(t *testing.T) {
+	const path = "internal/example.go"
+	digest := Hash([]byte("package example\n"))
+	route := PrivateRoute{Provider: "opencode", Model: "opencode/glm-5.3-flash-free",
+		Fingerprint: strings.Repeat("a", 64), Transport: OpenCodeNativeReadAsk, DataHandlingReviewed: true}
+	for _, keyword := range []string{"security", "financial"} {
+		t.Run(keyword, func(t *testing.T) {
+			repo := Repo{AllowedPaths: []string{"internal"}, Providers: []string{"opencode"},
+				PrivateSource: &PrivateSourcePolicy{ExpiresAt: time.Now().Add(time.Hour),
+					Files: map[string]string{path: digest}, Routes: []PrivateRoute{route}}}
+			task := Task{
+				Objective:    "Audit " + keyword + " handling in approved file",
+				Acceptance:   []Check{{ID: "analysis", Description: "Give one fact"}},
+				AllowedPaths: []string{path},
+				Mode:         "read_only",
+				DataClass:    PrivateSourceData,
+			}
+			repo.PrivateSource.Briefs = []string{PrivateBriefDigest(task.Objective, task.Acceptance)}
+			fault := task.Validate(repo)
+			if fault == nil || fault.Gate != "PRIVATE_MODE_UNSUPPORTED" {
+				t.Fatalf("expected PRIVATE_MODE_UNSUPPORTED for %s keyword in private read_only task, got %+v", keyword, fault)
+			}
+		})
+	}
+}
+
+func TestPrivateRouteAccountMatchesCanonicalAndCaseInsensitive(t *testing.T) {
+	const email = "Owner@Example.com"
+	const lowerEmail = "owner@example.com"
+
+	t.Run("trim and case-insensitive raw account match", func(t *testing.T) {
+		r := PrivateRoute{Provider: "agy", ExpectedAccount: " " + email + " "}
+		c := Capability{Provider: "agy", AttestedAccount: " " + lowerEmail + " "}
+		if ok, gate := r.AccountMatches(c); !ok || gate != "" {
+			t.Fatalf("expected case-insensitive trimmed match, got (%t, %q)", ok, gate)
+		}
+	})
+
+	t.Run("canonical lowercase SHA256 matches mixed-case raw AttestedAccount", func(t *testing.T) {
+		r := PrivateRoute{Provider: "agy", ExpectedAccountSHA256: Hash([]byte(lowerEmail))}
+		c := Capability{Provider: "agy", AttestedAccount: email}
+		if ok, gate := r.AccountMatches(c); !ok || gate != "" {
+			t.Fatalf("expected canonical lowercase SHA256 match, got (%t, %q)", ok, gate)
+		}
+	})
+
+	t.Run("backwards-compatible exact raw SHA256 matches mixed-case AttestedAccount", func(t *testing.T) {
+		r := PrivateRoute{Provider: "agy", ExpectedAccountSHA256: Hash([]byte(email))}
+		c := Capability{Provider: "agy", AttestedAccount: email}
+		if ok, gate := r.AccountMatches(c); !ok || gate != "" {
+			t.Fatalf("expected backwards-compatible exact SHA256 match, got (%t, %q)", ok, gate)
+		}
+	})
+
+	t.Run("uppercase hex SHA256 normalized", func(t *testing.T) {
+		r := PrivateRoute{Provider: "agy", ExpectedAccountSHA256: strings.ToUpper(Hash([]byte(lowerEmail)))}
+		c := Capability{Provider: "agy", AttestedAccountSHA256: Hash([]byte(lowerEmail))}
+		if ok, gate := r.AccountMatches(c); !ok || gate != "" {
+			t.Fatalf("expected case-insensitive hex SHA256 match, got (%t, %q)", ok, gate)
+		}
+	})
+
+	t.Run("mismatched account still denied", func(t *testing.T) {
+		r := PrivateRoute{Provider: "agy", ExpectedAccount: email}
+		c := Capability{Provider: "agy", AttestedAccount: "other@example.com"}
+		if ok, gate := r.AccountMatches(c); ok || gate != "ACCOUNT_MISMATCH" {
+			t.Fatalf("expected ACCOUNT_MISMATCH, got (%t, %q)", ok, gate)
+		}
+	})
+}

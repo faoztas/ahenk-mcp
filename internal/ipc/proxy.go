@@ -5,16 +5,21 @@ package ipc
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// RunProxy connects to the leader socket and bridges stdin <-> unixConn <-> stdout.
-// An optional failover hook is invoked when the socket connection is lost.
-func RunProxy(ctx context.Context, stateDir string, in io.Reader, out io.Writer, failover ...func() error) error {
-	// Dial with backoff (up to 2s).
+var ErrLeaderDisconnected = errors.New("IPC leader disconnected. Reconnect to start a new MCP session")
+
+// RunProxy relays one MCP session to the leader and owns the input stream.
+// If the leader disappears, a new connection must negotiate its own session.
+func RunProxy(ctx context.Context, stateDir string, in io.ReadCloser, out io.Writer) error {
+	defer in.Close()
+
 	deadline := time.Now().Add(2 * time.Second)
 	var conn net.Conn
 	var err error
@@ -24,41 +29,41 @@ func RunProxy(ctx context.Context, stateDir string, in io.Reader, out io.Writer,
 			break
 		}
 		if time.Now().After(deadline) {
-			break
+			return fmt.Errorf("%w: %v", ErrLeaderDisconnected, err)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-	if err != nil {
-		if len(failover) > 0 && failover[0] != nil {
-			return failover[0]()
-		}
-		return err
-	}
 	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	var clientEOF atomic.Bool
 	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(conn, in)
-		if uc, ok := conn.(*net.UnixConn); ok {
-			_ = uc.CloseWrite()
+		if _, err := io.Copy(conn, in); err != nil {
+			_ = conn.Close()
+			return
+		}
+		clientEOF.Store(true)
+		if unixConn, ok := conn.(*net.UnixConn); ok {
+			_ = unixConn.CloseWrite()
 		} else {
 			_ = conn.Close()
 		}
 	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(out, conn)
-	}()
-	wg.Wait()
 
-	if len(failover) > 0 && failover[0] != nil && ctx.Err() == nil {
-		return failover[0]()
+	_, err = io.Copy(out, conn)
+	if ctx.Err() != nil {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrLeaderDisconnected, err)
+	}
+	if !clientEOF.Load() {
+		return ErrLeaderDisconnected
 	}
 	return nil
 }

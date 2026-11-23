@@ -4,6 +4,9 @@
 package providers
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -161,5 +164,272 @@ func TestAGYNativeWeeklyFloorAppliesToExactFamily(t *testing.T) {
 	if got := agyWeeklyReserve(rows, "gemini", 17); got == nil || got.Bucket != "gemini-weekly" ||
 		agyWeeklyReserve(rows, "gemini_argon", 17) != nil || agyWeeklyReserve(rows, "gemini", 0) != nil {
 		t.Fatal("weekly floor was applied to the wrong worker")
+	}
+}
+
+func TestDefaultSpeedAdmitsDefaultReadOnlyBudget(t *testing.T) {
+	tempDir := t.TempDir()
+	codexPath := createDummyExecutable(t, tempDir, "codex")
+	claudePath := createDummyExecutable(t, tempDir, "claude")
+
+	now := time.Now().UTC()
+	cfg := model.Config{
+		EnableFixture: true,
+		Providers: []model.ProviderConfig{
+			{ID: "agy", Model: "gemini-3.8-flash-medium"},
+			{ID: "opencode", Model: "opencode/glm-5.3-flash-free", OpenCodeTransport: model.OpenCodeNativeReadAsk},
+			{ID: "codex", Path: codexPath, Model: "custom-codex-default"},
+			{ID: "codex", Path: codexPath, Model: "custom-codex-slow", Speed: "slow"},
+			{ID: "claude", Path: claudePath, Model: "custom-claude-default"},
+			{ID: "claude", Path: claudePath, Model: "custom-claude-slow", Speed: "slow"},
+		},
+		ModelAudit: &model.ModelInventory{
+			Fixture:    model.ModelAuditFixture,
+			ObservedAt: now,
+			Models: []model.ModelAudit{
+				{
+					Provider:  "agy",
+					Model:     "gemini-4-argon-low",
+					Actual:    "gemini-4-argon-low",
+					Binary:    agy153Fingerprint,
+					Inference: "PASS",
+					Cost:      "SUBSCRIPTION_PRECHECK",
+					Interface: "headless_json",
+					Terminal:  true,
+					LatencyMS: 1200,
+				},
+				{
+					Provider:  "agy",
+					Model:     "gemini-4-argon-high",
+					Actual:    "gemini-4-argon-high",
+					Binary:    agy153Fingerprint,
+					Inference: "PASS",
+					Cost:      "SUBSCRIPTION_PRECHECK",
+					Interface: "headless_json",
+					Terminal:  true,
+					LatencyMS: 35000,
+				},
+			},
+		},
+	}
+
+	// Enable audited AGY models by matching synthetic config on a separate registry check
+	// and also verify New(cfg) directly on agy/opencode/codex/claude.
+	reg := New(cfg)
+	readOnly := model.Task{Mode: "read_only"}
+	deadline := now.Add(120 * time.Second)
+
+	findCap := func(provider, modelID string) model.Capability {
+		t.Helper()
+		for _, c := range reg.Candidates {
+			if c.Provider == provider && (modelID == "" || c.Model == modelID) {
+				return c
+			}
+		}
+		t.Fatalf("missing candidate %s/%s in %+v", provider, modelID, reg.Candidates)
+		return model.Capability{}
+	}
+
+	for _, tc := range []struct {
+		provider string
+		modelID  string
+		wantFast bool
+	}{
+		{"agy", "gemini-3.8-flash-medium", true},
+		{"opencode", "opencode/glm-5.3-flash-free", true},
+		{"codex", "custom-codex-default", true},
+		{"claude", "custom-claude-default", true},
+		{"codex", "custom-codex-slow", false},
+		{"claude", "custom-claude-slow", false},
+	} {
+		c := findCap(tc.provider, tc.modelID)
+		est := Estimate(c, readOnly)
+		_, ok := Budget(now, deadline, readOnly, est)
+		if tc.wantFast {
+			if c.Speed != "fast" {
+				t.Errorf("%s/%s: expected Speed=fast, got %q", tc.provider, tc.modelID, c.Speed)
+			}
+			if est != 60*time.Second || !ok {
+				t.Errorf("%s/%s: expected fast 60s estimate admitted under 120s deadline, got est=%v ok=%v", tc.provider, tc.modelID, est, ok)
+			}
+		} else {
+			if c.Speed != "slow" {
+				t.Errorf("%s/%s: expected Speed=slow, got %q", tc.provider, tc.modelID, c.Speed)
+			}
+			if est != 240*time.Second || ok {
+				t.Errorf("%s/%s: expected slow 240s estimate rejected under 120s deadline, got est=%v ok=%v", tc.provider, tc.modelID, est, ok)
+			}
+		}
+	}
+
+	fixCap := findCap("fixture-a", "synthetic")
+	if fixCap.Speed != "fixture" || Estimate(fixCap, readOnly) != 5*time.Second {
+		t.Errorf("fixture speed changed unexpectedly: %+v", fixCap)
+	}
+
+	// Verify audited models via addAuditedModels honor fast default and high-latency slow hint.
+	auditReg := Registry{agy: model.ProviderConfig{EnableSynthetic: true, ExpectedBinarySHA256: agy153Fingerprint}}
+	auditReg.addAuditedModels(cfg.ModelAudit, now)
+	if len(auditReg.Candidates) != 2 {
+		t.Fatalf("expected 2 audited candidates, got %d", len(auditReg.Candidates))
+	}
+	fastAudit := auditReg.Candidates[0]
+	slowAudit := auditReg.Candidates[1]
+	if fastAudit.Speed != "fast" || Estimate(fastAudit, readOnly) != 60*time.Second {
+		t.Errorf("fast audited model: got speed=%q est=%v", fastAudit.Speed, Estimate(fastAudit, readOnly))
+	}
+	if _, ok := Budget(now, deadline, readOnly, Estimate(fastAudit, readOnly)); !ok {
+		t.Errorf("fast audited model was rejected by Budget under 120s deadline")
+	}
+	if slowAudit.Speed != "slow" || Estimate(slowAudit, readOnly) != 240*time.Second {
+		t.Errorf("slow audited model: got speed=%q est=%v", slowAudit.Speed, Estimate(slowAudit, readOnly))
+	}
+}
+
+func TestRegistryMultiEntryCLIProviders(t *testing.T) {
+	tempDir := t.TempDir()
+	codexPath := createDummyExecutable(t, tempDir, "codex")
+	claudePath := createDummyExecutable(t, tempDir, "claude")
+
+	cfg := model.Config{
+		Providers: []model.ProviderConfig{
+			{ID: "codex", Path: codexPath, Model: "codex-alpha", Speed: "slow"},
+			{ID: "codex", Path: codexPath, Model: "codex-beta"},
+			{ID: "codex", Model: "codex-gamma", Speed: "fast"},
+			{ID: "claude", Path: claudePath, Model: "claude-alpha", Speed: "slow"},
+			{ID: "claude", Path: claudePath, Model: "claude-beta"},
+			{ID: "claude", Model: "claude-gamma", Speed: "fast"},
+		},
+	}
+
+	reg := New(cfg)
+	want := map[string]string{
+		"codex/codex-alpha":   "slow",
+		"codex/codex-beta":    "fast",
+		"codex/codex-gamma":   "fast",
+		"claude/claude-alpha": "slow",
+		"claude/claude-beta":  "fast",
+		"claude/claude-gamma": "fast",
+	}
+	got := map[string]model.Capability{}
+	for _, c := range reg.Candidates {
+		if c.Provider == "codex" || c.Provider == "claude" {
+			got[c.Provider+"/"+c.Model] = c
+		}
+	}
+	for key, wantSpeed := range want {
+		c, ok := got[key]
+		if !ok {
+			t.Fatalf("missing multi-entry model %s", key)
+		}
+		if c.Status != "available" {
+			t.Errorf("%s: expected available, got %s (reason: %s)", key, c.Status, c.Reason)
+		}
+		if c.Speed != wantSpeed {
+			t.Errorf("%s: expected Speed=%q, got %q", key, wantSpeed, c.Speed)
+		}
+		if !AllowsTrustedLocal(c) {
+			t.Errorf("%s: expected AllowsTrustedLocal=true", key)
+		}
+	}
+}
+
+func TestRegistryTargetEffortPropagationCLI(t *testing.T) {
+	tempDir := t.TempDir()
+	realTemp, err := filepath.EvalSymlinks(tempDir)
+	if err != nil {
+		realTemp = tempDir
+	}
+	workDir := filepath.Join(realTemp, "worktree")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatalf("failed to create worktree: %v", err)
+	}
+
+	codexLog := filepath.Join(realTemp, "codex_args.log")
+	mockCodex := filepath.Join(realTemp, "mock_codex_effort")
+	codexScript := `#!/bin/sh
+echo "$@" >> "` + codexLog + `"
+echo '{"type":"thread.started","thread_id":"sess-codex-effort"}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"codex ok"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+exit 0
+`
+	if err := os.WriteFile(mockCodex, []byte(codexScript), 0755); err != nil {
+		t.Fatalf("failed to write mock codex: %v", err)
+	}
+
+	claudeLog := filepath.Join(realTemp, "claude_args.log")
+	mockClaude := filepath.Join(realTemp, "mock_claude_effort")
+	claudeScript := `#!/bin/sh
+echo "$@" >> "` + claudeLog + `"
+cat << 'EOF'
+{
+  "session_id": "sess-claude-effort",
+  "result": "claude ok",
+  "subtype": "success",
+  "usage": {"input_tokens": 10, "output_tokens": 5}
+}
+EOF
+exit 0
+`
+	if err := os.WriteFile(mockClaude, []byte(claudeScript), 0755); err != nil {
+		t.Fatalf("failed to write mock claude: %v", err)
+	}
+
+	reg := New(model.Config{
+		Providers: []model.ProviderConfig{
+			{ID: "codex", Path: mockCodex, Model: "gpt-6.1-sol"},
+			{ID: "claude", Path: mockClaude, Model: "claude-opus-5-5"},
+		},
+	})
+
+	var codexCap, claudeCap model.Capability
+	for _, c := range reg.Candidates {
+		if c.Provider == "codex" && c.Model == "gpt-6.1-sol" {
+			codexCap = c
+		}
+		if c.Provider == "claude" && c.Model == "claude-opus-5-5" {
+			claudeCap = c
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// 1. Codex TargetEffort="max" -> model_reasoning_effort="xhigh"
+	if _, err := reg.Run(ctx, realTemp, codexCap, model.Task{Objective: "Check max effort", Mode: "read_only", TargetEffort: "max"}, nil, nil); err != nil {
+		t.Fatalf("codex Run failed: %v", err)
+	}
+	codexArgsBytes, err := os.ReadFile(codexLog)
+	if err != nil {
+		t.Fatalf("failed to read codex log: %v", err)
+	}
+	if !strings.Contains(string(codexArgsBytes), `model_reasoning_effort="xhigh"`) {
+		t.Errorf("expected model_reasoning_effort=\"xhigh\" for TargetEffort=max, got: %s", string(codexArgsBytes))
+	}
+
+	// 2. Claude Run with TargetEffort="high" and RunTrustedLocal with TargetEffort="max"
+	if _, err := reg.Run(ctx, realTemp, claudeCap, model.Task{Objective: "Check claude effort", Mode: "read_only", TargetEffort: "high"}, nil, nil); err != nil {
+		t.Fatalf("claude Run failed: %v", err)
+	}
+	if _, err := reg.RunTrustedLocal(ctx, realTemp, workDir, claudeCap, model.Task{
+		Objective:        "Patch with max effort",
+		Mode:             "patch",
+		ExecutionProfile: model.TrustedLocalProfile,
+		DataClass:        "synthetic",
+		TargetEffort:     "max",
+	}, []string{"mod.go"}); err != nil {
+		t.Fatalf("claude RunTrustedLocal failed: %v", err)
+	}
+	claudeArgsBytes, err := os.ReadFile(claudeLog)
+	if err != nil {
+		t.Fatalf("failed to read claude log: %v", err)
+	}
+	claudeLogged := string(claudeArgsBytes)
+	if !strings.Contains(claudeLogged, "--effort high") {
+		t.Errorf("expected '--effort high' in claude Run args, got: %s", claudeLogged)
+	}
+	if !strings.Contains(claudeLogged, "--effort max") {
+		t.Errorf("expected '--effort max' in claude RunTrustedLocal args, got: %s", claudeLogged)
 	}
 }

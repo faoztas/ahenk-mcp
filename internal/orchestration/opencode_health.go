@@ -210,18 +210,18 @@ func openCodeScope(scope string) string {
 	}
 }
 
+func isOpenCodeSharedCircuitScope(a model.Attempt) bool {
+	return a.ProviderRateLimitScope == "provider" ||
+		a.ProviderRateLimitScope == "pool" ||
+		a.ProviderRateLimitScope == "account" ||
+		a.ProviderRateLimitScope == "free-limit" ||
+		a.ProviderReason == "provider.free-limit" ||
+		a.RetryAfterMS >= 59_760_000
+}
+
 func (e *Engine) rememberOpenCodeHealth(a *model.Attempt) {
 	e.openCodeHistory.Apply(a)
 	e.recordOpenCodeObservation(a)
-	if e.cb != nil && a.Code == "RATE_LIMIT" && (a.ProviderRateLimitScope == "provider" || a.ProviderRateLimitScope == "free-limit" || a.ProviderReason == "provider.free-limit" || a.RetryAfterMS >= 59_760_000) {
-		cooldown := 59760 * time.Second
-		if a.RetryAfterMS > 0 {
-			cooldown = time.Duration(a.RetryAfterMS) * time.Millisecond
-		} else if a.RetryAt != nil && a.FinishedAt != nil {
-			cooldown = a.RetryAt.Sub(*a.FinishedAt)
-		}
-		e.cb.Trip("opencode", cooldown)
-	}
 }
 
 // OpenCodeVerifiedSuccess is shared by dispatch and read-only diagnostics.
@@ -257,6 +257,9 @@ func (e *Engine) recordOpenCodeObservation(a *model.Attempt) {
 	}
 	scope := OpenCodeHealthScope(*a)
 	if scope == "" || scope == "session" || a.RetryAt == nil {
+		if e.cb != nil && a.Code != "" {
+			e.cb.Release(a.Provider)
+		}
 		return
 	}
 	var reset *time.Time
@@ -269,6 +272,20 @@ func (e *Engine) recordOpenCodeObservation(a *model.Attempt) {
 	key := openCodeObservedGateKey(scope, a.ProviderRateLimitScope, id)
 	e.rememberOpenCodeGate(key, openCodeHealth{resetAt: reset, origin: id, assertedScope: a.ProviderRateLimitScope, probe: a.OpenCodeRecheck,
 		suspect: openCodeSuspect(*a), until: *a.RetryAt, code: a.Code, observed: *a.FinishedAt, source: a.RetrySource})
+	if e.cb != nil {
+		if a.Code == "RATE_LIMIT" && isOpenCodeSharedCircuitScope(*a) {
+			until := *a.RetryAt
+			if a.RetryAfterMS >= 59_760_000 {
+				candidateUntil := a.FinishedAt.Add(time.Duration(a.RetryAfterMS) * time.Millisecond)
+				if candidateUntil.After(until) {
+					until = candidateUntil
+				}
+			}
+			e.cb.TripUntil(a.Provider, until)
+		} else {
+			e.cb.Release(a.Provider)
+		}
+	}
 }
 
 func openCodeSuspect(a model.Attempt) bool {

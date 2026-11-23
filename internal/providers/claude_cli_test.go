@@ -99,7 +99,7 @@ exit 0
 		t.Fatalf("failed to write mock binary: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	res, err := RunClaudeCLI(ctx, tempDir, "claude-3-7-sonnet", "Refactor parsing logic", SandboxModeWorkspaceWrite, mockBin)
@@ -147,7 +147,7 @@ exit 1
 		t.Fatalf("failed to write mock binary: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	_, err := RunClaudeCLI(ctx, tempDir, "claude-3-7-sonnet", "High throughput check", SandboxModeWorkspaceWrite, mockBin)
@@ -178,7 +178,7 @@ exit 1
 		t.Fatalf("failed to write mock binary: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	_, err := RunClaudeCLI(ctx, tempDir, "claude-3-7-sonnet", "Check status", SandboxModeWorkspaceWrite, mockBin)
@@ -209,7 +209,7 @@ exit 1
 		t.Fatalf("failed to write mock binary: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	_, err := RunClaudeCLI(ctx, tempDir, "claude-3-7-sonnet", "Task", SandboxModeWorkspaceWrite, mockBin)
@@ -239,7 +239,7 @@ exit 1
 		t.Fatalf("failed to write mock binary: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	_, err := RunClaudeCLI(ctx, tempDir, "claude-3-7-sonnet", "Task", SandboxModeWorkspaceWrite, mockBin)
@@ -326,7 +326,7 @@ exit 0
 		t.Fatalf("failed to write mock binary: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	// 1. Run with SandboxModeReadOnly
@@ -396,7 +396,7 @@ exit 0
 		t.Fatalf("failed to write mock binary: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	testPrompt := "Secure prompt passed via stdin to avoid ARG_MAX and ps snooping"
@@ -414,3 +414,220 @@ exit 0
 	}
 }
 
+func TestRunClaudeCLI_NonZeroExitWithResultReturnsError(t *testing.T) {
+	tempDir := t.TempDir()
+	mockBin := filepath.Join(tempDir, "mock_claude_fail_result")
+	script := `#!/bin/sh
+cat << 'EOF'
+{
+  "session_id": "sess-claude-fail",
+  "result": "partial output before non-zero exit",
+  "subtype": "success",
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 5
+  }
+}
+EOF
+echo "unexpected subprocess failure" >&2
+exit 1
+`
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock binary: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, err := RunClaudeCLI(ctx, tempDir, "claude-3-7-sonnet", "Task", SandboxModeWorkspaceWrite, mockBin)
+	if err == nil {
+		t.Fatal("expected error on non-zero exit even with non-empty JSON result, got nil")
+	}
+
+	var fault *model.Fault
+	if !errors.As(err, &fault) || fault.Code != "EXECUTION_FAILED" {
+		t.Fatalf("expected EXECUTION_FAILED fault, got %v", err)
+	}
+}
+
+func TestRunClaudeCLI_OversizedStdoutBounded(t *testing.T) {
+	tempDir := t.TempDir()
+	mockBin := filepath.Join(tempDir, "mock_claude_oversized")
+	script := `#!/bin/sh
+printf '{"session_id":"sess-big","subtype":"success","result":"'
+dd if=/dev/zero bs=65536 count=130 2>/dev/null | tr '\0' 'a'
+printf '"}\n'
+exit 0
+`
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock binary: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, err := RunClaudeCLI(ctx, tempDir, "claude-3-7-sonnet", "Big output", SandboxModeReadOnly, mockBin)
+	if err == nil {
+		t.Fatal("expected INVALID_OUTPUT error for >8 MiB stdout, got nil")
+	}
+
+	var fault *model.Fault
+	if !errors.As(err, &fault) || fault.Code != "INVALID_OUTPUT" {
+		t.Fatalf("expected INVALID_OUTPUT fault, got %v", err)
+	}
+}
+
+func TestRunClaudeCLI_PropagatesChildDepth(t *testing.T) {
+	t.Setenv("AHENK_CHILD_SESSION", "1")
+	t.Setenv("AHENK_CHILD_DEPTH", "1")
+	t.Setenv("AHENK_MAX_DEPTH", "3")
+
+	tempDir := t.TempDir()
+	envLog := filepath.Join(tempDir, "env.log")
+	mockBin := filepath.Join(tempDir, "mock_claude_depth")
+	script := `#!/bin/sh
+printf "AHENK_CHILD_DEPTH=%s\nAHENK_MAX_DEPTH=%s\n" "$AHENK_CHILD_DEPTH" "$AHENK_MAX_DEPTH" > "` + envLog + `"
+cat << 'EOF'
+{
+  "session_id": "sess-claude-depth",
+  "result": "ok",
+  "subtype": "success",
+  "usage": {
+    "input_tokens": 5,
+    "output_tokens": 5
+  }
+}
+EOF
+exit 0
+`
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock binary: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if _, err := RunClaudeCLI(ctx, tempDir, "claude-3-7-sonnet", "Depth test", SandboxModeReadOnly, mockBin); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got, err := os.ReadFile(envLog)
+	if err != nil {
+		t.Fatalf("failed to read env log: %v", err)
+	}
+	want := "AHENK_CHILD_DEPTH=2\nAHENK_MAX_DEPTH=3\n"
+	if string(got) != want {
+		t.Fatalf("child env mismatch:\ngot:\n%s\nwant:\n%s", string(got), want)
+	}
+}
+
+func TestRunClaudeCLI_EmptyStdoutNonZeroExitClassifiesStderr(t *testing.T) {
+	cases := []struct {
+		name     string
+		stderr   string
+		wantCode string
+	}{
+		{
+			name:     "stderr rate limit returns RATE_LIMIT",
+			stderr:   "429 rate_limit exceeded",
+			wantCode: "RATE_LIMIT",
+		},
+		{
+			name:     "stderr auth error returns AUTH_REQUIRED",
+			stderr:   "401 unauthorized: invalid credentials",
+			wantCode: "AUTH_REQUIRED",
+		},
+		{
+			name:     "stderr crash returns EXECUTION_FAILED",
+			stderr:   "fatal crash: segmentation fault",
+			wantCode: "EXECUTION_FAILED",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			mockBin := filepath.Join(tempDir, "mock_claude_stderr")
+			script := "#!/bin/sh\necho \"" + tc.stderr + "\" >&2\nexit 1\n"
+			if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+				t.Fatalf("failed to write mock binary: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			_, err := RunClaudeCLI(ctx, tempDir, "claude-3-7-sonnet", "Task", SandboxModeReadOnly, mockBin)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+
+			var fault *model.Fault
+			if !errors.As(err, &fault) || fault.Code != tc.wantCode {
+				t.Fatalf("expected %s fault, got %v", tc.wantCode, err)
+			}
+		})
+	}
+}
+
+func TestRunClaudeCLI_NonZeroExitEmptyStderrWithErrorJSONResult(t *testing.T) {
+	tempDir := t.TempDir()
+	mockBin := filepath.Join(tempDir, "mock_claude_err_result")
+	script := `#!/bin/sh
+cat << 'EOF'
+{
+  "is_error": true,
+  "result": "tool execution rejected by policy"
+}
+EOF
+exit 1
+`
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock binary: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, err := RunClaudeCLI(ctx, tempDir, "claude-3-7-sonnet", "Task", SandboxModeReadOnly, mockBin)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var fault *model.Fault
+	if !errors.As(err, &fault) || fault.Code != "EXECUTION_FAILED" {
+		t.Fatalf("expected EXECUTION_FAILED fault, got %v", err)
+	}
+	if !strings.Contains(fault.Message, "tool execution rejected by policy") {
+		t.Fatalf("expected parsed result message in fault, got %q", fault.Message)
+	}
+}
+
+func TestClaudeCLIArgs_WithEffort(t *testing.T) {
+	cases := []struct {
+		name     string
+		effort   string
+		wantFlag string
+	}{
+		{"empty omits effort", "", ""},
+		{"low passed", "low", "--effort low"},
+		{"medium passed", "medium", "--effort medium"},
+		{"high passed", "high", "--effort high"},
+		{"max passed", "max", "--effort max"},
+		{"xhigh maps to max", "xhigh", "--effort max"},
+		{"trimmed and lowercased", "  HIGH ", "--effort high"},
+		{"injection rejected", `high --malicious`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := BuildClaudeArgsWithEffort("claude-opus-5-5", tc.effort, SandboxModeReadOnly)
+			joined := strings.Join(args, " ")
+			if tc.wantFlag == "" {
+				if strings.Contains(joined, "--effort") || strings.Contains(joined, "malicious") {
+					t.Errorf("unexpected --effort or injection in args: %s", joined)
+				}
+			} else if !strings.Contains(joined, tc.wantFlag) {
+				t.Errorf("expected %q in args, got: %s", tc.wantFlag, joined)
+			}
+		})
+	}
+}

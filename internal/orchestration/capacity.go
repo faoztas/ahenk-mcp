@@ -119,7 +119,7 @@ func (e *Engine) capacitySnapshot(now time.Time, repoID string) CapacitySnapshot
 		if c.Provider != "opencode" || c.Mode == "fixture" {
 			continue
 		}
-		if repoID != "" && !slices.Contains(e.cfg.Repositories[repoID].Providers, c.Provider) {
+		if repoID != "" && !repoAllowsProvider(e.cfg.Repositories[repoID], c.Provider) {
 			continue
 		}
 		q := providers.UnknownQuota("opencode")
@@ -162,7 +162,7 @@ func (e *Engine) capacitySnapshot(now time.Time, repoID string) CapacitySnapshot
 		}
 		out.OpenCode = append(out.OpenCode, q)
 	}
-	if inventory := e.cfg.ModelAudit; inventory != nil && (repoID == "" || slices.Contains(e.cfg.Repositories[repoID].Providers, "opencode")) {
+	if inventory := e.cfg.ModelAudit; inventory != nil && (repoID == "" || repoAllowsProvider(e.cfg.Repositories[repoID], "opencode")) {
 		for _, row := range inventory.Models {
 			if row.Provider != "opencode" || slices.ContainsFunc(out.OpenCode, func(q providers.Quota) bool { return q.Model == row.Model }) {
 				continue
@@ -276,7 +276,7 @@ func (e *Engine) RepoAdmission(repoID string) *model.RepoAdmissionReport {
 	probe := model.Task{Mode: "read_only", DataClass: model.PrivateSourceData, WorkspaceMode: "head_only"}
 	hasReadRoute := false
 	for _, c := range e.reg.Candidates {
-		if !slices.Contains(repo.Providers, c.Provider) || c.Status != "available" {
+		if !repoAllowsProvider(repo, c.Provider) || c.Status != "available" {
 			continue
 		}
 		ok, gate := p.RouteDecision(c, probe, now)
@@ -322,7 +322,7 @@ func (e *Engine) previewRoute(j model.Job, now time.Time) []model.Decision {
 	if j.DeadlineAt.IsZero() {
 		j.DeadlineAt = now.Add(10 * time.Minute)
 	}
-	e.route(&j, now)
+	e.routeWithMode(&j, now, true)
 	for i := range j.Route {
 		if j.Route[i].Reason == "SELECTED" {
 			j.Route[i].Reason = "AVAILABLE_CANDIDATE"

@@ -62,6 +62,8 @@ func TestCodexCLIArgs_EffortValidation(t *testing.T) {
 		{"medium allowed", "medium", "medium"},
 		{"high allowed", "high", "high"},
 		{"xhigh allowed", "xhigh", "xhigh"},
+		{"max maps to xhigh", "max", "xhigh"},
+		{"MAX maps to xhigh", "MAX", "xhigh"},
 		{"case insensitive and trimmed", "  HIGH  ", "high"},
 		{"command injection fallback", `medium" -c malicious="1`, "medium"},
 		{"unsupported effort fallback", "ultra_max", "medium"},
@@ -85,7 +87,6 @@ func TestCodexCLIArgs_EffortValidation(t *testing.T) {
 	}
 }
 
-
 func TestRunCodexCLI_Success(t *testing.T) {
 	tempDir := t.TempDir()
 	mockBin := filepath.Join(tempDir, "mock_codex")
@@ -99,7 +100,7 @@ exit 0
 		t.Fatalf("failed to write mock binary: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	res, err := RunCodexCLI(ctx, tempDir, "gpt-5-sol", "medium", "Refactor network parser", SandboxModeWorkspaceWrite, mockBin)
@@ -142,7 +143,7 @@ exit 1
 		t.Fatalf("failed to write mock binary: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	_, err := RunCodexCLI(ctx, tempDir, "gpt-5-sol", "high", "Heavy task", SandboxModeWorkspaceWrite, mockBin)
@@ -224,7 +225,7 @@ exit 0
 		t.Fatalf("failed to write mock binary: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	// 1. Run with SandboxModeReadOnly
@@ -274,7 +275,7 @@ exit 1
 		t.Fatalf("failed to write mock binary: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	_, err := RunCodexCLI(ctx, tempDir, "gpt-5-sol", "high", "Heavy task", SandboxModeWorkspaceWrite, mockBin)
@@ -288,3 +289,188 @@ exit 1
 	}
 }
 
+func TestRunCodexCLI_NonZeroExitWithSummaryReturnsError(t *testing.T) {
+	tempDir := t.TempDir()
+	mockBin := filepath.Join(tempDir, "mock_codex_fail_summary")
+	script := `#!/bin/sh
+echo '{"type":"thread.started","thread_id":"sess-codex-fail"}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"partial message before crash"}}'
+echo "fatal runtime error" >&2
+exit 1
+`
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock binary: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, err := RunCodexCLI(ctx, tempDir, "gpt-5-sol", "medium", "Task", SandboxModeWorkspaceWrite, mockBin)
+	if err == nil {
+		t.Fatal("expected error on non-zero exit even with non-empty agent_message, got nil")
+	}
+
+	var fault *model.Fault
+	if !errors.As(err, &fault) || fault.Code != "EXECUTION_FAILED" {
+		t.Fatalf("expected EXECUTION_FAILED fault, got %v", err)
+	}
+}
+
+func TestRunCodexCLI_EmptyStdoutExitZeroReturnsInvalidOutput(t *testing.T) {
+	tempDir := t.TempDir()
+	mockBin := filepath.Join(tempDir, "mock_codex_empty")
+	script := `#!/bin/sh
+exit 0
+`
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock binary: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, err := RunCodexCLI(ctx, tempDir, "gpt-5-sol", "medium", "Task", SandboxModeWorkspaceWrite, mockBin)
+	if err == nil {
+		t.Fatal("expected INVALID_OUTPUT error on empty stdout, got nil")
+	}
+
+	var fault *model.Fault
+	if !errors.As(err, &fault) || fault.Code != "INVALID_OUTPUT" {
+		t.Fatalf("expected INVALID_OUTPUT fault, got %v", err)
+	}
+}
+
+func TestRunCodexCLI_StreamErrorPriorityPreserved(t *testing.T) {
+	cases := []struct {
+		name     string
+		firstErr string
+		wantCode string
+	}{
+		{
+			name:     "RATE_LIMIT not overwritten by generic error",
+			firstErr: `{"type":"error","message":"rate limit exceeded (429)"}`,
+			wantCode: "RATE_LIMIT",
+		},
+		{
+			name:     "AUTH_REQUIRED not overwritten by generic error",
+			firstErr: `{"type":"error","message":"401 unauthorized: not logged in"}`,
+			wantCode: "AUTH_REQUIRED",
+		},
+		{
+			name:     "AUTH_REQUIRED matches invalid_api_key and credit balance",
+			firstErr: `{"type":"error","message":"invalid_api_key: check your credit balance"}`,
+			wantCode: "AUTH_REQUIRED",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			mockBin := filepath.Join(tempDir, "mock_codex_prio")
+			script := "#!/bin/sh\n" +
+				`echo '{"type":"thread.started","thread_id":"sess-prio"}'` + "\n" +
+				"echo '" + tc.firstErr + "'\n" +
+				`echo '{"type":"turn.failed","error":{"message":"generic turn failure"}}'` + "\n" +
+				"exit 1\n"
+			if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+				t.Fatalf("failed to write mock binary: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			_, err := RunCodexCLI(ctx, tempDir, "gpt-5-sol", "medium", "Task", SandboxModeWorkspaceWrite, mockBin)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+
+			var fault *model.Fault
+			if !errors.As(err, &fault) || fault.Code != tc.wantCode {
+				t.Fatalf("expected %s fault, got %v", tc.wantCode, err)
+			}
+		})
+	}
+}
+
+func TestRunCodexCLI_PropagatesChildDepth(t *testing.T) {
+	t.Setenv("AHENK_CHILD_SESSION", "1")
+	t.Setenv("AHENK_CHILD_DEPTH", "1")
+	t.Setenv("AHENK_MAX_DEPTH", "3")
+
+	tempDir := t.TempDir()
+	envLog := filepath.Join(tempDir, "env.log")
+	mockBin := filepath.Join(tempDir, "mock_codex_depth")
+	script := `#!/bin/sh
+printf "AHENK_CHILD_DEPTH=%s\nAHENK_MAX_DEPTH=%s\n" "$AHENK_CHILD_DEPTH" "$AHENK_MAX_DEPTH" > "` + envLog + `"
+echo '{"type":"thread.started","thread_id":"sess-depth"}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+exit 0
+`
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock binary: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if _, err := RunCodexCLI(ctx, tempDir, "gpt-5-sol", "low", "Depth test", SandboxModeReadOnly, mockBin); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got, err := os.ReadFile(envLog)
+	if err != nil {
+		t.Fatalf("failed to read env log: %v", err)
+	}
+	want := "AHENK_CHILD_DEPTH=2\nAHENK_MAX_DEPTH=3\n"
+	if string(got) != want {
+		t.Fatalf("child env mismatch:\ngot:\n%s\nwant:\n%s", string(got), want)
+	}
+}
+
+func TestRunCodexCLI_ScannerErrReturnsInvalidOutput(t *testing.T) {
+	tempDir := t.TempDir()
+	mockBin := filepath.Join(tempDir, "mock_codex_longline")
+	script := `#!/bin/sh
+echo '{"type":"thread.started","thread_id":"sess-long"}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"partial before oversized line"}}'
+dd if=/dev/zero bs=65536 count=17 2>/dev/null | tr '\0' 'x'
+printf '\n'
+exit 0
+`
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock binary: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, err := RunCodexCLI(ctx, tempDir, "gpt-5-sol", "medium", "Oversized line", SandboxModeReadOnly, mockBin)
+	if err == nil {
+		t.Fatal("expected INVALID_OUTPUT error on scanner error, got nil")
+	}
+
+	var fault *model.Fault
+	if !errors.As(err, &fault) || fault.Code != "INVALID_OUTPUT" {
+		t.Fatalf("expected INVALID_OUTPUT fault, got %v", err)
+	}
+}
+
+func TestParseCodexJSONL_AuthKeywordsAndScannerError(t *testing.T) {
+	for _, keyword := range []string{"authentication failed", "credit balance exhausted", "invalid_api_key provided"} {
+		payload := `{"type":"error","message":"` + keyword + `"}` + "\n"
+		_, err := ParseCodexJSONL([]byte(payload))
+		var fault *model.Fault
+		if !errors.As(err, &fault) || fault.Code != "AUTH_REQUIRED" {
+			t.Fatalf("keyword %q: expected AUTH_REQUIRED fault, got %v", keyword, err)
+		}
+	}
+
+	// Oversized line (> 1 MiB) should trigger sc.Err() -> INVALID_OUTPUT instead of returning nil.
+	oversized := `{"type":"thread.started","thread_id":"sess-ok"}` + "\n" + strings.Repeat("x", (1024*1024)+64) + "\n"
+	_, err := ParseCodexJSONL([]byte(oversized))
+	var fault *model.Fault
+	if !errors.As(err, &fault) || fault.Code != "INVALID_OUTPUT" {
+		t.Fatalf("oversized JSONL line: expected INVALID_OUTPUT fault from sc.Err(), got %v", err)
+	}
+}

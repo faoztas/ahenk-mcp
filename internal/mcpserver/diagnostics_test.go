@@ -30,11 +30,29 @@ func TestDiagnosticsMCPTools(t *testing.T) {
 	}
 
 	// 3. get_routing_audit
-	resAudit, err := callMCPTool(server, "get_routing_audit", map[string]any{"job_id": "job-test-1"})
+	delOut, err := callMCPTool(server, "delegate_task", map[string]any{
+		"task": map[string]any{
+			"category":  "coding",
+			"objective": "Audit test task",
+		},
+		"target":         "auto",
+		"execution_mode": "async",
+	})
+	if err != nil {
+		t.Fatalf("delegate_task failed: %v", err)
+	}
+	resAudit, err := callMCPTool(server, "get_routing_audit", map[string]any{"job_id": delOut["job_id"]})
 	if err != nil {
 		t.Fatalf("get_routing_audit failed: %v", err)
 	}
 	if _, ok := resAudit["attempts"]; !ok {
 		t.Fatalf("expected attempts key, got %v", resAudit)
+	}
+	resUnknown, err := callMCPTool(server, "get_routing_audit", map[string]any{"job_id": "job-test-1"})
+	if err != nil {
+		t.Fatalf("get_routing_audit unknown failed: %v", err)
+	}
+	if resUnknown["code"] != "NOT_FOUND" {
+		t.Fatalf("expected NOT_FOUND for unknown job_id, got %v", resUnknown)
 	}
 }

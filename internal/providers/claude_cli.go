@@ -18,11 +18,39 @@ import (
 	"github.com/faoztas/ahenk-mcp/internal/model"
 )
 
+const maxClaudeStdoutBytes = 8 << 20
+
+var allowedClaudeEfforts = map[string]bool{
+	"low":    true,
+	"medium": true,
+	"high":   true,
+	"max":    true,
+}
+
+func sanitizeClaudeEffort(effort string) string {
+	normalized := strings.ToLower(strings.TrimSpace(effort))
+	if normalized == "xhigh" {
+		return "max"
+	}
+	if allowedClaudeEfforts[normalized] {
+		return normalized
+	}
+	return ""
+}
+
 // BuildClaudeArgs constructs the command-line arguments for the Claude CLI subprocess.
 func BuildClaudeArgs(modelID string, _ string, sandbox SandboxMode) []string {
+	return BuildClaudeArgsWithEffort(modelID, "", sandbox)
+}
+
+// BuildClaudeArgsWithEffort constructs the command-line arguments for the Claude CLI subprocess with optional reasoning effort.
+func BuildClaudeArgsWithEffort(modelID, effort string, sandbox SandboxMode) []string {
 	args := []string{"--output-format", "json"}
 	if modelID != "" {
 		args = append(args, "--model", modelID)
+	}
+	if sanitized := sanitizeClaudeEffort(effort); sanitized != "" {
+		args = append(args, "--effort", sanitized)
 	}
 	if sandbox == SandboxModeReadOnly {
 		args = append(args, "--permission-mode", "plan", "--tools", "Read,Grep,Glob")
@@ -47,16 +75,22 @@ func claudeEnv(base []string, tempDir string, currentDepth, maxDepth int) []stri
 
 // RunClaudeCLI executes the Claude CLI in a subprocess with process group isolation and JSON parsing.
 func RunClaudeCLI(ctx context.Context, worktreeDir string, modelID string, prompt string, sandbox SandboxMode, binPath string) (*CLIRunResult, error) {
+	return RunClaudeCLIWithEffort(ctx, worktreeDir, modelID, "", prompt, sandbox, binPath)
+}
+
+// RunClaudeCLIWithEffort executes the Claude CLI in a subprocess with process group isolation, effort propagation, and JSON parsing.
+func RunClaudeCLIWithEffort(ctx context.Context, worktreeDir string, modelID string, effort string, prompt string, sandbox SandboxMode, binPath string) (*CLIRunResult, error) {
 	if binPath == "" {
 		binPath = "claude"
 	}
-	args := BuildClaudeArgs(modelID, prompt, sandbox)
+	args := BuildClaudeArgsWithEffort(modelID, effort, sandbox)
 
 	cmd := exec.Command(binPath, args...)
 	if worktreeDir != "" {
 		cmd.Dir = worktreeDir
 	}
-	cmd.Env = claudeEnv(os.Environ(), worktreeDir, 0, 1)
+	currentDepth, maxDepth := DepthFromEnv(os.Environ())
+	cmd.Env = claudeEnv(os.Environ(), worktreeDir, currentDepth, maxDepth)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if prompt != "" {
@@ -80,10 +114,15 @@ func RunClaudeCLI(ctx context.Context, worktreeDir string, modelID string, promp
 	}
 
 	var stdoutBuf bytes.Buffer
+	var stdoutOverflow bool
 	stdoutDone := make(chan struct{})
 	go func() {
 		defer close(stdoutDone)
-		_, _ = io.Copy(&stdoutBuf, stdoutPipe)
+		_, _ = io.Copy(&stdoutBuf, io.LimitReader(stdoutPipe, maxClaudeStdoutBytes+1))
+		if stdoutBuf.Len() > maxClaudeStdoutBytes {
+			stdoutOverflow = true
+			_, _ = io.Copy(io.Discard, stdoutPipe)
+		}
 	}()
 
 	waitDone := make(chan error, 1)
@@ -108,35 +147,24 @@ func RunClaudeCLI(ctx context.Context, worktreeDir string, modelID string, promp
 		return nil, ctx.Err()
 
 	case waitErr := <-waitDone:
+		if stdoutOverflow {
+			return nil, model.Error("INVALID_OUTPUT", "claude stdout exceeded 8 MiB limit")
+		}
 		evidence, parseErr := ParseClaudeJSON(stdoutBuf.Bytes())
 		if parseErr != nil {
 			var fault *model.Fault
-			if errors.As(parseErr, &fault) {
+			if waitErr == nil || (errors.As(parseErr, &fault) && (fault.Code == "RATE_LIMIT" || fault.Code == "AUTH_REQUIRED")) {
 				return nil, parseErr
 			}
-			if waitErr != nil {
-				msg := stderrBuf.String()
-				if msg == "" {
-					msg = waitErr.Error()
-				}
-				low := strings.ToLower(msg)
-				if strings.Contains(low, "rate_limit") || strings.Contains(low, "overloaded") || strings.Contains(low, "429") || strings.Contains(low, "529") || strings.Contains(low, "too many") {
-					return nil, model.Error("RATE_LIMIT", msg)
-				}
-				if strings.Contains(low, "authentication") || strings.Contains(low, "credit balance") || strings.Contains(low, "unauthorized") || strings.Contains(low, "401") {
-					return nil, model.Error("AUTH_REQUIRED", msg)
-				}
-				return nil, model.Error("EXECUTION_FAILED", msg)
+			fallback := ""
+			if errors.As(parseErr, &fault) && evidence.Summary != "" {
+				fallback = evidence.Summary
 			}
-			return nil, parseErr
+			return nil, classifyClaudeFailure(stderrBuf.String(), fallback, waitErr)
 		}
 
-		if waitErr != nil && evidence.Summary == "" {
-			msg := stderrBuf.String()
-			if msg == "" {
-				msg = waitErr.Error()
-			}
-			return nil, model.Error("EXECUTION_FAILED", msg)
+		if waitErr != nil {
+			return nil, classifyClaudeFailure(stderrBuf.String(), "", waitErr)
 		}
 
 		res := &CLIRunResult{
@@ -147,6 +175,24 @@ func RunClaudeCLI(ctx context.Context, worktreeDir string, modelID string, promp
 		}
 		return res, nil
 	}
+}
+
+func classifyClaudeFailure(stderr, fallback string, waitErr error) error {
+	msg := strings.TrimSpace(stderr)
+	if msg == "" {
+		msg = strings.TrimSpace(fallback)
+	}
+	if msg == "" {
+		msg = waitErr.Error()
+	}
+	low := strings.ToLower(msg)
+	if strings.Contains(low, "rate_limit") || strings.Contains(low, "overloaded") || strings.Contains(low, "429") || strings.Contains(low, "529") || strings.Contains(low, "too many") {
+		return model.Error("RATE_LIMIT", msg)
+	}
+	if strings.Contains(low, "authentication") || strings.Contains(low, "credit balance") || strings.Contains(low, "unauthorized") || strings.Contains(low, "invalid_api_key") || strings.Contains(low, "401") {
+		return model.Error("AUTH_REQUIRED", msg)
+	}
+	return model.Error("EXECUTION_FAILED", msg)
 }
 
 // ParseClaudeJSON parses claude JSON output.

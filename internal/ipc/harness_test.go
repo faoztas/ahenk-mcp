@@ -6,12 +6,15 @@ package ipc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/faoztas/ahenk-mcp/internal/model"
 )
 
 type harnessRequest struct {
@@ -486,4 +489,152 @@ func TestHarnessAllowedPathsSymlinkBypassDenied(t *testing.T) {
 	}
 }
 
+func TestHarnessServerCloseWaitsForAndClosesConnections(t *testing.T) {
+	tempDir := t.TempDir()
+	worktree := filepath.Join(tempDir, "work")
+	if err := os.MkdirAll(worktree, 0700); err != nil {
+		t.Fatalf("failed to create worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "a.txt"), []byte("ok"), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
 
+	h, err := StartHarness(context.Background(), worktree, []string{"a.txt"}, 1)
+	if err != nil {
+		t.Fatalf("failed to start harness: %v", err)
+	}
+
+	conn, err := DialHarness(h.SocketPath(), 2*time.Second)
+	if err != nil {
+		_ = h.Close()
+		t.Fatalf("failed to dial harness: %v", err)
+	}
+	defer conn.Close()
+
+	// Ensure handleConn is active by sending one request and reading its response.
+	if err := json.NewEncoder(conn).Encode(harnessRequest{Tool: "read_file", Path: "a.txt"}); err != nil {
+		_ = h.Close()
+		t.Fatalf("encode: %v", err)
+	}
+	var resp harnessResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		_ = h.Close()
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Success || resp.Data != "ok" {
+		_ = h.Close()
+		t.Fatalf("unexpected resp: %+v", resp)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- h.Close()
+	}()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("HarnessServer.Close returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HarnessServer.Close hung with active idle client connection")
+	}
+
+	// Verify active client connection was closed by Close().
+	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("expected idle client connection to be closed on HarnessServer.Close")
+	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatalf("expected connection EOF/close, got timeout: %v", err)
+	}
+}
+
+func TestHarnessServer_CheckRecursionRespectsConfigEnv(t *testing.T) {
+	s := NewHarnessServer(HarnessConfig{
+		WorktreeRoot: t.TempDir(),
+		MaxDepth:     2,
+		CurrentDepth: 0,
+		Env:          []string{"AHENK_CHILD_SESSION=1", "AHENK_CHILD_DEPTH=1", "AHENK_MAX_DEPTH=1"},
+	})
+	err := s.CheckRecursion(nil)
+	if err == nil {
+		t.Fatal("expected CheckRecursion(nil) to deny based on s.cfg.Env")
+	}
+	var fault *model.Fault
+	if !errors.As(err, &fault) || fault.Gate != "RECURSIVE_DELEGATION_DENIED" {
+		t.Fatalf("expected RECURSIVE_DELEGATION_DENIED gate fault, got: %v", err)
+	}
+}
+
+func TestHarnessServer_ReadFileSizeLimit(t *testing.T) {
+	tempDir := t.TempDir()
+	worktree := filepath.Join(tempDir, "work")
+	if err := os.MkdirAll(worktree, 0700); err != nil {
+		t.Fatalf("failed to create worktree: %v", err)
+	}
+	bigFile := filepath.Join(worktree, "huge.bin")
+	// 4 MiB + 1 KiB exceeds the 4 MiB bound.
+	if err := os.WriteFile(bigFile, make([]byte, (4<<20)+1024), 0644); err != nil {
+		t.Fatalf("failed to write huge file: %v", err)
+	}
+
+	h, err := StartHarness(context.Background(), worktree, []string{"huge.bin"}, 1)
+	if err != nil {
+		t.Fatalf("failed to start harness: %v", err)
+	}
+	defer h.Close()
+
+	if _, err := h.ReadFile("huge.bin"); err == nil {
+		t.Fatal("expected ReadFile on >4 MiB file to return a bounded error")
+	}
+}
+
+func TestHarnessServer_JSONRPCErrorShape(t *testing.T) {
+	tempDir := t.TempDir()
+	worktree := filepath.Join(tempDir, "work")
+	if err := os.MkdirAll(worktree, 0700); err != nil {
+		t.Fatalf("failed to create worktree: %v", err)
+	}
+
+	h, err := StartHarness(context.Background(), worktree, []string{"hello.txt"}, 1)
+	if err != nil {
+		t.Fatalf("failed to start harness: %v", err)
+	}
+	defer h.Close()
+
+	conn, err := DialHarness(h.SocketPath(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	req := harnessRequest{
+		JSONRPC: "2.0",
+		ID:      42,
+		Method:  "read_file",
+		Params:  map[string]any{"path": "../../etc/passwd"},
+	}
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	var rpcResp struct {
+		JSONRPC string           `json:"jsonrpc"`
+		ID      any              `json:"id"`
+		Result  any              `json:"result,omitempty"`
+		Error   *HarnessRPCError `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(conn).Decode(&rpcResp); err != nil {
+		t.Fatalf("expected structured JSON-RPC error object, decode failed: %v", err)
+	}
+	if rpcResp.JSONRPC != "2.0" {
+		t.Fatalf("expected jsonrpc=2.0, got %q", rpcResp.JSONRPC)
+	}
+	if rpcResp.Error == nil {
+		t.Fatalf("expected non-nil error object in JSON-RPC response: %+v", rpcResp)
+	}
+	if rpcResp.Error.Code == 0 || rpcResp.Error.Message == "" {
+		t.Fatalf("expected populated error {code, message}, got %+v", rpcResp.Error)
+	}
+}

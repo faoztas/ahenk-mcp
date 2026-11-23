@@ -22,6 +22,7 @@ const (
 	BarAgyGemini    = "agy_gemini_5h"
 	BarAgyOpus      = "agy_opus_5d"
 	BarAgyOpus5h    = "agy_opus_5h"
+	BarAgyArgon     = "gemini-argon-wtu-weekly"
 	BarOpenCodeFree = "opencode_free_16h"
 )
 
@@ -74,7 +75,7 @@ func agyBucket(id string) (bar, family string, minutes int) {
 	case "3p-weekly":
 		return BarAgyOpus, "claude_gpt", 7200
 	case "gemini-argon-wtu-weekly":
-		return "gemini-argon-wtu-weekly", "gemini_argon", 10080
+		return BarAgyArgon, "gemini_argon", 10080
 	default:
 		return id, "", 0
 	}

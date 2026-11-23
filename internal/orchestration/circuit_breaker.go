@@ -26,7 +26,7 @@ func NormalizeProvider(provider string) string {
 	case "opencode", "opencode-native":
 		return "opencode"
 	default:
-		return provider
+		return strings.ToLower(strings.TrimSpace(provider))
 	}
 }
 
@@ -57,6 +57,9 @@ func NewCircuitBreaker() *CircuitBreaker {
 
 // Trip opens the circuit for the specified provider for duration dur.
 func (cb *CircuitBreaker) Trip(provider string, dur time.Duration) {
+	if cb == nil {
+		return
+	}
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	p := normalizeProvider(provider)
@@ -65,8 +68,27 @@ func (cb *CircuitBreaker) Trip(provider string, dur time.Duration) {
 	delete(cb.probeExpiry, p)
 }
 
+// TripUntil opens the circuit for provider until the given deadline.
+// It is a no-op if cb is nil or until is not after the current time.
+func (cb *CircuitBreaker) TripUntil(provider string, until time.Time) {
+	if cb == nil || !until.After(time.Now()) {
+		return
+	}
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	p := normalizeProvider(provider)
+	if existing, ok := cb.cooldown[p]; !ok || until.After(existing) {
+		cb.cooldown[p] = until
+	}
+	delete(cb.probing, p)
+	delete(cb.probeExpiry, p)
+}
+
 // State returns the current CircuitState for provider.
 func (cb *CircuitBreaker) State(provider string) CircuitState {
+	if cb == nil {
+		return CircuitClosed
+	}
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	p := normalizeProvider(provider)
@@ -111,6 +133,9 @@ func (cb *CircuitBreaker) IsProbing(provider string) bool {
 // In OPEN state, requests are blocked.
 // In HALF_OPEN state (after cooldown expiration), a single probe is admitted.
 func (cb *CircuitBreaker) Allow(provider string) bool {
+	if cb == nil {
+		return true
+	}
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	p := normalizeProvider(provider)
@@ -138,6 +163,9 @@ func (cb *CircuitBreaker) Allow(provider string) bool {
 
 // Release clears the probing lock for provider if it was being probed, allowing immediate retry.
 func (cb *CircuitBreaker) Release(provider string) {
+	if cb == nil {
+		return
+	}
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	p := normalizeProvider(provider)
@@ -147,6 +175,9 @@ func (cb *CircuitBreaker) Release(provider string) {
 
 // Success resets the circuit breaker for provider to CLOSED state.
 func (cb *CircuitBreaker) Success(provider string) {
+	if cb == nil {
+		return
+	}
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	p := normalizeProvider(provider)
@@ -157,6 +188,9 @@ func (cb *CircuitBreaker) Success(provider string) {
 
 // ActiveTripped returns all providers currently in OPEN or active probing state along with their deadline.
 func (cb *CircuitBreaker) ActiveTripped() map[string]time.Time {
+	if cb == nil {
+		return nil
+	}
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	now := time.Now()
