@@ -8,6 +8,8 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/faoztas/ahenk-mcp/internal/model"
 	"github.com/faoztas/ahenk-mcp/internal/orchestration"
@@ -49,7 +51,7 @@ func routedSubmit(e *orchestration.Engine, sub model.Submission) (model.Job, err
 
 func TestSubmissionIdentityReadsLegacyAndRestarts(t *testing.T) {
 	for _, kind := range []string{"legacy auto", "missing evidence", "wrong evidence", "exact legacy", "v2"} {
-		t.Run(kind, func(t *testing.T) {
+		run := func(t *testing.T) {
 			cfg := identityConfig(t)
 			cfg.Repositories["other"] = model.Repo{Root: t.TempDir(), AllowedPaths: []string{"."}}
 			sub := intent(t)
@@ -69,7 +71,8 @@ func TestSubmissionIdentityReadsLegacyAndRestarts(t *testing.T) {
 				}
 				id = j.ID
 			} else {
-				j := model.Job{ID: id, RepoID: sub.RepoID, RequestID: sub.RequestID, Task: old.Task, PolicyDigest: model.Digest(cfg.Repositories["repo"]), Status: model.Completed}
+				// Keep the completed legacy job within the retention window across restart.
+				j := model.Job{ID: id, CreatedAt: time.Now().UTC(), RepoID: sub.RepoID, RequestID: sub.RequestID, Task: old.Task, PolicyDigest: model.Digest(cfg.Repositories["repo"]), Status: model.Completed}
 				if _, err := db.Insert([]model.Job{j}, model.Digest(old)); err != nil {
 					t.Fatal(err)
 				}
@@ -88,6 +91,10 @@ func TestSubmissionIdentityReadsLegacyAndRestarts(t *testing.T) {
 			e, db = identityEngine(t, cfg)
 			defer db.Close()
 			defer e.Close()
+			// Advance the restarted engine through its first retention sweep.
+			synctest.Wait()
+			time.Sleep(time.Second)
+			synctest.Wait()
 			if kind == "exact legacy" {
 				sub = old
 			}
@@ -126,7 +133,8 @@ func TestSubmissionIdentityReadsLegacyAndRestarts(t *testing.T) {
 			if _, err := e.Submit(sub); err == nil {
 				t.Fatal("changed intent admitted")
 			}
-		})
+		}
+		t.Run(kind, func(t *testing.T) { synctest.Test(t, run) })
 	}
 }
 

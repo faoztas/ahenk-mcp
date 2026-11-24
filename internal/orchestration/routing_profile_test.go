@@ -149,7 +149,7 @@ func TestRoutingProfileReloadsLegacyAndAdmittedJobs(t *testing.T) {
 	// Captured from the staged A1 code using the validated pre-profile submission.
 	const legacyDigest = "v2:0c2947c00cf05180462a54fdbd2bd93da349fdd1df19498be55cd8b4b7f7bf14"
 	legacy := model.Job{
-		ID: "pre-profile", RepoID: legacyIntent.RepoID, RequestID: legacyIntent.RequestID, Task: legacyIntent.Task,
+		ID: "pre-profile", CreatedAt: time.Now().UTC(), RepoID: legacyIntent.RepoID, RequestID: legacyIntent.RequestID, Task: legacyIntent.Task,
 		Status: model.Completed, PolicyDigest: model.Digest(r), PlanSHA256: model.Hash([]byte(testPlan)),
 	}
 	if _, err = e.db.Insert([]model.Job{legacy}, legacyDigest); err != nil {
@@ -168,6 +168,9 @@ func TestRoutingProfileReloadsLegacyAndAdmittedJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
+	reopened.mu.Lock()
+	reopened.collect(time.Now())
+	reopened.mu.Unlock()
 	old, err := reopened.Get(legacy.ID)
 	if err != nil {
 		t.Fatal(err)

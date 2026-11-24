@@ -295,8 +295,9 @@ func TestCapacityLegacySQLiteT18(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	now := capacityClock
+	now := time.Now().UTC()
 	e, j := capacityFixture(now)
+	j.CreatedAt = now
 	j.PolicyDigest = model.Digest(e.cfg.Repositories[j.RepoID])
 	j.Status = model.Completed
 	j.Task.TaskClass = "review"
@@ -308,6 +309,9 @@ func TestCapacityLegacySQLiteT18(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restored.Close()
+	restored.mu.Lock()
+	restored.collect(time.Now())
+	restored.mu.Unlock()
 	old, err := restored.Get(j.ID)
 	if err != nil || old.Status != model.Completed || jobQualityRole(old) != "inference" {
 		t.Fatalf("legacy row changed: %+v %v", old, err)
