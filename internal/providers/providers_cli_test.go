@@ -8,11 +8,23 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/faoztas/ahenk-mcp/internal/model"
 )
+
+// registryCandidates returns every capability announced by reg that matches.
+func registryCandidates(reg Registry, match func(model.Capability) bool) []model.Capability {
+	var out []model.Capability
+	for _, candidate := range reg.Candidates {
+		if match(candidate) {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
 
 func createDummyExecutable(t *testing.T, dir, name string) string {
 	realDir, err := filepath.EvalSymlinks(dir)
@@ -329,5 +341,191 @@ exit 0
 	}
 	if outClaude.Summary != "Claude trusted patch executed" {
 		t.Errorf("expected 'Claude trusted patch executed', got %q", outClaude.Summary)
+	}
+}
+
+// TestAGYACPRemainsUnavailableWithoutApprovedRoute pins G-027 / E3.1 as a
+// decision guard: the registered AGY Headless capability stays visible, while
+// an unapproved ACP provider entry never becomes an admitted route and default
+// routing never starts an ACP process without an explicit approval/PoC gate.
+func TestAGYACPRemainsUnavailableWithoutApprovedRoute(t *testing.T) {
+	isHeadless := func(c model.Capability) bool { return c.Provider == "agy" && c.Mode == "headless" }
+	isACP := func(c model.Capability) bool { return Family(c.Provider) == "acp" || c.Provider == "agy-acp" }
+
+	base := New(model.Config{})
+	headless := registryCandidates(base, isHeadless)
+	if len(headless) == 0 {
+		t.Fatal("G-027: the registered AGY Headless capability must stay visible")
+	}
+	if headless[0].Status == "available" {
+		t.Fatalf("G-027: AGY Headless must not be admitted without its signed synthetic gate, got status %q", headless[0].Status)
+	}
+	if acp := registryCandidates(base, isACP); len(acp) != 0 {
+		t.Fatalf("G-027: the default registry must not admit ACP routes, got %+v", acp)
+	}
+
+	// ACP is only an unapproved candidate. Its command must never run as a
+	// side effect of registry construction or default routing.
+	dir := t.TempDir()
+	acpBinary := createDummyExecutable(t, dir, "agy-acp")
+	marker := filepath.Join(filepath.Dir(acpBinary), "acp-started")
+	if err := os.WriteFile(acpBinary, []byte("#!/bin/sh\n: > \""+marker+"\"\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write ACP probe: %v", err)
+	}
+
+	reg := New(model.Config{Providers: []model.ProviderConfig{
+		{ID: "acp", Path: acpBinary, Model: "acp-default", ACPCommand: acpBinary, ACPArgs: []string{"--acp"}, EnableSynthetic: true},
+		{ID: "agy-acp", Path: acpBinary, Model: agySyntheticModel, ACPCommand: acpBinary, ACPArgs: []string{"--acp"}, EnableSynthetic: true},
+	}})
+	if acp := registryCandidates(reg, isACP); len(acp) != 0 {
+		t.Fatalf("G-027: unapproved ACP config was admitted without an approval/PoC gate: %+v", acp)
+	}
+	if headless = registryCandidates(reg, isHeadless); len(headless) == 0 {
+		t.Fatal("G-027: unapproved ACP config removed the AGY Headless candidate")
+	} else if headless[0].Status == "available" {
+		t.Fatalf("G-027: unapproved ACP config admitted AGY Headless, got status %q", headless[0].Status)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	task := model.Task{Objective: "probe ACP default routing", Mode: "read_only", DataClass: "synthetic"}
+	for _, provider := range []string{"acp", "agy-acp"} {
+		synthetic := model.Capability{Provider: provider, Model: "acp-default", Status: "available", Mode: "acp"}
+		_, err := reg.Run(ctx, dir, synthetic, task, nil, nil)
+		if err == nil {
+			t.Fatalf("G-027: default routing started %s without an approved ACP route", provider)
+		}
+		if fault, ok := err.(*model.Fault); !ok || fault.Code != "POLICY_DENIED" {
+			t.Fatalf("G-027: expected POLICY_DENIED for %s, got %v", provider, err)
+		}
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatalf("G-027: the %s ACP command was executed without approval", provider)
+		}
+	}
+}
+
+// TestLocalProviderRemainsUnavailableUntilCapabilityVerified pins G-029 / E3.3
+// as a decision guard: default config plus an external binary alone never opens
+// a third local inference worker while capability, local egress boundary,
+// latency and role evidence (or a verified synthetic pass) are missing.
+func TestLocalProviderRemainsUnavailableUntilCapabilityVerified(t *testing.T) {
+	dir := t.TempDir()
+	localBinary := createDummyExecutable(t, dir, "local-inference")
+	isLocalFamily := func(c model.Capability) bool { return Family(c.Provider) == "local" }
+
+	for _, tc := range []struct {
+		name string
+		cfg  model.Config
+	}{
+		{"default config", model.Config{}},
+		{"external local binary only", model.Config{Providers: []model.ProviderConfig{
+			{ID: "ollama", Path: localBinary, Model: "llama-local"},
+		}}},
+		{"binary plus zero-cost claim", model.Config{Providers: []model.ProviderConfig{
+			{ID: "local", Path: localBinary, Model: "local-inference", Speed: "fast", EnableSynthetic: true},
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := New(tc.cfg)
+			for _, c := range reg.Candidates {
+				if isLocalFamily(c) && c.Status == "available" {
+					t.Fatalf("G-029: admitted a third local inference worker (%s/%s) without capability, egress, latency, role evidence or a verified synthetic pass",
+						c.Provider, c.Model)
+				}
+			}
+		})
+	}
+
+	// The local egress boundary is loopback-only and a non-loopback endpoint
+	// does not become a local provider.
+	for _, raw := range []string{"http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:11434"} {
+		if err := RunLocalLLM(raw); err != nil {
+			t.Errorf("G-029: loopback endpoint %q was rejected: %v", raw, err)
+		}
+	}
+	for _, raw := range []string{"https://api.example.com/v1", "http://192.168.1.20:11434", "http://10.0.0.5:11434"} {
+		err := RunLocalLLM(raw)
+		if err == nil {
+			t.Errorf("G-029: non-loopback endpoint %q was accepted without an egress boundary decision", raw)
+			continue
+		}
+		if fault, ok := err.(*model.Fault); !ok || fault.Code != "PROVIDER_STARTUP_FAILED" {
+			t.Errorf("G-029: expected PROVIDER_STARTUP_FAILED for %q, got %v", raw, err)
+		}
+	}
+
+	// Cost evidence alone is not admission: LOCAL_ONLY plus an available status
+	// still has no role, latency or synthetic capability proof.
+	localCap := model.Capability{Provider: "local", Model: "local-inference", Status: "available", Mode: "local", Cost: LocalZeroCost()}
+	if AllowsTrustedLocal(localCap) {
+		t.Fatal("G-029: LOCAL_ONLY cost evidence admitted a trusted-local worker without verified capability")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := New(model.Config{}).Run(ctx, dir, localCap,
+		model.Task{Objective: "probe local inference", Mode: "read_only", DataClass: "synthetic"}, nil, nil); err == nil {
+		t.Fatal("G-029: default routing executed an unverified local inference worker")
+	}
+}
+
+// TestCopilotStaysDisabledUntilEntitlementAndCostVerified pins G-030 / E3.4 as
+// a decision guard: copilot remains disabled (CLAUDE_ONLY_UNAVAILABLE) in
+// providers.New even when configured or paired with CodexBar copilot decode
+// support, until Claude-only role entitlement and cost policy are verified.
+func TestCopilotStaysDisabledUntilEntitlementAndCostVerified(t *testing.T) {
+	dir := t.TempDir()
+	copilotBinary := createDummyExecutable(t, dir, "copilot")
+
+	// CodexBar copilot decoding and the cheap price tier are diagnostics only;
+	// neither is worker entitlement or a verified cost policy.
+	now := time.Date(2026, 11, 12, 9, 45, 0, 0, time.UTC)
+	rows, err := decodeCodexBar(strings.NewReader(codexBar084Fixture(t, "codexbar_084_copilot.json")), "copilot", "oauth", "", now)
+	if err != nil || len(rows) != 1 || rows[0].Provider != "copilot" {
+		t.Fatalf("G-030: CodexBar copilot decode support must remain intact: rows=%+v err=%v", rows, err)
+	}
+	if FPTier("copilot", "claude-sonnet-5-5") == "" {
+		t.Fatal("G-030: copilot price tier classification must remain intact")
+	}
+
+	providers := []model.ProviderConfig{
+		{ID: "copilot", Path: copilotBinary, Model: "claude-sonnet-5-5", Speed: "fast", EnableSynthetic: true},
+	}
+	var reg Registry
+	for _, tc := range []struct {
+		name string
+		cfg  model.Config
+	}{
+		{"default config", model.Config{}},
+		{"configured copilot", model.Config{Providers: providers}},
+		{"configured copilot with CodexBar", model.Config{EnableCodexBar: true, Providers: providers}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := New(tc.cfg)
+			if tc.name == "configured copilot with CodexBar" {
+				reg = r
+			}
+			candidates := registryCandidates(r, func(c model.Capability) bool { return c.Provider == "copilot" })
+			if len(candidates) != 1 {
+				t.Fatalf("G-030: expected exactly one copilot candidate, got %+v", candidates)
+			}
+			copilot := candidates[0]
+			if copilot.Status != "disabled" || copilot.Reason != "CLAUDE_ONLY_UNAVAILABLE" {
+				t.Fatalf("G-030: copilot must stay disabled (CLAUDE_ONLY_UNAVAILABLE) until Claude-only entitlement and cost policy are verified, got status=%q reason=%q",
+					copilot.Status, copilot.Reason)
+			}
+			if copilot.Model != "" || copilot.Fingerprint != "" {
+				t.Fatalf("G-030: copilot config was partially admitted into the registry: %+v", copilot)
+			}
+			if AllowsTrustedLocal(copilot) {
+				t.Fatal("G-030: a disabled copilot candidate must not be trusted-local eligible")
+			}
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	attempt := model.Capability{Provider: "copilot", Model: "claude-sonnet-5-5", Status: "available", Mode: "cli"}
+	if _, err := reg.Run(ctx, dir, attempt, model.Task{Objective: "probe copilot", Mode: "read_only", DataClass: "synthetic"}, nil, nil); err == nil {
+		t.Fatal("G-030: copilot dispatched without verified entitlement and cost policy")
 	}
 }

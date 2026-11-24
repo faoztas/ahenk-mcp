@@ -139,6 +139,7 @@ func buildPlan(parent model.Job, repo model.Repo, summary string, now time.Time)
 			return nil, invalid
 		}
 		child := model.Job{ID: ids[i], RepoID: parent.RepoID, Parent: parent.ID, Key: s.Key, Task: t, Status: model.Created,
+			RoutingProfile: parent.RoutingProfile, RoutingProfileSource: parent.RoutingProfileSource,
 			QualityRole: routingRole(t), RoutingMode: parent.RoutingMode, CreatedAt: now, DeadlineAt: parent.DeadlineAt,
 			PolicyDigest: parent.PolicyDigest, HandoffFrom: handoff}
 		for _, dep := range s.DependsOn {

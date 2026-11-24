@@ -19,13 +19,16 @@ func TestQuotaRoutingKeepsFamiliesAndFallbackSeparate(t *testing.T) {
 	now := time.Now()
 	zero, spare, session, controller := 0.0, 75.0, 28.0, 98.0
 	e := Engine{
-		cfg: model.Config{Repositories: map[string]model.Repo{"demo": {Providers: []string{"agy", "opencode"}}}},
+		cfg: model.Config{
+			CodexBarAccountSHA256: map[string]string{"agy": model.Hash([]byte("fixture-account"))},
+			Repositories:          map[string]model.Repo{"demo": {Providers: []string{"agy", "opencode"}}},
+		},
 		reg: providers.Registry{Candidates: []model.Capability{
-			{Provider: "agy", Model: "gemini-3.8-flash-medium", Status: "available", Speed: "fast",
+			{AttestedAccount: "fixture-account", Provider: "agy", Model: "gemini-3.8-flash-medium", Status: "available", Speed: "fast",
 				Profiles: []model.ExecutionProfile{{Name: "analysis", Status: "verified"}}},
-			{Provider: "agy", Model: "gemini-4-argon", Status: "available", Speed: "fast",
+			{AttestedAccount: "fixture-account", Provider: "agy", Model: "gemini-4-argon", Status: "available", Speed: "fast",
 				Profiles: []model.ExecutionProfile{{Name: "analysis", Status: "verified"}}},
-			{Provider: "agy", Model: "claude-sonnet", Status: "available", Speed: "fast",
+			{AttestedAccount: "fixture-account", Provider: "agy", Model: "claude-sonnet", Status: "available", Speed: "fast",
 				Profiles: []model.ExecutionProfile{{Name: "analysis", Status: "verified"}}},
 			{Provider: "opencode", Model: "free", Status: "available", Speed: "fast"},
 		}},
@@ -543,7 +546,7 @@ func TestOpenCodeAccountsAndProviderAssertedSharedLimits(t *testing.T) {
 			limited := model.Attempt{Provider: "opencode", Model: modelID, OpenCodeAccount: firstAccount, Code: "RATE_LIMIT",
 				ProviderRateLimitScope: scope, FinishedAt: &now, RetryAfterMS: 120_000}
 			e.rememberOpenCodeHealth(&limited)
-			e.rememberRateLimit(model.Attempt{Provider: "fixture-b", Model: modelID, Code: "RATE_LIMIT", FinishedAt: &now})
+			e.rememberRateLimit(&model.Attempt{Provider: "fixture-b", Model: modelID, Code: "RATE_LIMIT", FinishedAt: &now})
 			if c, _ := e.route(&job, now); c.Provider != "opencode" || c.Model != modelID || c.OpenCodeAccount != secondAccount {
 				t.Fatalf("a different account or provider blocked the exact route: %+v %+v", c, job.Route)
 			}
@@ -724,8 +727,8 @@ func TestQuotaHealthNormalizationAndNonBlocking(t *testing.T) {
 	remaining75 := 75.0
 	remaining20 := 20.0
 	e.quotas["codex"] = []providers.Quota{
-		{Bucket: providers.BarCodexBurst, Remaining: &remaining75, State: "KNOWN", ObservedAt: now},
-		{Bucket: providers.BarCodexWeekly, Remaining: &remaining20, State: "KNOWN", ObservedAt: now},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarCodexBurst, Remaining: &remaining75, State: "KNOWN", ObservedAt: now},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarCodexWeekly, Remaining: &remaining20, State: "KNOWN", ObservedAt: now},
 	}
 	if h := e.HealthPercent(providers.BarCodexBurst); h != 0.75 {
 		t.Fatalf("expected health 0.75, got %v", h)
@@ -770,11 +773,11 @@ func TestHealthPercentStaleAndArgon(t *testing.T) {
 	e := &Engine{
 		quotas: map[string][]providers.Quota{
 			"codex": {
-				{Bucket: providers.BarCodexBurst, Remaining: &remZero, State: "EXHAUSTED", ObservedAt: staleAt},
+				{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarCodexBurst, Remaining: &remZero, State: "EXHAUSTED", ObservedAt: staleAt},
 			},
 			"agy": {
-				{Bucket: providers.BarAgyGemini, Remaining: &rem10, State: "KNOWN", ObservedAt: freshAt, ResetAt: &expiredReset},
-				{Bucket: providers.BarAgyArgon, Family: "gemini_argon", Remaining: &rem40, State: "KNOWN", ObservedAt: freshAt, ResetAt: &futureReset},
+				{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyGemini, Remaining: &rem10, State: "KNOWN", ObservedAt: freshAt, ResetAt: &expiredReset},
+				{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyArgon, Family: "gemini_argon", Remaining: &rem40, State: "KNOWN", ObservedAt: freshAt, ResetAt: &futureReset},
 			},
 		},
 		quotaRefreshedAt: now,
@@ -800,4 +803,74 @@ func TestHealthPercentStaleAndArgon(t *testing.T) {
 	if h := e.HealthPercent(providers.BarAgyArgon); h != 1.0 {
 		t.Fatalf("expected stale BarAgyArgon health 1.0, got %v", h)
 	}
+}
+
+func TestSharedCapacitySnapshotDistinguishesQuotaStates(t *testing.T) {
+	now := capacityClock
+	base := quotaFixture("codex", providers.BarCodexBurst, "", 300, 0, now)
+	for _, tc := range []struct {
+		name, cache, state string
+		edit               func(*providers.Quota)
+	}{
+		{"fresh", "codex", "EXHAUSTED", func(q *providers.Quota) {}},
+		{"reset", "codex", "STALE", func(q *providers.Quota) { q.ResetAt = &now }},
+		{"old", "codex", "STALE", func(q *providers.Quota) { q.ObservedAt = now.Add(-16 * time.Minute) }},
+		{"mismatch", "codex", "UNKNOWN", func(q *providers.Quota) { q.AccountMatch = "MISMATCH" }},
+		{"foreign_cache", "agy", "UNKNOWN", func(q *providers.Quota) {}},
+		{"foreign_provider", "codex", "UNKNOWN", func(q *providers.Quota) { q.Provider = "claude" }},
+		{"empty_window", "codex", "UNKNOWN", func(q *providers.Quota) { q.Remaining = nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, j := capacityFixture(now)
+			e.reg.Candidates = []model.Capability{{AttestedAccount: "fixture-account", Provider: "codex", Model: "gpt-6.1-sol", Status: "available", Speed: "fast"}}
+			e.cfg.Repositories["demo"] = model.Repo{Providers: []string{"codex"}}
+			q := base
+			tc.edit(&q)
+			e.quotas = map[string][]providers.Quota{tc.cache: {q}}
+			_, pre := e.EvaluateAutoRoute("demo", "coding", nil, j.Task, now)
+			got, _ := e.route(&j, now)
+			d := j.Route[0]
+			exhausted := tc.state == "EXHAUSTED"
+			if (pre == nil) != exhausted || (got.Provider == "") != exhausted || d.CapacityState != tc.state ||
+				!exhausted && (d.QuotaRemaining != nil || d.QuotaResetAt != nil || d.RetryAt != nil) {
+				t.Fatalf("preview=%v dispatch=%s decision=%+v", pre, got.Provider, d)
+			}
+		})
+	}
+}
+
+func TestQuotaObserverLeavesDisabledFixtureIntact(t *testing.T) {
+	now := capacityClock
+	e, _ := capacityFixture(now)
+	q := quotaFixture("codex", providers.BarCodexBurst, "", 300, 0, now)
+	e.quotas["codex"] = []providers.Quota{q}
+	e.readQuotas = func() { t.Error("disabled observer started") }
+	e.refreshQuotasAsync()
+	unavailable := providers.UnknownQuota("codex")
+	unavailable.Reason = "USAGE_UNAVAILABLE"
+	e.rememberQuota("codex", []providers.Quota{unavailable}, now.Add(time.Second))
+	got := e.quotas["codex"][0]
+	if got.Remaining == nil || *got.Remaining != 0 || !got.ObservedAt.Equal(now) {
+		t.Fatalf("failed read replaced verified sample: %+v", got)
+	}
+}
+
+func TestWorkerQuotaUsesCandidateAccount(t *testing.T) {
+	now := capacityClock
+	e, j := capacityFixture(now)
+	e.cfg.CodexBarAccountSHA256 = map[string]string{"codex": model.Hash([]byte("observed@example.invalid"))}
+	e.cfg.Repositories["demo"] = model.Repo{Providers: []string{"codex"}}
+	e.reg.Candidates = []model.Capability{{Provider: "codex", Model: "gpt-6.1-sol", Status: "available", Speed: "fast", AttestedAccountSHA256: model.Hash([]byte("other@example.invalid"))}}
+	e.quotas["codex"] = []providers.Quota{quotaFixture("codex", providers.BarCodexBurst, "", 300, 0, now)}
+	d, c := e.EvaluateAutoRoute("demo", "coding", nil, j.Task, now)
+	got, _ := e.route(&j, now)
+	if c == nil || got.Provider != "codex" || j.Route[0].QuotaRemaining != nil || d.QuotaPressure != 0 {
+		t.Fatal(d, got, j.Route)
+	}
+}
+
+func (e *Engine) rememberOpenCodeHealth(a *model.Attempt) {
+	e.openCodeHistory.Apply(a)
+	_ = e.commitOpenCodeCircuit(a, func() error { return nil })
+	e.recordOpenCodeObservation(a)
 }

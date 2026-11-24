@@ -3,6 +3,7 @@ package orchestration
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // priorityMatrices defines the deterministic 10-unique model engine priority matrix
@@ -137,7 +138,9 @@ func ValidatePriorityMatrix() error {
 // ValidateModelAdmission verifies whether a candidate model can be admitted for a given task category,
 // enforcing Claude Opus scarcity preservation and Luna strategic repositioning.
 func ValidateModelAdmission(category string, modelID string, opusHealth float64) error {
-	if modelID == "antigravity/claude-opus-5-5" {
+	provider, name, _ := strings.Cut(modelID, "/")
+	matches := func(base string) bool { return name == base || strings.HasPrefix(name, base+"-") }
+	if NormalizeProvider(provider) == "agy" && matches("claude-opus-5-5") {
 		allowed := category == "architecture" || category == "code_review" || category == "agent_orchestration"
 		if !allowed {
 			return errors.New("OPUS_SCARCITY_GATE_TASK_DENIED")
@@ -146,7 +149,7 @@ func ValidateModelAdmission(category string, modelID string, opusHealth float64)
 			return errors.New("OPUS_RESERVE_DEPLETED")
 		}
 	}
-	if modelID == "codex/gpt-6-luna" && (category == "coding" || category == "debugging") {
+	if NormalizeProvider(provider) == "codex" && matches("gpt-6-luna") && (category == "coding" || category == "debugging") {
 		return errors.New("LUNA_CODING_DENIED")
 	}
 	return nil

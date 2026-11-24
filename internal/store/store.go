@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -55,6 +56,10 @@ func Open(dir string) (*Store, error) {
 		s.Close()
 		return nil, err
 	}
+	if err := s.reconcileLegacyDispatch(); err != nil {
+		s.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -71,6 +76,25 @@ func stateDirectory(dir string) (string, error) {
 		return "", fmt.Errorf("state directory must be private and owned by the current user")
 	}
 	return actual, nil
+}
+
+// jobRecord preserves task field presence privately in the existing JSON body.
+type jobRecord struct {
+	*model.Job
+	HasComplexity bool `json:"has_complexity,omitempty"`
+}
+
+func marshalJob(j model.Job) ([]byte, error) {
+	return json.Marshal(jobRecord{Job: &j, HasComplexity: j.Task.HasComplexity})
+}
+
+func unmarshalJob(body []byte, j *model.Job) error {
+	record := jobRecord{Job: j}
+	if err := json.Unmarshal(body, &record); err != nil {
+		return err
+	}
+	j.Task.HasComplexity = record.HasComplexity || j.Task.Complexity != 0
+	return nil
 }
 
 type JobEvidence struct {
@@ -114,7 +138,7 @@ func ReadEvidence(ctx context.Context, dir string) (string, []JobEvidence, error
 		if err := rows.Scan(&body, &j.RequestID, &j.RunningAudited, &j.CompletedAudited); err != nil {
 			return "", nil, err
 		}
-		if err := json.Unmarshal(body, &j.Job); err != nil {
+		if err := unmarshalJob(body, &j.Job); err != nil {
 			return "", nil, err
 		}
 		jobs = append(jobs, j)
@@ -141,8 +165,11 @@ func (s *Store) init() error {
 	if err = s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
+	const circuitTable = `CREATE TABLE IF NOT EXISTS pruned_opencode_circuit (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1), sequence INTEGER NOT NULL, decision TEXT NOT NULL)`
 	if version == 2 {
-		return nil
+		_, err = s.db.Exec(circuitTable)
+		return err
 	}
 	if version > 2 {
 		return fmt.Errorf("unsupported state schema %d", version)
@@ -195,6 +222,9 @@ func (s *Store) init() error {
 			return err
 		}
 	}
+	if _, err = tx.Exec(circuitTable); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -212,35 +242,65 @@ func (s *Store) Insert(jobs []model.Job, digest string) (string, error) {
 // InsertWithAdmission returns an existing matching request even when new
 // submissions would fail the current admission check.
 func (s *Store) InsertWithAdmission(jobs []model.Job, digest string, admissionErr error) (string, error) {
+	id, _, err := s.InsertRouted(jobs, digest, admissionErr, nil, nil)
+	return id, err
+}
+
+type LegacyMatch func(digest string, job model.Job, first *JobRoutingAudit) bool
+
+// InsertRouted commits the first routing decision alongside the job that owns it.
+func (s *Store) InsertRouted(jobs []model.Job, digest string, admissionErr error, initial *JobRoutingAudit, legacyMatch LegacyMatch) (string, bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer tx.Rollback()
 	first := jobs[0]
 	var existing, previous string
-	err = tx.QueryRow("SELECT id,digest FROM jobs WHERE repo=? AND request=?", first.RepoID, first.RequestID).Scan(&existing, &previous)
+	var body []byte
+	err = tx.QueryRow("SELECT id,digest,body FROM jobs WHERE repo=? AND request=?", first.RepoID, first.RequestID).Scan(&existing, &previous, &body)
 	if err == nil {
-		if previous != digest {
-			return "", ErrConflict
+		if previous == digest {
+			return existing, false, nil
 		}
-		return existing, nil
+		if legacyMatch != nil && !strings.HasPrefix(previous, "v2:") {
+			var job model.Job
+			if err := unmarshalJob(body, &job); err != nil {
+				return "", false, err
+			}
+			audit, err := scanRoutingAudit(tx.QueryRow(routingAuditSelect+" WHERE job_id=? AND attempt_number=1", existing))
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return "", false, err
+			}
+			if legacyMatch(previous, job, audit) {
+				return existing, false, nil
+			}
+		}
+		return "", false, ErrConflict
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return "", err
+		return "", false, err
 	}
 	if admissionErr != nil {
-		return "", admissionErr
+		return "", false, admissionErr
 	}
 	if err := insertJobs(tx, jobs, digest); err != nil {
-		return "", err
+		return "", false, err
 	}
-	return first.ID, tx.Commit()
+	if initial != nil {
+		if err := insertRoutingAuditTx(tx, *initial); err != nil {
+			return "", false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return "", false, err
+	}
+	return first.ID, true, nil
 }
 
 func insertJobs(tx *sql.Tx, jobs []model.Job, digest string) error {
 	for _, j := range jobs {
-		b, err := json.Marshal(j)
+		b, err := marshalJob(j)
 		if err != nil {
 			return err
 		}
@@ -266,7 +326,7 @@ func (s *Store) Expand(parent model.Job, children []model.Job) error {
 		return err
 	}
 	defer tx.Rollback()
-	b, err := json.Marshal(parent)
+	b, err := marshalJob(parent)
 	if err != nil {
 		return err
 	}
@@ -303,7 +363,7 @@ func (s *Store) Save(jobs ...model.Job) error {
 	}
 	defer tx.Rollback()
 	for _, j := range jobs {
-		b, err := json.Marshal(j)
+		b, err := marshalJob(j)
 		if err != nil {
 			return err
 		}
@@ -313,12 +373,15 @@ func (s *Store) Save(jobs ...model.Job) error {
 		if err = audit(tx, j); err != nil {
 			return err
 		}
+		if err = syncTerminalRoutingAudit(tx, j); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
 
 func (s *Store) All() ([]model.Job, error) {
-	rows, err := s.db.Query("SELECT body FROM jobs ORDER BY rowid")
+	rows, err := s.db.Query("SELECT body,COALESCE(request,'') FROM jobs ORDER BY rowid")
 	if err != nil {
 		return nil, err
 	}
@@ -327,10 +390,10 @@ func (s *Store) All() ([]model.Job, error) {
 	for rows.Next() {
 		var b []byte
 		var j model.Job
-		if err := rows.Scan(&b); err != nil {
+		if err := rows.Scan(&b, &j.RequestID); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal(b, &j); err != nil {
+		if err := unmarshalJob(b, &j); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, j)
@@ -339,6 +402,39 @@ func (s *Store) All() ([]model.Job, error) {
 }
 
 func (s *Store) Delete(id string) error {
-	_, err := s.db.Exec("DELETE FROM jobs WHERE id=?", id)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Keep the newest accepted decision even when its job and audit rows expire.
+	_, err = tx.Exec(`INSERT INTO pruned_opencode_circuit(singleton,sequence,decision)
+        SELECT 1, attempt.value ->> '$.opencode_circuit.sequence', attempt.value -> '$.opencode_circuit'
+        FROM jobs, json_each(jobs.body,'$.attempts') AS attempt
+        WHERE jobs.id=? AND attempt.value ->> '$.provider'='opencode'
+          AND attempt.value ->> '$.finished_at' IS NOT NULL
+          AND attempt.value ->> '$.opencode_circuit.sequence' > 0
+        ORDER BY 2 DESC LIMIT 1
+        ON CONFLICT(singleton) DO UPDATE SET sequence=excluded.sequence, decision=excluded.decision
+        WHERE excluded.sequence>pruned_opencode_circuit.sequence`, id)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec("DELETE FROM jobs WHERE id=?", id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) PrunedOpenCodeCircuit() (model.OpenCodeCircuitDecision, error) {
+	var d model.OpenCodeCircuitDecision
+	var body []byte
+	err := s.db.QueryRow("SELECT decision FROM pruned_opencode_circuit WHERE singleton=1").Scan(&body)
+	if errors.Is(err, sql.ErrNoRows) {
+		return d, nil
+	}
+	if err == nil {
+		err = json.Unmarshal(body, &d)
+	}
+	return d, err
 }

@@ -345,6 +345,21 @@ func (r *Registry) configureCLI(p model.ProviderConfig) {
 			})
 		}
 	}
+	// An account observation belongs to the configured worker. A provider-wide
+	// default must not overwrite a model-specific worker's attestation.
+	for i := range r.Candidates {
+		candidate := &r.Candidates[i]
+		if candidate.Provider != provider || candidate.Fingerprint != fp || r.cliPath(provider, candidate.Model) != canonicalPath {
+			continue
+		}
+		if p.Model != "" && candidate.Model != p.Model || p.Model == "" && r.cliPaths[provider+"\x00"+candidate.Model] != "" {
+			continue
+		}
+		candidate.AttestedAccount, candidate.AttestedAccountSHA256 = "", ""
+		if p.ExpectedBinarySHA256 == "" || p.ExpectedBinarySHA256 == fp {
+			candidate.AttestedAccount, candidate.AttestedAccountSHA256 = p.AttestedAccount, p.AttestedAccountSHA256
+		}
+	}
 }
 
 func (r Registry) cliPath(provider, modelID string) string {
@@ -494,11 +509,8 @@ func (r Registry) RunTrustedLocal(ctx context.Context, dir, work string, c model
 		if modelID == "" {
 			modelID = r.codex.Model
 		}
-		effort := t.TargetEffort
-		if effort == "" {
-			effort = "medium"
-		}
-		res, err := RunCodexCLI(ctx, work, modelID, effort, t.Objective, SandboxModeWorkspaceWrite, r.cliPath("codex", modelID))
+		effort := AdapterEffort(c, t)
+		res, err := runCodexCLI(ctx, work, modelID, effort, t.Objective, SandboxModeWorkspaceWrite, r.cliPath("codex", modelID))
 		if err != nil {
 			return execution.FixtureInput{}, err
 		}
@@ -508,7 +520,7 @@ func (r Registry) RunTrustedLocal(ctx context.Context, dir, work string, c model
 		if modelID == "" {
 			modelID = r.claude.Model
 		}
-		res, err := RunClaudeCLIWithEffort(ctx, work, modelID, t.TargetEffort, t.Objective, SandboxModeWorkspaceWrite, r.cliPath("claude", modelID))
+		res, err := RunClaudeCLIWithEffort(ctx, work, modelID, AdapterEffort(c, t), t.Objective, SandboxModeWorkspaceWrite, r.cliPath("claude", modelID))
 		if err != nil {
 			return execution.FixtureInput{}, err
 		}
@@ -557,6 +569,20 @@ func (r Registry) RunPrivate(ctx context.Context, dir string, c model.Capability
 }
 
 func (r Registry) Run(ctx context.Context, dir string, c model.Capability, t model.Task, contextFiles map[string]string, handoffs []model.Handoff) (execution.FixtureInput, error) {
+	return r.RunWithFixtureHarness(ctx, dir, c, t, contextFiles, handoffs, nil)
+}
+
+// UsesFixtureHarness selects an explicit, deterministic synthetic worker.
+func UsesFixtureHarness(c model.Capability, t model.Task) bool {
+	return c.Provider == "fixture-a" && c.Mode == "fixture" && c.Model == "synthetic" && c.Status == "available" &&
+		t.PreferredProvider == c.Provider && t.DataClass == "synthetic" && t.ExecutionProfile == "implementation" &&
+		t.Mode == "patch" && t.Objective == "fixture:harness"
+}
+
+func (r Registry) RunWithFixtureHarness(ctx context.Context, dir string, c model.Capability, t model.Task, contextFiles map[string]string, handoffs []model.Handoff, endpoint *execution.FixtureHarness) (execution.FixtureInput, error) {
+	if (endpoint != nil) != UsesFixtureHarness(c, t) || (endpoint != nil && len(handoffs) != 0) {
+		return execution.FixtureInput{}, model.Error("POLICY_DENIED", "fixture harness requires a standalone synthetic implementation")
+	}
 	if t.DataClass == model.PrivateSourceData {
 		return execution.FixtureInput{}, model.Error("PRIVATE_SOURCE_ROUTE_DENIED", "private source requires an operator grant")
 	}
@@ -581,11 +607,8 @@ func (r Registry) Run(ctx context.Context, dir string, c model.Capability, t mod
 		if modelID == "" {
 			modelID = r.codex.Model
 		}
-		effort := t.TargetEffort
-		if effort == "" {
-			effort = "medium"
-		}
-		res, err := RunCodexCLI(ctx, dir, modelID, effort, t.Objective, sb, r.cliPath("codex", modelID))
+		effort := AdapterEffort(c, t)
+		res, err := runCodexCLI(ctx, dir, modelID, effort, t.Objective, sb, r.cliPath("codex", modelID))
 		if err != nil {
 			return execution.FixtureInput{}, err
 		}
@@ -600,7 +623,7 @@ func (r Registry) Run(ctx context.Context, dir string, c model.Capability, t mod
 		if modelID == "" {
 			modelID = r.claude.Model
 		}
-		res, err := RunClaudeCLIWithEffort(ctx, dir, modelID, t.TargetEffort, t.Objective, sb, r.cliPath("claude", modelID))
+		res, err := RunClaudeCLIWithEffort(ctx, dir, modelID, AdapterEffort(c, t), t.Objective, sb, r.cliPath("claude", modelID))
 		if err != nil {
 			return execution.FixtureInput{}, err
 		}
@@ -631,6 +654,9 @@ func (r Registry) Run(ctx context.Context, dir string, c model.Capability, t mod
 	}
 	if c.Mode != "fixture" || c.Status != "available" {
 		return execution.FixtureInput{}, model.Error("POLICY_DENIED", "live execution requires verified permission and cost evidence")
+	}
+	if endpoint != nil {
+		return execution.RunFixture(ctx, dir, execution.FixtureInput{Harness: endpoint})
 	}
 	return r.runFixture(ctx, dir, c, t, contextFiles, handoffs)
 }
@@ -731,4 +757,73 @@ func hashReader(r io.Reader) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+// AdapterEffort returns the value expressed by this transport. AGY variants
+// encode their fixed effort in the model name and take no separate flag.
+func AdapterEffort(c model.Capability, task model.Task) string {
+	switch c.Provider {
+	case "codex":
+		if task.RoutingProfile != "" && !slices.Contains(defaultCodexModels, c.Model) {
+			return ""
+		}
+		return sanitizeCodexEffort(task.TargetEffort)
+	case "claude":
+		if task.RoutingProfile != "" && !slices.Contains(defaultClaudeModels, c.Model) {
+			return ""
+		}
+		return sanitizeClaudeEffort(task.TargetEffort)
+	case "agy":
+		for _, level := range []string{"low", "medium", "high"} {
+			if strings.HasSuffix(c.Model, "-"+level) {
+				return level
+			}
+		}
+	}
+	return ""
+}
+
+// MatchesCostReceipt compares observed identity fields to the selected route.
+func MatchesCostReceipt(c model.Capability, t model.Task) bool {
+	if c.Cost == nil || c.Cost.VerifiedRoute == nil || c.Fingerprint == "" || c.Model == "" {
+		return false
+	}
+	expected := model.CostRoute{
+		Provider: c.Provider, Model: c.Model, Fingerprint: c.Fingerprint, Adapter: c.Mode,
+		Transport: c.OpenCodeTransport, Endpoint: c.OpenCodeEndpoint, Account: c.Cost.Account, Scope: t.AttemptScope(),
+	}
+	return *c.Cost.VerifiedRoute == expected
+}
+
+// VerifiedIncludedRoute requires a runtime receipt bound to this worker account.
+// AGY's documented credit protection alone does not prove the effective charge.
+func VerifiedIncludedRoute(c model.Capability, t model.Task) bool {
+	cost := c.Cost
+	if !MatchesCostReceipt(c, t) || cost.Policy != "SUBSCRIPTION_ONLY" || cost.Status != "ZERO_COST_VERIFIED" ||
+		cost.Documented != "VERIFIED" || cost.RuntimeVerified != "VERIFIED" || cost.Account == "" {
+		return false
+	}
+	if matches, _ := (model.PrivateRoute{ExpectedAccount: cost.Account}).AccountMatches(c); !matches {
+		return false
+	}
+	switch c.Provider {
+	case "agy":
+		return c.Mode == "headless" && AGYWorkerIdentityMatches(c.Model, c.Fingerprint) && AllowsAGYProfile(c, t) &&
+			slices.ContainsFunc(c.Profiles, func(p model.ExecutionProfile) bool {
+				return p.Name == agyExecutionProfile(c, t) && p.Status == "verified"
+			})
+	case "claude", "codex":
+		// CLI discovery has no subscription receipt by default.
+		return c.Mode == "cli" && c.Model != "" && t.DataClass == "synthetic" && t.Mode == "read_only" &&
+			slices.Contains([]string{"", "analysis", "restricted"}, t.ExecutionProfile)
+	}
+	return false
+}
+
+// FreeRouteIdentity binds a cost observation to the anonymous OpenCode adapter.
+func FreeRouteIdentity(c model.Capability) bool {
+	accountMatches, _ := (model.PrivateRoute{ExpectedAccount: model.OpenCodeAnonymous}).AccountMatches(c)
+	return c.Provider == "opencode" && c.Mode == "tool_free" && OpenCodeIdentityMatches(c.Model, c.Fingerprint) &&
+		accountMatches && c.OpenCodeAccount == model.OpenCodeAnonymous && c.OpenCodeEndpoint == model.OpenCodeFreeEndpoint &&
+		(openCodeTransportMatches(c.Model, c.OpenCodeTransport) || c.AuditValidUntil != nil && c.OpenCodeTransport == model.OpenCodeNativeReadAsk)
 }

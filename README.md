@@ -59,15 +59,14 @@ cp examples/ahenk.fixture.json "$demo_dir/ahenk.json"
 printf 'Repository: %s\nState: %s\nConfiguration: %s\n' "$demo_dir/repo" "$demo_dir/state" "$demo_dir/ahenk.json"
 ```
 
-## Connect Codex App
+## Connect Codex or Claude Code
 
-Add the following to `~/.codex/config.toml` or a trusted project's `.codex/config.toml`. Use absolute paths to the binary and edited configuration, then reconnect the MCP server. Call `list_capabilities` for `repo_id: "demo"` to confirm that the scheduler and fixture routes are available. [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=app#configure-with-configtoml)
+Replace the placeholders in each client example with the same absolute path to the Ahenk binary and the same absolute path to your local `ahenk.json`. The JSON file's `state_dir` is shared by both clients. Keep each path as one string, including any spaces. Both clients launch the executable directly and pass each array element as one argument.
 
-```toml
-[mcp_servers.ahenk]
-command = "/absolute/path/to/ahenk-mcp/bin/ahenk"
-args = ["serve", "--stdio", "--config", "/absolute/path/to/ahenk.json"]
-```
+- **Codex.** Add the example table to `~/.codex/config.toml` or a trusted project's `.codex/config.toml`, then reconnect the server. [Codex example](examples/codex-ahenk.toml) · [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=app#configure-with-configtoml)
+- **Claude Code.** Save the example as `.mcp.json` at the project root, or merge `mcpServers.ahenk` into the existing file. Start Claude Code interactively, review the command and config path, then approve the project server when prompted. Keep the edited copy with local paths private. [Claude Code example](examples/claude-ahenk.mcp.json) · [Claude Code project servers](https://code.claude.com/docs/en/mcp#project-scope)
+
+Review the repository and provider permissions in `ahenk.json` before enabling the server in either client. For the offline fixture, call `list_capabilities` with `{"repo_id":"demo"}` to confirm the scheduler and fixture routes are available. The repository ID refers to the registration in `ahenk.json`, so these calls work from different client working directories.
 
 Submit this example with `delegate_task`.
 
@@ -96,8 +95,8 @@ Provider opt-in is separate from repository permission. The live pilots require 
 
 - **AGY.** `ahenk probe-agy --config FILE` checks the audited binary, signature, and official `/usage` output. The synthetic pilot uses signed AGY 1.5.3 or 1.5.4 and `gemini-3.8-flash-medium`. Version-specific evidence determines the allowed profile. It requires fresh Gemini subscription windows and checks model, workspace, agent, and permission mode before sending the prompt. Ahenk disables automatic updates and requests `useG1Credits:false`. The CLI does not attest the effective runtime credit setting.
 - **OpenCode.** Use `ahenk probe-opencode-catalog` to inspect the pinned OpenCode 2.2.6 binary's isolated catalog. Use `--public` for the public catalog. Configure an exact supported `opencode/<model>` ID, the audited App binary path and SHA-256, and `enable_synthetic: true`. Each attempt starts a fresh worker on loopback. The read-only native route rejects permission requests and results containing tool calls. A zero-price catalog entry alone does not establish supported execution or live capacity.
-- **CodexBar.** `ahenk decode-quota --provider codex` (also `antigravity` or `copilot`) normalizes a usage export from stdin without emitting account identifiers. `enable_codexbar` enables live polling of the pinned local binary. For account binding, set `codexbar_account_sha256` keys `codex` and `agy` to the SHA-256 of the independently verified, trimmed, lowercase account email. Leave a binding unset if the working session cannot be independently identified. `ahenk probe-codexbar --config FILE --provider codex` (or `agy`) checks the effective source and match without starting the scheduler.
-- **Capacity policy.** The optional `capacity_policy` object defaults to `{"mode":"quality_first","agy_weekly_min_remaining_pct_while_codex_available":15,"codex_low_pct":20,"codex_critical_pct":10}`. `balanced` gives latency more weight. `conserve` favors lower usage within the same verified quality tier. Tasks can select a mode through `strategy`. CodexBar polls every five minutes and Codex is a controller signal only. Each AGY family has a separate reserve, a bounded dispatch buffer, and a native subscription quota check before a prompt. Unknown Codex capacity keeps the reserve in place.
+- **CodexBar.** `ahenk decode-quota --provider codex` (also `antigravity` or `copilot`) normalizes a usage export from stdin without emitting account identifiers. `enable_codexbar` enables live polling of the pinned local binary. For live account binding, `codexbar_account_sha256` accepts `codex` and `agy`. Set each configured key to the SHA-256 of its independently verified, trimmed, lowercase account email. Leave a binding unset if the working session cannot be independently identified. `ahenk probe-codexbar --config FILE --provider codex` (or `agy`) checks the effective source and match without starting the scheduler.
+- **Capacity policy.** The optional `capacity_policy` object defaults to `{"mode":"quality_first","agy_weekly_min_remaining_pct_while_codex_available":15,"codex_low_pct":20,"codex_critical_pct":10}`. `balanced` gives latency more weight. `conserve` favors lower usage within the same verified quality tier. Tasks can select a mode through `strategy`. When CodexBar is enabled, Ahenk refreshes its cached quota snapshot every 60 seconds. Codex is a controller signal only. Each AGY family has a separate reserve, a bounded dispatch buffer, and a native subscription quota check before a prompt. Unknown Codex capacity keeps the reserve in place.
 - **Capacity warnings.** `list_capabilities` with `include_quota:true` returns the normalized controller, AGY, and OpenCode Free capacity alongside the existing quota fields. Supply `repo_id` for a scoped utility routing preview. Job responses include stable warning IDs and route evidence when relevant. Use `model_audit_file` for the discovered model inventory. Inference evidence admits scoped read-only work. Explicit architecture, planning, reasoning, and research requests require evidence for the requested role. A repository can allow a task-scoped reserve exception with `allow_agy_weekly_reserve_override:true` and a short `agy_weekly_reserve_override` justification on that task. The exception preserves cost, account, exhaustion, and review checks.
 
 ## Quota-aware routing
@@ -109,6 +108,54 @@ A standalone synthetic read-only `delegate_task` can set `opencode_recheck:true`
 For a qualified synthetic role, set `task_class` to `architecture`, `planning`, `reasoning`, or `research`. A standalone synthetic read-only task with `role_calibration:true` and an exact preferred route can run the built-in four-role fixture under ordinary quota and cost policy. Durable passing evidence remains bound to that route.
 
 `ahenk import-opencode-cooldown --config FILE --from-state DIR` reads prior cooldown evidence from an idle state directory without modifying its database or WAL. SQLite may use its shared-memory sidecar. Repeat `--from-state` to inspect multiple sources.
+
+### Repository routing presets and one-job overrides
+
+Run these commands locally with the same config and repository ID used by both MCP clients.
+
+```sh
+config="/absolute/path/to/ahenk.json"
+ahenk routing get --config "$config" --repo demo
+ahenk routing set --config "$config" --repo demo quality
+```
+
+The available profiles are `price_performance`, `quality`, and `price`. The new preset applies to later submissions from open sessions. In order of precedence, Ahenk uses the explicit request profile, the batch profile, the operator preset, the repository's `default_routing_profile`, and the legacy routing policy. Repository scope, provider eligibility, quota, and cost policy still apply.
+
+After setting `quality`, submit a synthetic one-job override through Ahenk's `delegate_task`.
+
+```json
+{
+  "repo_id": "demo",
+  "request_id": "demo-override",
+  "target": {"provider": "auto"},
+  "objective": "Inspect fixture.txt",
+  "acceptance": [{"id": "inspect", "description": "Summarize the fixture"}],
+  "allowed_paths": ["fixture.txt"],
+  "mode": "read_only",
+  "data_class": "synthetic",
+  "routing_profile": "price",
+  "execution_mode": "wait"
+}
+```
+
+Price requires verified free or subscription-included cost evidence for an eligible route. Without that evidence, the job returns `NOT_RUN` and starts no worker. The next job inherits `quality` if you omit `routing_profile`. Give that job a fresh request ID such as `demo-auto`. When retrying the same submission, reuse its original request ID and job input to recover the original job, including after reconnecting.
+
+For independent background jobs, set `execution_mode` to `async` and pass the returned IDs to `wait_jobs`. Use `delegate_batch` for dependencies and verified handoffs. A batch can set a profile for its items, and an item can override that profile. Use `get_job_result` to inspect the outcome and `get_routing_audit` to read the effective profile and source, first decision, and execution attempts for the job.
+
+```sh
+ahenk routing get --config "$config" --repo demo
+ahenk routing reset --config "$config" --repo demo
+```
+
+Reset removes the operator preset and returns the repository to its configured or legacy default. To change the same preference in a browser, run `ahenk routing web --config "$config" --repo demo` in an interactive terminal, then open the local address and enter the displayed one-time code.
+
+In Codex, add this example to the project's `AGENTS.md`.
+
+> For approved, scoped delegation, call Ahenk's MCP `delegate_task` with the registered repo ID, allowed paths, and a stable request ID. Use automatic routing and leave `routing_profile` unset unless the operator requests a one-job override. Check the result and routing audit before using the output.
+
+In Claude Code, add this example to the project's `CLAUDE.md`.
+
+> Use the project Ahenk MCP server for approved, scoped delegation. Submit via `delegate_task` with the registered repo ID and a stable request ID. For background calls, pass the job IDs to Ahenk's `wait_jobs`. Leave `routing_profile` unset to inherit the repository preset, and verify any returned artifact before using it.
 
 ### Model audits and continuation
 
@@ -124,7 +171,7 @@ A batch can order jobs with `depends_on` and pass a verified predecessor's `diff
 
 For a high-level synthetic objective, add `"decompose": true` to `delegate_task`. Ahenk selects a planning-qualified model, validates a graph of one to eight steps, and routes the steps through the same scheduler. The planner cannot change approved paths, provider eligibility, checks, or execution permissions. For patch jobs, a single implementation step keeps the original acceptance criteria. Critical changes and repositories that require review must include a separate reviewer that receives the verified diff. Inspect the parent’s route for the plan hash and retrieve diffs, checks and verdicts from its child jobs.
 
-One stdio process owns a state directory. A second connection reports `state_busy`. On shutdown, Ahenk stops workers. A later connection can resume an eligible job against its original snapshot and deadline. A missing worker lease or cleanup marker quarantines the attempt and can block dispatch.
+One stdio process owns a state directory. Additional clients using that directory connect to the owner over a local Unix socket. If the owner exits, reconnect to initialize a new MCP session. On shutdown, Ahenk stops workers. A later connection can resume an eligible job against its original snapshot and deadline. A missing worker lease or cleanup marker quarantines the attempt and can block dispatch.
 
 ### Trusted-local synthetic Go tasks
 

@@ -211,8 +211,19 @@ func (t Task) privateWriteAllowed(p *PrivateSourcePolicy) bool {
 func (r PrivateRoute) AccountMatches(c Capability) (bool, string) {
 	want := strings.TrimSpace(r.ExpectedAccount)
 	wantSHA := strings.ToLower(strings.TrimSpace(r.ExpectedAccountSHA256))
+	actual := strings.TrimSpace(c.AttestedAccount)
+	actualSHA := strings.ToLower(strings.TrimSpace(c.AttestedAccountSHA256))
+	if actual == "" && c.Provider == "opencode" {
+		actual = strings.TrimSpace(c.OpenCodeAccount)
+	}
+	if actual != "" && actualSHA != "" && !accountDigestMatches(actual, actualSHA) {
+		return false, "ACCOUNT_MISMATCH"
+	}
 	if want == "" && wantSHA == "" {
 		if c.Provider == "opencode" && c.OpenCodeAccount == OpenCodeAnonymous {
+			if actual != OpenCodeAnonymous {
+				return false, "ACCOUNT_MISMATCH"
+			}
 			return true, ""
 		}
 		if c.Mode == "fixture" {
@@ -220,11 +231,6 @@ func (r PrivateRoute) AccountMatches(c Capability) (bool, string) {
 		}
 		return false, "ACCOUNT_ATTESTATION_REQUIRED"
 	}
-	actual := strings.TrimSpace(c.AttestedAccount)
-	if actual == "" && c.Provider == "opencode" {
-		actual = strings.TrimSpace(c.OpenCodeAccount)
-	}
-	actualSHA := strings.ToLower(strings.TrimSpace(c.AttestedAccountSHA256))
 	if actual == "" && actualSHA == "" {
 		return false, "ACCOUNT_ATTESTATION_REQUIRED"
 	}
@@ -233,7 +239,7 @@ func (r PrivateRoute) AccountMatches(c Capability) (bool, string) {
 			if !strings.EqualFold(actual, want) {
 				return false, "ACCOUNT_MISMATCH"
 			}
-		} else if actualSHA != Hash([]byte(strings.ToLower(want))) && actualSHA != Hash([]byte(want)) {
+		} else if !accountDigestMatches(want, actualSHA) {
 			return false, "ACCOUNT_MISMATCH"
 		}
 	}
@@ -242,11 +248,15 @@ func (r PrivateRoute) AccountMatches(c Capability) (bool, string) {
 			if actualSHA != wantSHA {
 				return false, "ACCOUNT_MISMATCH"
 			}
-		} else if Hash([]byte(strings.ToLower(actual))) != wantSHA && Hash([]byte(actual)) != wantSHA {
+		} else if !accountDigestMatches(actual, wantSHA) {
 			return false, "ACCOUNT_MISMATCH"
 		}
 	}
 	return true, ""
+}
+
+func accountDigestMatches(account, digest string) bool {
+	return digest == Hash([]byte(strings.ToLower(account))) || digest == Hash([]byte(account))
 }
 
 func (p *PrivateSourcePolicy) RouteDecision(c Capability, t Task, now time.Time) (bool, string) {

@@ -81,12 +81,12 @@ func TestOpusDualWindowScarcityMin(t *testing.T) {
 	h10 := 10.0 // depleted (<= 20)
 	h80 := 80.0
 
-	// Case 1: 5h is healthy (80%), weekly is depleted (10%) -> HealthPercent should return 0.10
+	// Case 1: 5h is healthy (80%), weekly is depleted (10%) -> the admission guard uses 0.10
 	e.quotas["agy"] = []providers.Quota{
-		{Bucket: providers.BarAgyOpus5h, Remaining: &h80, ObservedAt: now},
-		{Bucket: providers.BarAgyOpus, Remaining: &h10, ObservedAt: now},
+		{AccountMatch: "MATCHED", Unit: "percent", State: "KNOWN", Bucket: providers.BarAgyOpus5h, Remaining: &h80, ObservedAt: now},
+		{AccountMatch: "MATCHED", Unit: "percent", State: "KNOWN", Bucket: providers.BarAgyOpus, Remaining: &h10, ObservedAt: now},
 	}
-	health := e.HealthPercent(providers.BarAgyOpus)
+	health := e.opusAdmissionHealth(now)
 	if health != 0.10 {
 		t.Fatalf("expected min health 0.10, got %v", health)
 	}
@@ -94,12 +94,12 @@ func TestOpusDualWindowScarcityMin(t *testing.T) {
 		t.Fatalf("expected OPUS_RESERVE_DEPLETED when weekly window is depleted")
 	}
 
-	// Case 2: 5h is depleted (10%), weekly is healthy (80%) -> HealthPercent should return 0.10
+	// Case 2: 5h is depleted (10%), weekly is healthy (80%) -> the admission guard uses 0.10
 	e.quotas["agy"] = []providers.Quota{
-		{Bucket: providers.BarAgyOpus5h, Remaining: &h10, ObservedAt: now},
-		{Bucket: providers.BarAgyOpus, Remaining: &h80, ObservedAt: now},
+		{AccountMatch: "MATCHED", Unit: "percent", State: "KNOWN", Bucket: providers.BarAgyOpus5h, Remaining: &h10, ObservedAt: now},
+		{AccountMatch: "MATCHED", Unit: "percent", State: "KNOWN", Bucket: providers.BarAgyOpus, Remaining: &h80, ObservedAt: now},
 	}
-	health = e.HealthPercent(providers.BarAgyOpus)
+	health = e.opusAdmissionHealth(now)
 	if health != 0.10 {
 		t.Fatalf("expected min health 0.10, got %v", health)
 	}
@@ -109,10 +109,10 @@ func TestOpusDualWindowScarcityMin(t *testing.T) {
 
 	// Case 3: Both windows healthy (50% and 80%) -> min health is 0.50, admission passes
 	e.quotas["agy"] = []providers.Quota{
-		{Bucket: providers.BarAgyOpus5h, Remaining: &h50, ObservedAt: now},
-		{Bucket: providers.BarAgyOpus, Remaining: &h80, ObservedAt: now},
+		{AccountMatch: "MATCHED", Unit: "percent", State: "KNOWN", Bucket: providers.BarAgyOpus5h, Remaining: &h50, ObservedAt: now},
+		{AccountMatch: "MATCHED", Unit: "percent", State: "KNOWN", Bucket: providers.BarAgyOpus, Remaining: &h80, ObservedAt: now},
 	}
-	health = e.HealthPercent(providers.BarAgyOpus)
+	health = e.opusAdmissionHealth(now)
 	if health != 0.50 {
 		t.Fatalf("expected min health 0.50, got %v", health)
 	}

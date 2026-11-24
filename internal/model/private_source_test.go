@@ -128,6 +128,82 @@ func TestPrivateSourceExactEgress(t *testing.T) {
 	}
 }
 
+func TestPrivateDispatchGrantRequiresCurrentExactIdentity(t *testing.T) {
+	const path = "internal/example.go"
+	const content = "package example\n"
+	const account = "owner@example.test"
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		change   func(*PrivateSourcePolicy, *Task, *Capability)
+		wantGate string
+	}{
+		{"exact grant", func(*PrivateSourcePolicy, *Task, *Capability) {}, ""},
+		{"matching account digest", func(_ *PrivateSourcePolicy, _ *Task, c *Capability) {
+			c.AttestedAccountSHA256 = Hash([]byte(account))
+		}, ""},
+		{"provider mismatch", func(_ *PrivateSourcePolicy, _ *Task, c *Capability) { c.Provider = "opencode" }, "PRIVATE_SOURCE_ROUTE_DENIED"},
+		{"provider alias mismatch", func(_ *PrivateSourcePolicy, _ *Task, c *Capability) { c.Provider = "antigravity" }, "PRIVATE_SOURCE_ROUTE_DENIED"},
+		{"requested alias mismatch", func(_ *PrivateSourcePolicy, task *Task, _ *Capability) { task.PreferredProvider = "antigravity" }, "PRIVATE_SOURCE_ROUTE_DENIED"},
+		{"model mismatch", func(_ *PrivateSourcePolicy, _ *Task, c *Capability) { c.Model = "different-model" }, "PRIVATE_SOURCE_ROUTE_DENIED"},
+		{"account mismatch", func(_ *PrivateSourcePolicy, _ *Task, c *Capability) { c.AttestedAccount = "other@example.test" }, "ACCOUNT_MISMATCH"},
+		{"account attestation missing", func(_ *PrivateSourcePolicy, _ *Task, c *Capability) { c.AttestedAccount = "" }, "ACCOUNT_ATTESTATION_REQUIRED"},
+		{"conflicting account digest", func(_ *PrivateSourcePolicy, _ *Task, c *Capability) {
+			c.AttestedAccountSHA256 = Hash([]byte("other@example.test"))
+		}, "ACCOUNT_MISMATCH"},
+		{"binary drift", func(_ *PrivateSourcePolicy, _ *Task, c *Capability) { c.Fingerprint = Hash([]byte("different binary")) }, "BINARY_CHANGED"},
+		{"expired at dispatch", func(p *PrivateSourcePolicy, _ *Task, _ *Capability) { p.ExpiresAt = now }, "GRANT_EXPIRED"},
+		{"owner consent revoked", func(p *PrivateSourcePolicy, _ *Task, _ *Capability) { *p.OwnerConsent = false }, "OWNER_CONSENT_REQUIRED"},
+		{"unapproved path", func(_ *PrivateSourcePolicy, task *Task, _ *Capability) {
+			task.AllowedPaths = []string{"internal/unapproved.go"}
+		}, "PATH_NOT_APPROVED"},
+		{"synthetic data class", func(_ *PrivateSourcePolicy, task *Task, _ *Capability) { task.DataClass = "synthetic" }, "PRIVATE_SOURCE_ROUTE_DENIED"},
+		{"critical read-only risk", func(_ *PrivateSourcePolicy, task *Task, _ *Capability) { task.Risk = "critical" }, "PRIVATE_SOURCE_ROUTE_DENIED"},
+		{"data handling unreviewed", func(p *PrivateSourcePolicy, _ *Task, _ *Capability) { p.Routes[0].DataHandlingReviewed = false }, "DATA_HANDLING_UNREVIEWED"},
+		{"context digest revoked", func(p *PrivateSourcePolicy, _ *Task, _ *Capability) {
+			p.Files[path] = Hash([]byte("package example // newly approved\n"))
+		}, "DIGEST_MISMATCH"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := Task{Objective: "Summarize the approved file", Acceptance: []Check{{ID: "summary", Description: "Give one fact"}},
+				Mode: "read_only", DataClass: PrivateSourceData, AllowedPaths: []string{path}}
+			route := PrivateRoute{Provider: "agy", Model: "gemini-3.8-flash-medium", Fingerprint: Hash([]byte("approved binary")),
+				ExpectedAccount: account, DataHandlingReviewed: true}
+			consent := true
+			policy := &PrivateSourcePolicy{OwnerConsent: &consent, ExpiresAt: now.Add(time.Hour), Routes: []PrivateRoute{route},
+				Files: map[string]string{path: Hash([]byte(content))}, Briefs: []string{PrivateBriefDigest(task.Objective, task.Acceptance)}}
+			capability := Capability{Provider: route.Provider, Model: route.Model, Fingerprint: route.Fingerprint,
+				AttestedAccount: account, Status: "available"}
+			tc.change(policy, &task, &capability)
+
+			calls := 0
+			// Apply the model gates in the same order as Registry.RunPrivate,
+			// with a spy in place of the worker and a fixed dispatch clock.
+			dispatch := func() string {
+				if ok, gate := policy.RouteDecision(capability, task, now); !ok {
+					return gate
+				}
+				if fault := policy.CheckRequest(task, now); fault != nil {
+					return fault.Gate
+				}
+				if fault := policy.CheckContext(task.AllowedPaths, map[string]string{path: content}); fault != nil {
+					return fault.Gate
+				}
+				calls++
+				return ""
+			}
+			gate := dispatch()
+			wantCalls := 0
+			if tc.wantGate == "" {
+				wantCalls = 1
+			}
+			if gate != tc.wantGate || calls != wantCalls {
+				t.Fatalf("dispatch gate = %q, worker calls = %d; want %q and %d", gate, calls, tc.wantGate, wantCalls)
+			}
+		})
+	}
+}
+
 func TestPrivateStatePhysicalOverlap(t *testing.T) {
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -219,4 +295,17 @@ func TestPrivateRouteAccountMatchesCanonicalAndCaseInsensitive(t *testing.T) {
 			t.Fatalf("expected ACCOUNT_MISMATCH, got (%t, %q)", ok, gate)
 		}
 	})
+}
+
+func TestOpenCodeAccountFallbackChecksAttestation(t *testing.T) {
+	c := Capability{Provider: "opencode", OpenCodeAccount: OpenCodeAnonymous, AttestedAccountSHA256: Hash([]byte("different"))}
+	for _, grant := range []PrivateRoute{{}, {ExpectedAccount: OpenCodeAnonymous}, {ExpectedAccountSHA256: c.AttestedAccountSHA256}} {
+		if ok, gate := grant.AccountMatches(c); ok || gate != "ACCOUNT_MISMATCH" {
+			t.Error("conflicting fallback digest accepted", grant)
+		}
+	}
+	c.AttestedAccountSHA256 = Hash([]byte(OpenCodeAnonymous))
+	if ok, _ := (PrivateRoute{}).AccountMatches(c); !ok {
+		t.Fatal("valid anonymous fallback denied")
+	}
 }

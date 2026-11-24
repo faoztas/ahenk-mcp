@@ -5,6 +5,7 @@ package orchestration
 
 import (
 	"cmp"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -43,7 +44,10 @@ func (e *Engine) lastWorkerResults(c model.Capability) (success, failure time.Ti
 				continue
 			}
 			if (a.Code == "" || a.Code == "CHECKPOINT_READY") && a.FinishedAt.After(success) &&
-				(a.AGY != nil && a.AGY.TerminalVerified || a.OpenCode != nil && a.OpenCode.TerminalVerified) {
+				(a.Provider == "agy" && a.AGY != nil && a.AGY.TerminalVerified ||
+					a.Provider == "opencode" && a.OpenCode != nil && a.OpenCode.TerminalVerified ||
+					a.Provider == "codex" && a.Codex != nil && a.Codex.TerminalVerified ||
+					a.Provider == "claude" && a.Claude != nil && a.Claude.TerminalVerified) {
 				success = *a.FinishedAt
 			}
 			if a.Code != "" && a.Code != "CHECKPOINT_READY" && a.FinishedAt.After(failure) {
@@ -73,9 +77,7 @@ func normalizedQuota(q providers.Quota, policy model.CapacityPolicy) providers.Q
 	q.State = quotaState(q, policy)
 	if q.State == "UNKNOWN" || q.State == "STALE" {
 		q.Remaining = nil
-		if q.AccountMatch != "MATCHED" {
-			q.ResetAt = nil
-		}
+		q.ResetAt = nil
 	}
 	return q
 }
@@ -88,25 +90,28 @@ func (e *Engine) capacitySnapshot(now time.Time, repoID string) CapacitySnapshot
 	out := CapacitySnapshot{Codex: []providers.Quota{normalizedQuota(five, policy), normalizedQuota(weekly, policy)},
 		AGY: []providers.Quota{}, OpenCode: []providers.Quota{}}
 	for _, q := range codex {
+		if q.Provider != "" && q.Provider != "codex" {
+			continue
+		}
 		if strings.HasPrefix(q.Bucket, "extra:") || q.WindowMinutes > 0 && q.Bucket != five.Bucket && q.Bucket != weekly.Bucket {
 			out.Codex = append(out.Codex, normalizedQuota(q.At(now), policy))
 		}
 	}
 	for _, family := range []string{"gemini", "claude_gpt", "gemini_argon"} {
-		reserve := e.agyReserve(model.Job{RepoID: repoID}, family, now, 2*time.Minute, weekly)
+		reserve := e.agyReserve(model.Job{RepoID: repoID}, family, now, 2*time.Minute, weekly, true)
 		for _, id := range providers.AGYFamilyBuckets(family) {
 			q := providers.UnknownQuota("agy")
-			q.Bucket, q.Family, q.WindowMinutes = id, family, 300
-			if strings.HasSuffix(id, "weekly") {
-				q.WindowMinutes = weeklyMinutes
+			q.Bucket, q.Family, q.WindowMinutes = observerBucket(id), family, 300
+			if long, minutes := providers.AGYLongWindow(family); q.Bucket == long {
+				q.WindowMinutes = minutes
 			}
 			for _, observed := range e.quotas["agy"] {
-				if observed.Bucket == id && observed.Family == family {
+				if (observed.Provider == "" || observed.Provider == "agy") && observerBucket(observed.Bucket) == observerBucket(id) && observed.Family == family {
 					q = observed.At(now)
 					break
 				}
 			}
-			if reserve.reason == reserveReason && reserve.weekly.Bucket == id {
+			if reserve.reason == reserveReason && observerBucket(reserve.weekly.Bucket) == observerBucket(id) {
 				q = reserve.weekly
 				q.State = "PROTECTED_RESERVE"
 			} else {
@@ -190,8 +195,14 @@ func (e *Engine) capacitySnapshot(now time.Time, repoID string) CapacitySnapshot
 // controller and every AGY model family.
 func capacityHeadroom(e *Engine, now time.Time, five, weekly providers.Quota) []HeadroomResult {
 	out := []HeadroomResult{}
+	if !verifiedQuota(five) {
+		five.Remaining = nil
+	}
+	if !verifiedQuota(weekly) {
+		weekly.Remaining = nil
+	}
 	if five.Remaining != nil || weekly.Remaining != nil {
-		h := ComputeHeadroom(&five, &weekly)
+		h := computeHeadroomAt(&five, &weekly, now)
 		h.Family = "codex"
 		out = append(out, h)
 	}
@@ -204,16 +215,26 @@ func capacityHeadroom(e *Engine, now time.Time, five, weekly providers.Quota) []
 }
 
 func (e *Engine) Capacity(repoID string) (CapacitySnapshot, []model.CapacityWarning, []model.Decision) {
+	cfg := e.routingPreferenceConfig()
+	stateDir, _ := routingPreferenceState(cfg)
+	var previews []model.Job
+	addPreview := func(id string) {
+		profile, _, _ := ResolveDefaultRoutingProfile(stateDir, id, cfg.Repositories[id])
+		previews = append(previews, model.Job{RepoID: id, RoutingProfile: profile})
+	}
+	if repoID != "" {
+		addPreview(repoID)
+	} else {
+		for _, id := range slices.Sorted(maps.Keys(cfg.Repositories)) {
+			addPreview(id)
+		}
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := time.Now().UTC()
 	var routes []model.Decision
-	if repoID != "" {
-		routes = e.previewRoute(model.Job{RepoID: repoID}, now)
-	} else {
-		for id := range e.cfg.Repositories {
-			routes = append(routes, e.previewRoute(model.Job{RepoID: id}, now)...)
-		}
+	for _, preview := range previews {
+		routes = append(routes, e.previewRoute(preview, now)...)
 	}
 	return e.capacitySnapshot(now, repoID), e.capacityWarnings("", routes, "CAPABILITY_CHECK", now), routes
 }

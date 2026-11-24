@@ -163,7 +163,7 @@ func currentEvidence(cfg model.Config, jobs []store.JobEvidence) map[string]stor
 	current := make(map[string]store.JobEvidence, len(jobs))
 	for _, j := range jobs {
 		repo, ok := cfg.Repositories[j.RepoID]
-		if ok && model.ValidID(j.ID) && j.PolicyDigest == model.Digest(repo) {
+		if ok && model.ValidID(j.ID) && j.PolicyDigest == repo.PolicyDigest() {
 			current[j.ID] = j
 		}
 	}

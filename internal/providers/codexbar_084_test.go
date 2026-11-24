@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/faoztas/ahenk-mcp/internal/model"
 )
 
 // codexBar084Fixture reads one of the recorded 0.84.0 dashboard exports.
@@ -82,11 +84,12 @@ func TestDecodeCodexBar084CopilotAndClaude(t *testing.T) {
 	if err != nil || len(rows) != 1 || rows[0].State != "EXHAUSTED" || *rows[0].Remaining != 0 || rows[0].Provider != "copilot" {
 		t.Fatalf("wrong copilot windows: %+v %v", rows, err)
 	}
-	// Claude: session and weekly windows are decoded like Codex.
-	rows, err = decodeCodexBar(strings.NewReader(codexBar084Fixture(t, "codexbar_084_claude.json")), "claude", "oauth", "", now)
+	// Claude: session and weekly windows require an exact account binding.
+	account := model.Hash([]byte("fixture@example.invalid"))
+	rows, err = decodeCodexBar(strings.NewReader(codexBar084Fixture(t, "codexbar_084_claude.json")), "claude", "oauth", account, now)
 	if err != nil || len(rows) != 2 ||
-		rows[0].Bucket != "primary" || *rows[0].Remaining != 77.5 ||
-		rows[1].Bucket != "secondary" || *rows[1].Remaining != 91.7 || rows[1].Provider != "claude" {
+		rows[0].Bucket != "primary" || rows[0].Remaining == nil || *rows[0].Remaining != 77.5 ||
+		rows[1].Bucket != "secondary" || rows[1].Remaining == nil || *rows[1].Remaining != 91.7 || rows[1].Provider != "claude" {
 		t.Fatalf("wrong claude windows: %+v %v", rows, err)
 	}
 }

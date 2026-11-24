@@ -7,11 +7,13 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/faoztas/ahenk-mcp/internal/execution"
+	"github.com/faoztas/ahenk-mcp/internal/ipc"
 	"github.com/faoztas/ahenk-mcp/internal/model"
 	"github.com/faoztas/ahenk-mcp/internal/providers"
 )
@@ -65,7 +67,11 @@ func (e *Engine) runSubagentImplementation(ctx context.Context, dir string, c mo
 	if c.Provider == "codex" || c.Provider == "claude" {
 		runDir = w.Dir
 	}
-	out, err = e.reg.Run(ctx, runDir, c, t, files, handoffs)
+	if providers.UsesFixtureHarness(c, t) {
+		out, err = e.runHarnessFixture(ctx, dir, w, c, t, snapshot, files, handoffs)
+	} else {
+		out, err = e.reg.Run(ctx, runDir, c, t, files, handoffs)
+	}
 	if err != nil || out.Failure != "" {
 		return out, nil, checks, err
 	}
@@ -138,70 +144,59 @@ func (e *Engine) runSubagentImplementation(ctx context.Context, dir string, c mo
 	return out, &result, checks, nil
 }
 
+// The socket lifetime ends before worktree collection and independent verification.
+func (e *Engine) runHarnessFixture(ctx context.Context, dir string, w *execution.Worktree, c model.Capability,
+	t model.Task, snapshot execution.Snapshot, files map[string]string, handoffs []model.Handoff,
+) (out execution.FixtureInput, err error) {
+	if !model.InScope("fixture.txt", t.AllowedPaths) {
+		return out, model.Error("POLICY_DENIED", "fixture.txt is outside the task scope")
+	}
+	// The attempt directory basename contains both the job ID and attempt number.
+	attemptID := filepath.Base(dir)
+	h, err := ipc.StartHarnessWithConfig(ctx, ipc.HarnessConfig{
+		WorktreeRoot: w.Dir, SocketPath: w.HarnessSocketPath(), AllowedPaths: []string{"fixture.txt"},
+		AttemptID: attemptID, CurrentDepth: 1, MaxDepth: 1, ReadOnly: t.Mode != "patch",
+		Checks: map[string]ipc.HarnessCheck{"source-unchanged": func(ctx context.Context) error {
+			ok, err := execution.VerifySnapshot(ctx, snapshot)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return model.Error("SNAPSHOT_CHANGED", "fixture source changed")
+			}
+			return nil
+		}},
+	})
+	if err != nil {
+		return out, err
+	}
+	defer func() {
+		if closeErr := h.Close(); closeErr != nil {
+			err = errors.Join(err, execution.ErrCleanup, closeErr)
+		}
+	}()
+	out, err = e.reg.RunWithFixtureHarness(ctx, dir, c, t, files, handoffs, &execution.FixtureHarness{SocketPath: h.SocketPath(), AttemptID: attemptID})
+	if err != nil || out.Failure != "" {
+		return out, err
+	}
+	if !h.IsFinished() || !h.IsSuccess() || out.Patch != "" {
+		return out, model.Error("INVALID_OUTPUT", "fixture harness did not complete a worktree edit")
+	}
+	out.Summary = h.Summary()
+	return out, nil
+}
+
+// Production has no verified private writer backend. Only package tests
+// inject a synthetic executor at construction to exercise artifact acceptance.
+type privateWriteExecutor func(*Engine, context.Context, string, model.Capability, model.Task, execution.Snapshot, map[string]string, []model.Handoff, *model.PrivateSourcePolicy) (execution.FixtureInput, *execution.WorktreeResult, []model.CheckEvidence, error)
+
 func (e *Engine) runPrivateWriteImplementation(ctx context.Context, dir string, c model.Capability, t model.Task,
 	snapshot execution.Snapshot, files map[string]string, handoffs []model.Handoff, policy *model.PrivateSourcePolicy,
 ) (out execution.FixtureInput, collected *execution.WorktreeResult, checks []model.CheckEvidence, err error) {
-	writerVerified := policy != nil && policy.WriterIsolationVerified
-	if policy == nil || !writerVerified || !policy.AllowWrite || len(policy.GoChecks) == 0 {
-		return out, nil, nil, model.GateError("POLICY_DENIED", "WRITER_ISOLATION_UNVERIFIED", "private write requires verified writer isolation and registered Go checks", "verify_writer_isolation_and_enable_allow_write")
+	if e.privateWriter == nil {
+		return out, nil, nil, model.GateError("POLICY_DENIED", "WRITER_ISOLATION_UNVERIFIED", "private writer has no verified host isolation backend", "verify_host_isolation")
 	}
-	for _, criterion := range t.Acceptance {
-		id := criterion.CheckID
-		if id != "" && !slices.ContainsFunc(checks, func(check model.CheckEvidence) bool { return check.ID == id }) {
-			checks = append(checks, model.CheckEvidence{ID: id, Test: policy.GoChecks[id], Status: model.NotRun, ExitStatus: -1})
-		}
-	}
-	if len(checks) == 0 {
-		return out, nil, nil, model.GateError("POLICY_DENIED", "DETERMINISTIC_CHECK_NOT_CONFIGURED", "private write requires a registered Go check", "configure_registered_go_check_for_private_patch")
-	}
-	tool, err := execution.GoCheckTool()
-	if err != nil {
-		return out, nil, checks, err
-	}
-	w, err := execution.PrepareWorktree(ctx, dir, snapshot, t)
-	if err != nil {
-		return out, nil, checks, err
-	}
-	defer func() {
-		if cleanupErr := w.Close(); cleanupErr != nil {
-			err = errors.Join(err, cleanupErr)
-		}
-	}()
-	out, err = e.reg.RunPrivate(ctx, dir, c, t, files, handoffs, policy)
-	if err != nil || out.Failure != "" {
-		return out, nil, checks, err
-	}
-	if err = w.ApplyPatch(ctx, []byte(out.Patch)); err != nil {
-		return out, nil, checks, err
-	}
-	result, err := w.Collect(ctx, e.scratch)
-	if err != nil {
-		return out, nil, checks, err
-	}
-	if !result.SourceUnchanged {
-		return out, nil, checks, model.Error("SNAPSHOT_CHANGED", "source changed during the private worktree attempt")
-	}
-	verifiedChecks, err := execution.RunGoChecks(ctx, dir, w.Dir, tool, checks)
-	if err != nil {
-		return out, nil, checks, err
-	}
-	if len(verifiedChecks) != len(checks) {
-		return out, nil, checks, model.Error("CHECK_FAILED", "registered Go check evidence is incomplete")
-	}
-	for i, check := range verifiedChecks {
-		if check.ID != checks[i].ID || check.Test != checks[i].Test || check.Status != "PASSED" || check.ExitStatus != 0 {
-			return out, nil, verifiedChecks, model.Error("CHECK_FAILED", "a registered Go check did not pass")
-		}
-	}
-	after, err := w.Collect(ctx, e.scratch)
-	if err != nil {
-		return out, nil, verifiedChecks, err
-	}
-	if after.ArtifactSHA256 != result.ArtifactSHA256 || !after.SourceUnchanged {
-		return out, nil, verifiedChecks, model.Error("SNAPSHOT_CHANGED", "Go verification changed the worktree or source")
-	}
-	out.Patch = string(after.Patch)
-	return out, &after, verifiedChecks, nil
+	return e.privateWriter(e, ctx, dir, c, t, snapshot, files, handoffs, policy)
 }
 
 func (e *Engine) runTrustedImplementation(ctx context.Context, dir string, c model.Capability, t model.Task,

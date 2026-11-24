@@ -4,11 +4,14 @@
 package providers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/faoztas/ahenk-mcp/internal/model"
 )
@@ -255,4 +258,505 @@ func TestAllowsAGYProfileRestrictedPatchRequiresM2A(t *testing.T) {
 	if !AllowsAGYProfile(capM2A, patchTask) || !AllowsAGYProfile(capM2A, explicitRestrictedPatch) {
 		t.Fatal("expected M2A agy153 model to allow restricted patch task")
 	}
+}
+
+func TestAGYChildEvidenceRejectsMissingOrForeignTerminal(t *testing.T) {
+	const root = "/fixture"
+	policy := AGYPolicy{
+		Root:                         root,
+		Agent:                        agyNativeParent,
+		Profile:                      "native_child",
+		NativeChildRole:              agyNativeChild,
+		ChildAndMessageScopeVerified: true,
+		Tools:                        []string{"invoke_subagent", "send_message"},
+	}
+	initLine := `{"event":"init","conversation_id":"main","init":{"cwd":"/fixture","model":"` + agySyntheticModel + `","agent":"` + agyNativeParent + `","permission_mode":"request-review","tools":["invoke_subagent","send_message","finish"]}}`
+	invokeActive := `{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"tool","state":"ACTIVE","tool_name":"invoke_subagent","tool_info":{"name":"invoke_subagent","parameters":{"subagent_type":"` + agyNativeChild + `","workspace":"inherit"}}}}`
+	invokeActiveChild := `{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"subagent","state":"ACTIVE","subagent_info":{"subagents":[{"type_name":"` + agyNativeChild + `","conversation_id":"child-1","workspace_uris":["file:///fixture"]}]}}}`
+	invokeDone := `{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"subagent","state":"DONE","subagent_info":{"subagents":[{"type_name":"` + agyNativeChild + `","conversation_id":"child-1","workspace_uris":["file:///fixture"]}]}}}`
+	childFinish := `{"event":"step_update","step_update":{"conversation_id":"child-1","step_type":"finish","state":"DONE","tool_info":{"parameters":{"summary":"42"}}}}`
+	parentDone := `{"event":"result","result":{"conversation_id":"main","status":"SUCCESS","structured_output":{"summary":"42"},"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}`
+
+	runStream := func(t *testing.T, events ...string) (AGYResult, *model.AGYRunEvidence, error) {
+		t.Helper()
+		payload := strings.Join(events, "\n")
+		script := `printf '%s\n' "$1"; IFS= read -r first || exit 0
+case "$first" in *'"event":"user"'*'"content":"child-fixture"'*) ;; *) exit 2;; esac
+if [ -n "$2" ]; then printf '%s\n' "$2"; IFS= read -r extra && exit 3; fi
+exit 0`
+		cmd := exec.Command("/bin/sh", "-c", script, "worker", initLine, payload)
+		ev := &model.AGYRunEvidence{
+			Cost: &model.CostEvidence{Status: "DOCUMENTED_COST_PROTECTION", Documented: "VERIFIED"},
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		out, err := runAGYStream(ctx, cmd, agySyntheticModel, policy, "child-fixture", ev)
+		return out, ev, err
+	}
+
+	t.Run("valid parent and child completion", func(t *testing.T) {
+		events := []string{invokeActive, invokeDone, childFinish, parentDone}
+		if res, err := ParseAGY([]byte(strings.Join(append([]string{initLine}, events...), "\n")), nil, agySyntheticModel, policy); err != nil || res.Session != "main" {
+			t.Fatalf("ParseAGY rejected valid parent+child completion: %+v, %v", res, err)
+		}
+		_, ev, err := runStream(t, events...)
+		if err != nil {
+			t.Fatalf("runAGYStream rejected valid parent+child completion: %v", err)
+		}
+		if !ev.StartupVerified || !ev.TerminalVerified || ev.NativeChild == nil || !ev.NativeChild.ChildFinished ||
+			ev.NativeChild.ParentSHA256 != model.Hash([]byte("main")) ||
+			ev.NativeChild.ChildSHA256 != model.Hash([]byte("child-1")) ||
+			ev.NativeChild.ResultSHA256 != model.Hash([]byte("42")) ||
+			ev.ObservedTools["invoke_subagent"] != 1 {
+			t.Fatalf("incomplete native child evidence: %+v", ev)
+		}
+	})
+
+	for _, tc := range []struct {
+		name          string
+		events        []string
+		wantCode      string
+		wantReason    string
+		wantChildLink string
+		wantRejected  string
+	}{
+		{
+			name:          "identityless subagent error without children metadata",
+			events:        []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"subagent","state":"ERROR"}}`},
+			wantCode:      "INVALID_OUTPUT",
+			wantReason:    "AGY_CHILD_INVOCATION_ERROR",
+			wantChildLink: "CHILD_METADATA_MISSING_OR_MULTIPLE",
+			wantRejected:  "invoke_subagent",
+		},
+		{
+			name:          "identityless subagent error with empty child conversation_id",
+			events:        []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"subagent","state":"ERROR","subagent_info":{"subagents":[{"type_name":"` + agyNativeChild + `","workspace_uris":["file:///fixture"]}]}}}`},
+			wantCode:      "INVALID_OUTPUT",
+			wantReason:    "AGY_CHILD_INVOCATION_ERROR",
+			wantChildLink: "CHILD_ID_MISSING",
+			wantRejected:  "invoke_subagent",
+		},
+		{
+			name:          "child invocation timeout without children metadata",
+			events:        []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"subagent","state":"ERROR","text_delta":"deadline exceeded"}}`},
+			wantCode:      "ATTEMPT_TIMEOUT",
+			wantReason:    "AGY_CHILD_TIMEOUT",
+			wantChildLink: "CHILD_METADATA_MISSING_OR_MULTIPLE",
+			wantRejected:  "invoke_subagent",
+		},
+		{
+			name:       "error_message timeout",
+			events:     []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_type":"error_message","state":"DONE","text_delta":"child timeout"}}`},
+			wantCode:   "ATTEMPT_TIMEOUT",
+			wantReason: "AGY_STEP_ERROR",
+		},
+		{
+			name:         "wrong workspace uri",
+			events:       []string{strings.ReplaceAll(invokeDone, "file:///fixture", "file:///outside"), childFinish, parentDone},
+			wantCode:     "PERMISSION_DENIED",
+			wantReason:   "AGY_CHILD_WORKSPACE_URI_DENIED",
+			wantRejected: "invoke_subagent",
+		},
+		{
+			name:         "wrong workspace mode parameter",
+			events:       []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"tool","state":"DONE","tool_name":"invoke_subagent","tool_info":{"name":"invoke_subagent","parameters":{"workspace_mode":"branch"}},"subagent_info":{"subagents":[{"type_name":"` + agyNativeChild + `","conversation_id":"child-1","workspace_uris":["file:///fixture"]}]}}}`, childFinish, parentDone},
+			wantCode:     "PERMISSION_DENIED",
+			wantReason:   "AGY_CHILD_WORKSPACE_INVALID",
+			wantRejected: "invoke_subagent",
+		},
+		{
+			name:         "conflicting workspace aliases",
+			events:       []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"tool","state":"DONE","tool_name":"invoke_subagent","tool_info":{"name":"invoke_subagent","parameters":{"workspace_mode":"inherit","workspace":"branch"}},"subagent_info":{"subagents":[{"type_name":"` + agyNativeChild + `","conversation_id":"child-1","workspace_uris":["file:///fixture"]}]}}}`, childFinish, parentDone},
+			wantCode:     "PERMISSION_DENIED",
+			wantReason:   "AGY_CHILD_WORKSPACE_CONFLICT",
+			wantRejected: "invoke_subagent",
+		},
+		{
+			name:         "conflicting workspace aliases reversed order",
+			events:       []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"tool","state":"DONE","tool_name":"invoke_subagent","tool_info":{"name":"invoke_subagent","parameters":{"workspace_mode":"branch","workspace":"inherit"}},"subagent_info":{"subagents":[{"type_name":"` + agyNativeChild + `","conversation_id":"child-1","workspace_uris":["file:///fixture"]}]}}}`, childFinish, parentDone},
+			wantCode:     "PERMISSION_DENIED",
+			wantReason:   "AGY_CHILD_WORKSPACE_CONFLICT",
+			wantRejected: "invoke_subagent",
+		},
+		{
+			name:         "conflicting duplicate workspace json keys",
+			events:       []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"tool","state":"DONE","tool_name":"invoke_subagent","tool_info":{"name":"invoke_subagent","parameters":{"workspace_mode":"branch","workspace_mode":"inherit"}},"subagent_info":{"subagents":[{"type_name":"` + agyNativeChild + `","conversation_id":"child-1","workspace_uris":["file:///fixture"]}]}}}`, childFinish, parentDone},
+			wantCode:     "PERMISSION_DENIED",
+			wantReason:   "AGY_CHILD_WORKSPACE_CONFLICT",
+			wantRejected: "invoke_subagent",
+		},
+		{
+			name:         "conflicting non-string and inherit workspace aliases",
+			events:       []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"tool","state":"DONE","tool_name":"invoke_subagent","tool_info":{"name":"invoke_subagent","parameters":{"workspace_mode":123,"workspace":"inherit"}},"subagent_info":{"subagents":[{"type_name":"` + agyNativeChild + `","conversation_id":"child-1","workspace_uris":["file:///fixture"]}]}}}`, childFinish, parentDone},
+			wantCode:     "PERMISSION_DENIED",
+			wantReason:   "AGY_CHILD_WORKSPACE_CONFLICT",
+			wantRejected: "invoke_subagent",
+		},
+		{
+			name:         "conflicting null and empty workspace aliases",
+			events:       []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"tool","state":"DONE","tool_name":"invoke_subagent","tool_info":{"name":"invoke_subagent","parameters":{"workspace_mode":null,"workspace":""}},"subagent_info":{"subagents":[{"type_name":"` + agyNativeChild + `","conversation_id":"child-1","workspace_uris":["file:///fixture"]}]}}}`, childFinish, parentDone},
+			wantCode:     "PERMISSION_DENIED",
+			wantReason:   "AGY_CHILD_WORKSPACE_CONFLICT",
+			wantRejected: "invoke_subagent",
+		},
+		{
+			name:         "empty workspace mode parameter",
+			events:       []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"tool","state":"DONE","tool_name":"invoke_subagent","tool_info":{"name":"invoke_subagent","parameters":{"workspace_mode":""}},"subagent_info":{"subagents":[{"type_name":"` + agyNativeChild + `","conversation_id":"child-1","workspace_uris":["file:///fixture"]}]}}}`, childFinish, parentDone},
+			wantCode:     "PERMISSION_DENIED",
+			wantReason:   "AGY_CHILD_WORKSPACE_INVALID",
+			wantRejected: "invoke_subagent",
+		},
+		{
+			name:         "missing child id on completion",
+			events:       []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"subagent","state":"DONE","subagent_info":{"subagents":[{"type_name":"` + agyNativeChild + `","workspace_uris":["file:///fixture"]}]}}}`, childFinish, parentDone},
+			wantCode:     "INVALID_OUTPUT",
+			wantReason:   "AGY_CHILD_ID_MISSING",
+			wantRejected: "invoke_subagent",
+		},
+		{
+			name:         "multiple children on completion",
+			events:       []string{`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"subagent","state":"DONE","subagent_info":{"subagents":[{"type_name":"` + agyNativeChild + `","conversation_id":"child-1","workspace_uris":["file:///fixture"]},{"type_name":"` + agyNativeChild + `","conversation_id":"child-2","workspace_uris":["file:///fixture"]}]}}}`, childFinish, parentDone},
+			wantCode:     "PERMISSION_DENIED",
+			wantReason:   "AGY_CHILD_MULTIPLE_CHILDREN",
+			wantRejected: "invoke_subagent",
+		},
+		{
+			name:         "duplicate invoke_subagent completion before child finish",
+			events:       []string{invokeActive, invokeDone, invokeDone, childFinish, parentDone},
+			wantCode:     "INVALID_OUTPUT",
+			wantReason:   "AGY_CHILD_INVOCATION_DUPLICATE",
+			wantRejected: "invoke_subagent",
+		},
+		{
+			name:         "duplicate invoke_subagent completion after child finish",
+			events:       []string{invokeActive, invokeDone, childFinish, invokeDone, parentDone},
+			wantCode:     "INVALID_OUTPUT",
+			wantReason:   "AGY_CHILD_INVOCATION_DUPLICATE",
+			wantRejected: "invoke_subagent",
+		},
+		{
+			name:         "foreign child terminal step",
+			events:       []string{invokeDone, strings.ReplaceAll(childFinish, `"child-1"`, `"foreign-child"`), parentDone},
+			wantCode:     "PERMISSION_DENIED",
+			wantReason:   "AGY_UNOWNED_SESSION",
+			wantRejected: "finish",
+		},
+		{
+			name:       "foreign child terminal result event",
+			events:     []string{invokeDone, childFinish, strings.ReplaceAll(parentDone, `"conversation_id":"main"`, `"conversation_id":"child-1"`)},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_TERMINAL_REJECTED",
+		},
+		{
+			name:       "child finishes without completed invoke_subagent",
+			events:     []string{invokeActiveChild, childFinish, parentDone},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_RESULT_UNVERIFIED",
+		},
+		{
+			name:       "parent result without child completion",
+			events:     []string{invokeDone, parentDone},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_RESULT_UNVERIFIED",
+		},
+		{
+			name:       "mismatched result digest",
+			events:     []string{invokeDone, childFinish, strings.ReplaceAll(parentDone, `"summary":"42"`, `"summary":"99"`)},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_DIGEST_MISMATCH",
+		},
+		{
+			name:       "conflicting second child finish",
+			events:     []string{invokeDone, childFinish, strings.ReplaceAll(childFinish, `"summary":"42"`, `"summary":"99"`), strings.ReplaceAll(parentDone, `"summary":"42"`, `"summary":"99"`)},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_RESULT_UNVERIFIED",
+		},
+		{
+			name:         "post-finish child response with summaryless second child finish",
+			events:       []string{invokeDone, childFinish, `{"event":"step_update","step_update":{"conversation_id":"child-1","step_type":"agent_response","state":"DONE","text_delta":"99"}}`, `{"event":"step_update","step_update":{"conversation_id":"child-1","step_type":"finish","state":"DONE"}}`, parentDone},
+			wantCode:     "INVALID_OUTPUT",
+			wantReason:   "AGY_CHILD_RESULT_UNVERIFIED",
+			wantRejected: "finish",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("ParseAGY", func(t *testing.T) {
+				if _, parseErr := ParseAGY([]byte(strings.Join(append([]string{initLine}, tc.events...), "\n")), nil, agySyntheticModel, policy); parseErr == nil {
+					t.Fatalf("ParseAGY unexpectedly accepted %s", tc.name)
+				} else {
+					var parseFault *model.Fault
+					if !errors.As(parseErr, &parseFault) || parseFault.Code != tc.wantCode || parseFault.ProviderReason != tc.wantReason {
+						t.Fatalf("ParseAGY fault = %+v, want %s/%s", parseErr, tc.wantCode, tc.wantReason)
+					}
+				}
+			})
+
+			t.Run("runAGYStream", func(t *testing.T) {
+				_, ev, err := runStream(t, tc.events...)
+				var fault *model.Fault
+				if !errors.As(err, &fault) || fault.Code != tc.wantCode || fault.ProviderReason != tc.wantReason {
+					t.Fatalf("runAGYStream fault = %+v, want %s/%s", err, tc.wantCode, tc.wantReason)
+				}
+				if ev.TerminalVerified {
+					t.Fatalf("rejected child evidence must not mark TerminalVerified: %+v", ev)
+				}
+				if tc.wantChildLink != "" && (ev.LastEvent == nil || ev.LastEvent.ChildLink != tc.wantChildLink) {
+					t.Fatalf("ChildLink = %+v, want %q", ev.LastEvent, tc.wantChildLink)
+				}
+				if tc.wantRejected != "" && ev.RejectedStep != tc.wantRejected {
+					t.Fatalf("RejectedStep = %q, want %q", ev.RejectedStep, tc.wantRejected)
+				}
+			})
+		})
+	}
+}
+
+func TestAGYNativeAcceptanceRequiresLiveChildEvidence(t *testing.T) {
+	parentHash := model.Hash([]byte("main"))
+	childHash := model.Hash([]byte("child-1"))
+	resultHash := model.Hash([]byte("42"))
+
+	valid := func() AGYNativeChildAcceptance {
+		return AGYNativeChildAcceptance{
+			ExpectedParentHash: parentHash,
+			ExpectedResultHash: resultHash,
+			CleanupVerified:    true,
+			Evidence: model.AGYRunEvidence{
+				Profile:                   "native_child",
+				Model:                     agySyntheticModel,
+				PermissionMode:            "request-review",
+				SubscriptionQuotaVerified: true,
+				StartupVerified:           true,
+				PromptSent:                true,
+				TerminalVerified:          true,
+				InputTokens:               10,
+				OutputTokens:              5,
+				TotalTokens:               15,
+				ObservedTools:             map[string]int{"invoke_subagent": 1},
+				Cost: &model.CostEvidence{
+					Policy:     "SUBSCRIPTION_ONLY",
+					Status:     "DOCUMENTED_COST_PROTECTION",
+					Documented: "VERIFIED",
+				},
+				NativeChild: &model.NativeChildEvidence{
+					ParentSHA256:  parentHash,
+					ChildSHA256:   childHash,
+					ChildFinished: true,
+					ResultSHA256:  resultHash,
+				},
+			},
+		}
+	}
+
+	if err := ValidateAGYNativeChildAcceptance(valid()); err != nil {
+		t.Fatalf("schema-valid synthetic evidence rejected: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		mutate     func(*AGYNativeChildAcceptance)
+		wantCode   string
+		wantReason string
+	}{
+		{
+			name: "parent only reply without native child evidence",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.NativeChild = nil
+			},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_OWNERSHIP_MISSING",
+		},
+		{
+			name: "missing provider-owned child id",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.NativeChild.ChildSHA256 = ""
+			},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_ID_MISSING",
+		},
+		{
+			name: "child identity aliases parent identity",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.NativeChild.ChildSHA256 = parentHash
+			},
+			wantCode:   "PERMISSION_DENIED",
+			wantReason: "AGY_CHILD_IDENTITY_ALIAS",
+		},
+		{
+			name: "mismatched parent ownership hash",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.NativeChild.ParentSHA256 = model.Hash([]byte("other-parent"))
+			},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_PARENT_OWNERSHIP_INVALID",
+		},
+		{
+			name: "missing completed invoke_subagent tool count",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.ObservedTools = map[string]int{}
+			},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_INVOCATION_COUNT_INVALID",
+		},
+		{
+			name: "missing terminal child completion",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.NativeChild.ChildFinished = false
+			},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_RESULT_UNVERIFIED",
+		},
+		{
+			name: "result digest mismatch",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.NativeChild.ResultSHA256 = model.Hash([]byte("wrong"))
+			},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_DIGEST_MISMATCH",
+		},
+		{
+			name: "missing cleanup verification",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.CleanupVerified = false
+			},
+			wantCode:   "CLEANUP_UNVERIFIED",
+			wantReason: "AGY_CHILD_CLEANUP_UNVERIFIED",
+		},
+		{
+			name: "missing subscription cost protection",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.SubscriptionQuotaVerified = false
+			},
+			wantCode:   "ZERO_COST_UNVERIFIED",
+			wantReason: "AGY_CHILD_COST_UNVERIFIED",
+		},
+		{
+			name: "missing cost policy",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.Cost.Policy = ""
+			},
+			wantCode:   "ZERO_COST_UNVERIFIED",
+			wantReason: "AGY_CHILD_COST_UNVERIFIED",
+		},
+		{
+			name: "mismatched cost policy",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.Cost.Policy = "FREE_ONLY"
+			},
+			wantCode:   "ZERO_COST_UNVERIFIED",
+			wantReason: "AGY_CHILD_COST_UNVERIFIED",
+		},
+		{
+			name: "negative input tokens",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.InputTokens = -1
+			},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_TERMINAL_UNVERIFIED",
+		},
+		{
+			name: "negative output tokens",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.OutputTokens = -1
+			},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_TERMINAL_UNVERIFIED",
+		},
+		{
+			name: "input plus output exceeds total tokens",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.InputTokens = 10
+				in.Evidence.OutputTokens = 6
+				in.Evidence.TotalTokens = 15
+			},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_TERMINAL_UNVERIFIED",
+		},
+		{
+			name: "zero total tokens",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.Evidence.InputTokens = 0
+				in.Evidence.OutputTokens = 0
+				in.Evidence.TotalTokens = 0
+			},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_TERMINAL_UNVERIFIED",
+		},
+		{
+			name: "mismatched expected parent hash",
+			mutate: func(in *AGYNativeChildAcceptance) {
+				in.ExpectedParentHash = model.Hash([]byte("wrong-session"))
+			},
+			wantCode:   "INVALID_OUTPUT",
+			wantReason: "AGY_CHILD_PARENT_OWNERSHIP_INVALID",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := valid()
+			tc.mutate(&in)
+			err := ValidateAGYNativeChildAcceptance(in)
+			var fault *model.Fault
+			if !errors.As(err, &fault) || fault.Code != tc.wantCode || fault.ProviderReason != tc.wantReason {
+				t.Fatalf("ValidateAGYNativeChildAcceptance = %+v, want %s/%s", err, tc.wantCode, tc.wantReason)
+			}
+		})
+	}
+
+	// Offline schema acceptance must NOT assert live G-013 availability or open the AGY gate.
+	reg := New(model.Config{})
+	c := reg.Candidates[0]
+	if c.Provider != "agy" || c.Status == "available" || AllowsNativeChild(c, model.Task{NativeChild: true}) {
+		t.Fatalf("offline acceptance must keep AGY G-013 gated, got candidate %+v", c)
+	}
+	reg154 := New(model.Config{Providers: []model.ProviderConfig{{
+		ID: "agy", Model: agySyntheticModel, ExpectedBinarySHA256: agy154Fingerprint, EnableSynthetic: true,
+	}}})
+	c154 := reg154.Candidates[0]
+	if c154.Status == "available" || AllowsNativeChild(c154, model.Task{NativeChild: true}) {
+		t.Fatalf("configured AGY 1.5.4 without verified binary must keep G-013 gated, got %+v", c154)
+	}
+	cap154 := model.Capability{
+		Provider:    "agy",
+		Model:       agySyntheticModel,
+		Fingerprint: agy154Fingerprint,
+		Status:      "available",
+		Mode:        "headless",
+		Profiles:    agyProfiles(),
+	}
+	if AGYIdentityMatches(cap154.Model, cap154.Fingerprint) || AllowsNativeChild(cap154, model.Task{NativeChild: true}) {
+		t.Fatalf("documented blocked AGY 1.5.4 identity must remain gated for native child, got %+v", cap154)
+	}
+	_, runErr := reg.Run(t.Context(), t.TempDir(), cap154, model.Task{DataClass: "synthetic", Mode: "read_only", NativeChild: true}, nil, nil)
+	var gateFault *model.Fault
+	if !errors.As(runErr, &gateFault) || gateFault.Code != "POLICY_DENIED" {
+		t.Fatalf("expected POLICY_DENIED for AGY 1.5.4 native child gate, got %v", runErr)
+	}
+	cap153 := model.Capability{
+		Provider:    "agy",
+		Model:       agySyntheticModel,
+		Fingerprint: agy153Fingerprint,
+		Status:      "available",
+		Mode:        "headless",
+		Profiles:    agyProfiles(),
+	}
+	if AllowsNativeChild(cap153, model.Task{NativeChild: true, NativeChildBackground: true}) {
+		t.Fatal("background native child must remain gated for AGY")
+	}
+
+	t.Run("attempt verifier derives parent hash from stream session", func(t *testing.T) {
+		tampered := valid()
+		tampered.Evidence.NativeChild.ParentSHA256 = model.Hash([]byte("tampered-parent"))
+		err := verifyAGYAttemptNativeChild(&tampered.Evidence, "main", "42")
+		var fault *model.Fault
+		if !errors.As(err, &fault) || fault.Code != "INVALID_OUTPUT" || fault.ProviderReason != "AGY_CHILD_PARENT_OWNERSHIP_INVALID" {
+			t.Fatalf("verifyAGYAttemptNativeChild = %+v, want INVALID_OUTPUT/AGY_CHILD_PARENT_OWNERSHIP_INVALID", err)
+		}
+		if tampered.Evidence.TerminalVerified {
+			t.Fatal("failed attempt verification must clear TerminalVerified")
+		}
+		clean := valid()
+		if err := verifyAGYAttemptNativeChild(&clean.Evidence, "main", "42"); err != nil {
+			t.Fatalf("verifyAGYAttemptNativeChild rejected matching session: %v", err)
+		}
+	})
 }

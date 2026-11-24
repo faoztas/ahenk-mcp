@@ -25,6 +25,9 @@ func repoAllowsProvider(repo model.Repo, provider string) bool {
 
 // RouteDecision contains the end-to-end multi-provider dynamic routing result.
 type RouteDecision struct {
+	CapacityState  string           `json:"capacity_state,omitempty"`
+	CostClass      string           `json:"cost_class,omitempty"`
+	ProfileScore   float64          `json:"profile_score,omitempty"`
 	SelectedModel  string           `json:"selected_model"`
 	ResolvedEffort string           `json:"resolved_effort"`
 	Reason         string           `json:"reason"`
@@ -57,6 +60,9 @@ func EvaluateRouting(db *store.Store, category string, complexity float64, barHe
 		opusHealth = 1.0
 	}
 
+	if short, ok := barHealths[providers.BarAgyOpus5h]; ok {
+		opusHealth = min(opusHealth, short)
+	}
 	stage := DetermineOperationalStage(codexHealth, agyHealth, freeHealth)
 
 	cb := NewCircuitBreaker()
@@ -93,42 +99,17 @@ func EvaluateRouting(db *store.Store, category string, complexity float64, barHe
 			continue
 		}
 
-		if !cb.Allow(prov) {
+		if !cb.Eligible(prov) {
 			continue
 		}
 
 		if err := ValidateModelAdmission(category, cand, opusHealth); err != nil {
-			cb.Release(prov)
 			continue
 		}
 
 		selectedModel = cand
 		candHealth = h
 		break
-	}
-
-	if selectedModel == "" && len(matrix) > 0 {
-		for _, cand := range matrix {
-			parts := strings.Split(cand, "/")
-			prov := parts[0]
-			h := 1.0
-			switch NormalizeProvider(prov) {
-			case "codex":
-				h = codexHealth
-			case "agy":
-				h = agyHealth
-			case "opencode":
-				h = freeHealth
-			}
-			if h > 0.0 {
-				selectedModel = cand
-				candHealth = h
-				break
-			}
-		}
-		if selectedModel == "" {
-			selectedModel = matrix[0]
-		}
 	}
 
 	effort, reason := ResolveEffort(category, complexity, candHealth, selectedModel)
@@ -174,6 +155,9 @@ func EvaluateRouting(db *store.Store, category string, complexity float64, barHe
 		})
 	}
 
+	if selectedModel == "" {
+		return RouteDecision{TaskCategory: category, Stage: stage, Reason: "NO_ELIGIBLE_ROUTE", QuotaPressure: 1, Latency: time.Since(start)}
+	}
 	elapsed := time.Since(start)
 
 	return RouteDecision{
@@ -187,21 +171,43 @@ func EvaluateRouting(db *store.Store, category string, complexity float64, barHe
 	}
 }
 
+func normalizedRoutingCategory(category string) string {
+	category = strings.ToLower(strings.TrimSpace(category))
+	if _, ok := priorityMatrices[category]; !ok {
+		return "coding"
+	}
+	return category
+}
+
+func legacyModelName(provider, name string) string {
+	if provider == "opencode" {
+		return strings.TrimPrefix(name, "opencode/")
+	}
+	return name
+}
+
 // EvaluateAutoRoute selects the best eligible candidate from the priority matrix for the
 // given repository, task category, optional complexity, and task constraints using live
 // quota freshness, circuit breakers, cooldown gates, policy admissibility, and deadline budgets.
 func (e *Engine) EvaluateAutoRoute(repoID, category string, complexity *float64, task model.Task, now time.Time) (RouteDecision, *model.Capability) {
+	profile := task.RoutingProfile
+	if e != nil && profile == "" {
+		if repo, ok := e.Repo(repoID); ok {
+			profile, _, _ = e.defaultRoutingProfile(repoID, repo, "")
+		}
+	}
+	return e.evaluateAutoRoute(repoID, category, complexity, task, now, profile, routingRole(task))
+}
+
+func (e *Engine) evaluateAutoRoute(repoID, category string, complexity *float64, task model.Task, now time.Time, profile model.RoutingProfile, role string) (RouteDecision, *model.Capability) {
 	start := time.Now()
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
 
-	normalizedCat := strings.ToLower(strings.TrimSpace(category))
+	normalizedCat := normalizedRoutingCategory(category)
+	task.Category = normalizedCat
 	matrix := FallbackMatrix(normalizedCat)
-	if len(matrix) == 0 {
-		normalizedCat = "coding"
-		matrix = FallbackMatrix(normalizedCat)
-	}
 
 	effComplexity := 0.9
 	if normalizedCat == "research" {
@@ -221,8 +227,6 @@ func (e *Engine) EvaluateAutoRoute(repoID, category string, complexity *float64,
 	}
 
 	deadline := now.Add(task.Deadline())
-	role := routingRole(task)
-	targetTier := effectiveTargetTier(task)
 
 	e.mu.Lock()
 	var repo model.Repo
@@ -251,7 +255,7 @@ func (e *Engine) EvaluateAutoRoute(repoID, category string, complexity *float64,
 		e.hasFreshQuotaLocked("gemini-5h", now) ||
 		e.hasFreshQuotaLocked("gemini-weekly", now)
 
-	opusHealth := e.healthPercentLocked(providers.BarAgyOpus, now)
+	opusHealth := e.opusAdmissionHealth(now)
 	argonHealth := e.healthPercentLocked(providers.BarAgyArgon, now)
 	hasArgon := e.hasFreshQuotaLocked(providers.BarAgyArgon, now)
 	freeHealth := e.healthPercentLocked(providers.BarOpenCodeFree, now)
@@ -263,8 +267,6 @@ func (e *Engine) EvaluateAutoRoute(repoID, category string, complexity *float64,
 	}
 
 	stage := DetermineOperationalStage(codexHealth, agyStageHealth, freeHealth)
-
-	liveRepo := e.cfg.EnableFixture && hasRepo && (repoAllowsProvider(repo, "agy") || repoAllowsProvider(repo, "opencode"))
 
 	candHealthFor := func(normProv, modelName string) float64 {
 		switch normProv {
@@ -288,89 +290,53 @@ func (e *Engine) EvaluateAutoRoute(repoID, category string, complexity *float64,
 		}
 	}
 
-	isCandidateEligibleLocked := func(c model.Capability) bool {
-		normCProv := NormalizeProvider(c.Provider)
-		if hasRepo && !repoAllowsProvider(repo, c.Provider) {
-			return false
-		}
-		if c.Status != "available" {
-			return false
-		}
-		if task.DataClass == model.PrivateSourceData && (!hasRepo || !repo.PrivateSource.Allows(c, task, now)) {
-			return false
-		}
-		if !workerCostAllowed(c) {
-			return false
-		}
-		quality := e.routeQuality(c, role, now)
-		if quality.Tier == 0 || (hasRepo && quality.Tier < repo.Limits.MinimumQualityTier) {
-			return false
-		}
-		if !providers.AllowsNativeChild(c, task) || !providers.AllowsContinuation(c, task) || !providers.AuditRouteAllows(c, task, now) {
-			return false
-		}
-		if task.ExecutionProfile == model.TrustedLocalProfile {
-			if !hasRepo || repo.TrustedLocal == nil || !providers.AllowsTrustedLocal(c) ||
-				(repo.TrustedLocal.Provider != "" && NormalizeProvider(repo.TrustedLocal.Provider) != normCProv) {
-				return false
-			}
-		}
-		if task.ExecutionProfile == "implementation" && task.DataClass != model.PrivateSourceData {
-			if c.Mode != "fixture" && !((normCProv == "codex" || normCProv == "claude") && c.Status == "available") {
-				return false
-			}
-		}
-		if normCProv == "agy" && !providers.AllowsAGYProfile(c, task) {
-			return false
-		}
-		if normCProv == "opencode" && task.ExecutionProfile != model.TrustedLocalProfile &&
-			(task.DataClass != "synthetic" && task.DataClass != model.PrivateSourceData || task.Mode != "read_only") {
-			return false
-		}
-		if liveRepo && c.Mode == "fixture" && task.Strategy != "offline_privacy_first" {
-			return false
-		}
-		if c.Mode == "fixture" && task.DataClass != "synthetic" && task.DataClass != model.PrivateSourceData {
-			return false
-		}
-		if task.Strategy == "offline_privacy_first" && c.Mode != "fixture" {
-			return false
-		}
-		if e.cb != nil && !e.cb.Eligible(c.Provider) {
-			return false
-		}
-		if normCProv == "opencode" && c.Mode != "fixture" {
-			if scope, _ := e.openCodeGate(c, now); scope != "" {
-				return false
-			}
-		} else if e.cooldown[providers.Family(c.Provider)].After(now) {
-			return false
-		}
-
-		if targetTierViolation(targetTier, providers.FPTier(normCProv, c.Model), quality.Tier) != "" {
-			return false
-		}
-
-		estimate := providers.Estimate(c, task)
-		if _, fits := providers.Budget(now, deadline, task, estimate); !fits {
-			return false
-		}
-		return true
+	var policy *model.Repo
+	if hasRepo {
+		policy = &repo
 	}
-
+	task.Category = normalizedCat
+	if complexity != nil {
+		task.HasComplexity, task.Complexity = true, *complexity
+	}
+	job := model.Job{RepoID: repoID, Task: task, DeadlineAt: deadline, QualityRole: role, RoutingProfile: profile}
+	if profile != "" && task.Decompose {
+		job.Task = planningTask(task, task.Mode == "patch" && repo.Limits.RequireIndependentReview || task.Risk == "critical")
+		job.QualityRole = "planning"
+	}
+	options, _ := e.eligibleCandidates(&job, now, policy)
+	if profile != "" {
+		ranked := e.rankProfile(&job, options, now)
+		e.mu.Unlock()
+		decision := RouteDecision{TaskCategory: normalizedCat, Stage: stage, Reason: "NO_ELIGIBLE_ROUTE", Latency: time.Since(start)}
+		if len(ranked) == 0 {
+			return decision, nil
+		}
+		best := ranked[0]
+		decision.SelectedModel = qualifiedModel(best.capability)
+		decision.ResolvedEffort = best.decision.ResolvedEffort
+		decision.Reason = best.decision.RankingReason
+		decision.CapacityState, decision.CostClass, decision.ProfileScore = best.decision.CapacityState, best.decision.CostClass, best.decision.ProfileScore
+		if best.decision.QuotaRemaining != nil {
+			decision.QuotaPressure = 1 - *best.decision.QuotaRemaining/100
+		}
+		return decision, &best.capability
+	}
 	findMatchingCandidateLocked := func(normProv, candModel string) (model.Capability, bool) {
-		for _, c := range e.reg.Candidates {
-			if NormalizeProvider(c.Provider) == normProv && c.Model == candModel && isCandidateEligibleLocked(c) {
+		for _, option := range options {
+			c := option.capability
+			if NormalizeProvider(c.Provider) == normProv && legacyModelName(normProv, c.Model) == candModel {
 				return c, true
 			}
 		}
-		for _, c := range e.reg.Candidates {
-			if NormalizeProvider(c.Provider) == normProv && candModel != "" && strings.HasPrefix(c.Model, candModel+"-") && isCandidateEligibleLocked(c) {
+		for _, option := range options {
+			c := option.capability
+			if NormalizeProvider(c.Provider) == normProv && candModel != "" && strings.HasPrefix(legacyModelName(normProv, c.Model), candModel+"-") {
 				return c, true
 			}
 		}
-		for _, c := range e.reg.Candidates {
-			if NormalizeProvider(c.Provider) == normProv && c.Model == "" && isCandidateEligibleLocked(c) {
+		for _, option := range options {
+			c := option.capability
+			if NormalizeProvider(c.Provider) == normProv && c.Model == "" {
 				return c, true
 			}
 		}
@@ -391,72 +357,38 @@ func (e *Engine) EvaluateAutoRoute(repoID, category string, complexity *float64,
 		}
 		normCandProv := NormalizeProvider(candProv)
 
-		h := candHealthFor(normCandProv, candModel)
-		if h <= 0.0 {
-			continue
-		}
-		if err := ValidateModelAdmission(normalizedCat, cand, opusHealth); err != nil {
-			continue
-		}
 		matched, ok := findMatchingCandidateLocked(normCandProv, candModel)
 		if !ok {
 			continue
 		}
 
+		h := 1.0
+		sameAccount := e.quotaAccountMatches(matched)
+		if normCandProv == "opencode" || sameAccount {
+			h = candHealthFor(normCandProv, matched.Model)
+		}
+		// A provider-only capability takes its model from the matrix.
+		if matched.Model == "" {
+			health := 1.0
+			if sameAccount {
+				health = opusHealth
+			}
+			if ValidateModelAdmission(normalizedCat, cand, health) != nil {
+				continue
+			}
+		}
+
 		selectedCap = matched
 		hasSelected = true
 		selectedModel = cand
-		if matched.Model != "" && matched.Model != candModel {
-			selectedModel = candProv + "/" + matched.Model
+		if name := legacyModelName(normCandProv, matched.Model); name != "" && name != candModel {
+			selectedModel = candProv + "/" + name
 		}
 		candHealth = h
 		break
 	}
 
-	db := e.db
-	cb := e.cb
 	e.mu.Unlock()
-
-	if db != nil {
-		codexCircuit := string(CircuitClosed)
-		agyCircuit := string(CircuitClosed)
-		openCodeCircuit := string(CircuitClosed)
-		if cb != nil {
-			codexCircuit = string(cb.State("codex"))
-			agyCircuit = string(cb.State("antigravity"))
-			openCodeCircuit = string(cb.State("opencode"))
-		}
-		_ = db.SaveQuotaState(store.ProviderQuotaState{
-			ProviderID:           "codex",
-			TierName:             "codex_pro",
-			WindowDurationHours:  5.0,
-			RequestsUsedInWindow: int((1.0 - codexHealth) * 180),
-			MaxWindowRequests:    180,
-			HealthPct:            codexHealth,
-			CircuitState:         codexCircuit,
-			UpdatedAt:            now,
-		})
-		_ = db.SaveQuotaState(store.ProviderQuotaState{
-			ProviderID:           "antigravity",
-			TierName:             "google_ai_pro",
-			WindowDurationHours:  5.0,
-			RequestsUsedInWindow: int((1.0 - agyStageHealth) * 100),
-			MaxWindowRequests:    100,
-			HealthPct:            agyStageHealth,
-			CircuitState:         agyCircuit,
-			UpdatedAt:            now,
-		})
-		_ = db.SaveQuotaState(store.ProviderQuotaState{
-			ProviderID:           "opencode",
-			TierName:             "opencode_free",
-			WindowDurationHours:  16.6,
-			RequestsUsedInWindow: int((1.0 - freeHealth) * 50),
-			MaxWindowRequests:    50,
-			HealthPct:            freeHealth,
-			CircuitState:         openCodeCircuit,
-			UpdatedAt:            now,
-		})
-	}
 
 	if !hasSelected {
 		return RouteDecision{

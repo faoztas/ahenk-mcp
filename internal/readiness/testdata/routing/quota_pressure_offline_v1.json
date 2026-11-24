@@ -1,0 +1,629 @@
+{
+  "fixture_version": "b1-routing-v1",
+  "schema_version": "2026-11-23.v1",
+  "protocol": {
+    "pre_registered": true,
+    "hypothesis": "Under quota exhaustion, scoped 429 cooldowns, half-open recovery, and retry idempotency, profiles never spawn exhausted 0% candidates and preserve durable first decisions.",
+    "primary_metric": "verified_success_rate",
+    "drift_thresholds": {
+      "fp_max_accuracy_drop_pp": 5.0,
+      "fp_min_measurable_cost_gain_pct": 10.0,
+      "fp_max_p95_latency_increase_pct": 25.0,
+      "quality_min_success_rate": 0.85,
+      "price_max_extra_spend": 0.0
+    },
+    "budget_limit": {
+      "max_total_calls": 40,
+      "max_paid_spend": 1.0,
+      "allow_live_quota_consumption": false
+    },
+    "sample_plan": {
+      "min_matched_cases_per_profile": 16,
+      "min_cases_per_role": 1,
+      "required_roles": [
+        "coding",
+        "debugging",
+        "code_review",
+        "planning"
+      ]
+    },
+    "recorded_at": "2026-11-23T17:00:00Z",
+    "environment": {
+      "cpu": "Intel(R) Core(TM) i9-9980HK CPU @ 2.40GHz",
+      "platform": "darwin/amd64",
+      "worktree": "synthetic-trusted-local-v1",
+      "stdout_json_ingestion_ms": 5,
+      "observer_io_ms": 8,
+      "provider_mode": "offline_simulated"
+    }
+  },
+  "runs": [
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-pressure-01",
+      "role": "coding",
+      "task_variant": "go-quota-pressure-fallback-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestQuotaPressureFallback"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "reference",
+      "run_order": 1,
+      "scenario": "EXHAUSTED_0PCT",
+      "quota_provenance": {
+        "source": "codexbar_oauth",
+        "provider": "codex",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "EXHAUSTED",
+        "window": "five_hour",
+        "remaining_percent": 0.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-press-01-ref",
+          "job_id": "job-press-01-ref",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "EXHAUSTED_0PCT",
+          "provider_reply": {
+            "status": "NOT_SPAWNED",
+            "reported_success": false
+          },
+          "verification": {
+            "independent_verified": false
+          },
+          "latency_ms": 15,
+          "cost_unit": "usd",
+          "reported_cost": 0.0
+        }
+      ],
+      "verified_success": false,
+      "latency_ms": 15,
+      "cost_unit": "usd",
+      "reported_cost": 0.0
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-pressure-01",
+      "role": "coding",
+      "task_variant": "go-quota-pressure-fallback-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestQuotaPressureFallback"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price_performance",
+      "run_order": 2,
+      "scenario": "FALLBACK_429",
+      "quota_provenance": {
+        "source": "opencode_cooldown_history",
+        "account": "ANONYMOUS",
+        "account_bound": false,
+        "fresh": true,
+        "state": "UNKNOWN"
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-press-01-fp",
+          "job_id": "job-press-01-fp",
+          "provider": "opencode",
+          "model": "opencode/glm-5.3-flash-free",
+          "account": "ANONYMOUS",
+          "route_status": "FALLBACK_429",
+          "rate_limit_scope": "model",
+          "process_exit_code": 1,
+          "provider_reply": {
+            "status": "HTTP_429",
+            "http_status": 429,
+            "reported_success": false
+          },
+          "verification": {
+            "independent_verified": false
+          },
+          "latency_ms": 420,
+          "cost_unit": "usd",
+          "reported_cost": 0.0
+        },
+        {
+          "number": 2,
+          "request_id": "req-press-01-fp",
+          "job_id": "job-press-01-fp",
+          "provider": "agy",
+          "model": "gemini-3.8-flash-medium",
+          "effort": "medium",
+          "account": "SAME_NATIVE_CLI_CONTEXT",
+          "quota_window": "gemini-weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "7111111111111111111111111111111111111111111111111111111111111112",
+            "artifact_sha256": "7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestQuotaPressureFallback",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 9100,
+          "cost_unit": "quota_percent_weekly",
+          "reported_cost": 0.35
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 9520,
+      "cost_unit": "quota_percent_weekly",
+      "reported_cost": 0.35
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-pressure-01",
+      "role": "coding",
+      "task_variant": "go-quota-pressure-fallback-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestQuotaPressureFallback"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "quality",
+      "run_order": 3,
+      "scenario": "HALF_OPEN_RECOVERY",
+      "quota_provenance": {
+        "source": "codexbar_oauth",
+        "provider": "codex",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 54.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-press-01-qual",
+          "job_id": "job-press-01-qual",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "HALF_OPEN_PROBE",
+          "recovery_state": "HALF_OPEN",
+          "probe_evidence": {
+            "cooldown_until": "2026-11-14T10:01:00Z",
+            "probe_started_at": "2026-11-14T10:01:01Z",
+            "state_after": "CLOSED"
+          },
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "7111111111111111111111111111111111111111111111111111111111111113",
+            "artifact_sha256": "7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestQuotaPressureFallback",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 13800,
+          "cost_unit": "usd",
+          "reported_cost": 0.11
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 13800,
+      "cost_unit": "usd",
+      "reported_cost": 0.11
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-pressure-01",
+      "role": "coding",
+      "task_variant": "go-quota-pressure-fallback-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestQuotaPressureFallback"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price",
+      "run_order": 4,
+      "scenario": "NO_ELIGIBLE_ROUTE",
+      "quota_provenance": {
+        "source": "codexbar_app",
+        "provider": "agy",
+        "account": "SAME_NATIVE_CLI_CONTEXT",
+        "account_bound": true,
+        "fresh": true,
+        "state": "EXHAUSTED",
+        "window": "gemini-weekly",
+        "remaining_percent": 0.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-press-01-price",
+          "job_id": "job-press-01-price",
+          "provider": "none",
+          "model": "none",
+          "route_status": "NO_ELIGIBLE_ROUTE",
+          "provider_reply": {
+            "status": "NOT_SPAWNED",
+            "reported_success": false
+          },
+          "verification": {
+            "independent_verified": false
+          },
+          "latency_ms": 12,
+          "cost_unit": "usd",
+          "reported_cost": 0.0
+        }
+      ],
+      "verified_success": false,
+      "latency_ms": 12,
+      "cost_unit": "usd",
+      "reported_cost": 0.0
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-pressure-02",
+      "role": "debugging",
+      "task_variant": "go-retry-idempotency-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestRetryIdempotency"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "reference",
+      "run_order": 2,
+      "scenario": "RETRY_IDEMPOTENCY",
+      "quota_provenance": {
+        "source": "codexbar_oauth",
+        "provider": "codex",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 50.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-idem-shared-01",
+          "job_id": "job-idem-shared-01",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "7222222222222222222222222222222222222222222222222222222222222221",
+            "artifact_sha256": "7bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestRetryIdempotency",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 12200,
+          "cost_unit": "usd",
+          "reported_cost": 0.1
+        },
+        {
+          "number": 2,
+          "request_id": "req-idem-shared-01",
+          "job_id": "job-idem-shared-01",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "IDEMPOTENT_REPLAY",
+          "provider_reply": {
+            "status": "NOT_SPAWNED",
+            "summary_sha256": "7222222222222222222222222222222222222222222222222222222222222221",
+            "artifact_sha256": "7bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestRetryIdempotency",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 5,
+          "cost_unit": "usd",
+          "reported_cost": 0.0
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 12205,
+      "cost_unit": "usd",
+      "reported_cost": 0.1
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-pressure-02",
+      "role": "debugging",
+      "task_variant": "go-retry-idempotency-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestRetryIdempotency"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price_performance",
+      "run_order": 3,
+      "scenario": "RETRY_IDEMPOTENCY",
+      "quota_provenance": {
+        "source": "codexbar_app",
+        "provider": "agy",
+        "account": "SAME_NATIVE_CLI_CONTEXT",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "gemini-weekly",
+        "remaining_percent": 48.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-idem-shared-02",
+          "job_id": "job-idem-shared-02",
+          "provider": "agy",
+          "model": "gemini-3.8-flash-medium",
+          "effort": "medium",
+          "account": "SAME_NATIVE_CLI_CONTEXT",
+          "quota_window": "gemini-weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "7222222222222222222222222222222222222222222222222222222222222222",
+            "artifact_sha256": "7bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestRetryIdempotency",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 8700,
+          "cost_unit": "quota_percent_weekly",
+          "reported_cost": 0.3
+        },
+        {
+          "number": 2,
+          "request_id": "req-idem-shared-02",
+          "job_id": "job-idem-shared-02",
+          "provider": "agy",
+          "model": "gemini-3.8-flash-medium",
+          "effort": "medium",
+          "account": "SAME_NATIVE_CLI_CONTEXT",
+          "quota_window": "gemini-weekly",
+          "route_status": "IDEMPOTENT_REPLAY",
+          "provider_reply": {
+            "status": "NOT_SPAWNED",
+            "summary_sha256": "7222222222222222222222222222222222222222222222222222222222222222",
+            "artifact_sha256": "7bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestRetryIdempotency",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 4,
+          "cost_unit": "quota_percent_weekly",
+          "reported_cost": 0.0
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 8704,
+      "cost_unit": "quota_percent_weekly",
+      "reported_cost": 0.3
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-pressure-02",
+      "role": "debugging",
+      "task_variant": "go-retry-idempotency-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestRetryIdempotency"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "quality",
+      "run_order": 4,
+      "scenario": "HALF_OPEN_RECOVERY",
+      "quota_provenance": {
+        "source": "codexbar_oauth",
+        "provider": "codex",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 49.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-idem-shared-03",
+          "job_id": "job-idem-shared-03",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "HALF_OPEN_PROBE",
+          "recovery_state": "HALF_OPEN",
+          "probe_evidence": {
+            "cooldown_until": "2026-11-14T10:01:00Z",
+            "probe_started_at": "2026-11-14T10:01:01Z",
+            "state_after": "CLOSED"
+          },
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "7222222222222222222222222222222222222222222222222222222222222223",
+            "artifact_sha256": "7bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestRetryIdempotency",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 12900,
+          "cost_unit": "usd",
+          "reported_cost": 0.1
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 12900,
+      "cost_unit": "usd",
+      "reported_cost": 0.1
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-pressure-02",
+      "role": "debugging",
+      "task_variant": "go-retry-idempotency-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestRetryIdempotency"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price",
+      "run_order": 1,
+      "scenario": "FALLBACK_429",
+      "quota_provenance": {
+        "source": "opencode_cooldown_history",
+        "account": "ANONYMOUS",
+        "account_bound": false,
+        "fresh": true,
+        "state": "UNKNOWN"
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-idem-shared-04",
+          "job_id": "job-idem-shared-04",
+          "provider": "opencode",
+          "model": "opencode/glm-5.3-flash-free",
+          "account": "ANONYMOUS",
+          "route_status": "FALLBACK_429",
+          "rate_limit_scope": "model",
+          "process_exit_code": 1,
+          "provider_reply": {
+            "status": "HTTP_429",
+            "http_status": 429,
+            "reported_success": false
+          },
+          "verification": {
+            "independent_verified": false
+          },
+          "latency_ms": 380,
+          "cost_unit": "usd",
+          "reported_cost": 0.0
+        },
+        {
+          "number": 2,
+          "request_id": "req-idem-shared-04",
+          "job_id": "job-idem-shared-04",
+          "provider": "opencode",
+          "model": "opencode/deepseek-v4.1-flash-free",
+          "account": "ANONYMOUS",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "7222222222222222222222222222222222222222222222222222222222222224",
+            "artifact_sha256": "7bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbd",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestRetryIdempotency",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 3600,
+          "cost_unit": "usd",
+          "reported_cost": 0.0
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 3980,
+      "cost_unit": "usd",
+      "reported_cost": 0.0
+    }
+  ]
+}

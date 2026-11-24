@@ -143,7 +143,11 @@ func SuperviseAGY() error {
 	})
 }
 
-func runAGYAttempt(ctx context.Context, req agyRequest) (out execution.FixtureInput, result error) {
+func runAGYAttempt(ctx context.Context, req agyRequest) (execution.FixtureInput, error) {
+	return runAGYAttemptWithUsage(ctx, req, probeAGY)
+}
+
+func runAGYAttemptWithUsage(ctx context.Context, req agyRequest, usage func(context.Context, model.ProviderConfig, string, bool) (AGYProbe, error)) (out execution.FixtureInput, result error) {
 	out.AGY = &model.AGYRunEvidence{Cost: agyUnverifiedCost()}
 	t := req.Task
 	trusted := t.ExecutionProfile == model.TrustedLocalProfile
@@ -175,7 +179,7 @@ func runAGYAttempt(ctx context.Context, req agyRequest) (out execution.FixtureIn
 	}
 	defer os.RemoveAll(usageDir)
 	usageCtx, stopUsage := context.WithTimeout(ctx, 15*time.Second)
-	probe, err := probeAGY(usageCtx, req.Config, usageDir, audited)
+	probe, err := usage(usageCtx, req.Config, usageDir, audited)
 	stopUsage()
 	if err != nil {
 		return out, err
@@ -189,6 +193,8 @@ func runAGYAttempt(ctx context.Context, req agyRequest) (out execution.FixtureIn
 		fault := model.Error("AGY_WEEKLY_RESERVE_PROTECTED", "AGY native weekly quota reached the protected reserve and dispatch buffer")
 		fault.ProviderReason = q.Bucket
 		out.AGY.WeeklyReserve = q
+		// /usage identifies the native CLI context but supplies no account
+		// identity. Enforce the reserve here and leave replay unbound.
 		return out, fault
 	}
 
@@ -217,6 +223,7 @@ func runAGYAttempt(ctx context.Context, req agyRequest) (out execution.FixtureIn
 		if !AGYIdentityMatches(req.Config.Model, req.Config.ExpectedBinarySHA256) || t.Mode != "read_only" || t.FollowUp != "" || len(req.Handoffs) != 0 {
 			return out, model.Error("POLICY_DENIED", "AGY native child requires the pinned synthetic parent route")
 		}
+		out.AGY.Profile = "native_child"
 		agent, definition = agyNativeParent, agyNativeParentDefinition
 		policy = AGYPolicy{Root: work, Agent: agent, Profile: "native_child", NativeChildRole: agyNativeChild,
 			ChildAndMessageScopeVerified: true, Tools: []string{"invoke_subagent", "send_message"}}
@@ -328,12 +335,27 @@ func runAGYAttempt(ctx context.Context, req agyRequest) (out execution.FixtureIn
 			return out, model.Error("INVALID_OUTPUT", "AGY did not report both a completed read and a completed native edit")
 		}
 	}
-	if t.NativeChild && (out.AGY.NativeChild == nil || !out.AGY.NativeChild.ChildFinished ||
-		out.AGY.NativeChild.ResultSHA256 != model.Hash([]byte(strings.TrimSpace(reply.Summary)))) {
-		return out, agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_RESULT_UNVERIFIED", "AGY parent summary did not match an owned child terminal result")
+	if t.NativeChild {
+		if err := verifyAGYAttemptNativeChild(out.AGY, resultData.Session, reply.Summary); err != nil {
+			return out, err
+		}
 	}
 	out.Summary, out.Patch = reply.Summary, reply.Patch
 	return out, nil
+}
+
+func verifyAGYAttemptNativeChild(ev *model.AGYRunEvidence, session, summary string) error {
+	expectedParent := ""
+	if session != "" {
+		expectedParent = model.Hash([]byte(session))
+	}
+	if err := verifyAGYNativeChildEvidence(ev, expectedParent, model.Hash([]byte(strings.TrimSpace(summary)))); err != nil {
+		if ev != nil {
+			ev.TerminalVerified = false
+		}
+		return err
+	}
+	return nil
 }
 
 func agyTrustedPermissions(args []string, work string, reads, writes []string) error {
@@ -369,7 +391,7 @@ func agyWeeklyReserve(rows []Quota, family string, floor float64) *model.AGYRese
 		return nil
 	}
 	for _, q := range rows {
-		if q.Family == family && q.WindowMinutes == 10080 && q.Remaining != nil && *q.Remaining <= floor {
+		if q.IsAGYLongWindow(family) && q.Remaining != nil && *q.Remaining <= floor {
 			return &model.AGYReserveEvidence{Bucket: q.Bucket, Remaining: *q.Remaining, ResetAt: q.ResetAt, ObservedAt: q.ObservedAt}
 		}
 	}
@@ -540,7 +562,7 @@ func runAGYStream(ctx context.Context, cmd *exec.Cmd, modelID string, policy AGY
 			}
 			if stream.finished {
 				usage := stream.result.Usage
-				if usage.Total <= 0 || usage.Input < 0 || usage.Output < 0 || usage.Input > usage.Total-usage.Output {
+				if !validAGYUsage(usage.Input, usage.Output, usage.Total) {
 					return result, agyProviderFault("INVALID_OUTPUT", "AGY_TERMINAL_USAGE_INVALID", "AGY terminal usage was missing or invalid")
 				}
 				evidence.InputTokens += usage.Input

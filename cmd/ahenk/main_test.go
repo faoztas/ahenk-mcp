@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,11 +20,12 @@ import (
 	"github.com/faoztas/ahenk-mcp/internal/execution"
 	"github.com/faoztas/ahenk-mcp/internal/model"
 	"github.com/faoztas/ahenk-mcp/internal/readiness"
+	"github.com/faoztas/ahenk-mcp/internal/store"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestMain(m *testing.M) {
-	if len(os.Args) > 1 && slices.Contains([]string{"serve", "readiness", "m1-request", "_supervise_fixture", "_fixture_worker", "_supervise_go_check"}, os.Args[1]) {
+	if len(os.Args) > 1 && slices.Contains([]string{"serve", "routing", "readiness", "m1-request", "_supervise_fixture", "_fixture_worker", "_supervise_go_check"}, os.Args[1]) {
 		main()
 		os.Exit(0)
 	}
@@ -596,7 +598,7 @@ func TestPrivateWorkAdmissionAndLocalRunners(t *testing.T) {
 		t.Fatalf("expected bound grant_digest and snapshot_id, got %+v", readRes)
 	}
 
-	// 5. Approved private write batch in disposable Go repo runs patch + TestAfter + independent review.
+	// 5. An operator grant admits the batch; production dispatch still requires host isolation.
 	patchTask := model.Task{
 		Objective:        patchObj,
 		Acceptance:       []model.Check{{ID: "unit", Description: "Pass TestAfter", CheckID: "unit"}},
@@ -624,16 +626,11 @@ func TestPrivateWorkAdmissionAndLocalRunners(t *testing.T) {
 		},
 	}
 	batchID := call("delegate_batch", privBatch)["job_id"].(string)
-	batchStatus := wait(s, batchID, model.Completed)
+	batchStatus := wait(s, batchID, model.Blocked, model.Failed)
 	children := batchStatus["children"].([]any)
-	implID, revID := children[0].(string), children[1].(string)
-	implRes := call("get_job_result", map[string]string{"job_id": implID})["result"].(map[string]any)
-	revRes := call("get_job_result", map[string]string{"job_id": revID})["result"].(map[string]any)
-	revVerdict := revRes["review"].(map[string]any)
-	if implRes["grant_digest"] != model.Digest(policy) || implRes["artifact_sha256"] == "" ||
-		revVerdict["verdict"] != "APPROVED" || revVerdict["artifact_sha256"] != implRes["artifact_sha256"] ||
-		revVerdict["deterministic_check_status"] != "PASSED" {
-		t.Fatalf("private write batch did not complete with verified check and independent review: impl=%+v rev=%+v", implRes, revRes)
+	writer := call("get_job_status", map[string]string{"job_id": children[0].(string)})
+	if writer["status"] != model.Blocked || writer["reason_code"] != "WRITER_ISOLATION_UNVERIFIED" || writer["attempt_count"] != float64(0) {
+		t.Fatalf("unisolated private writer dispatched: %+v", writer)
 	}
 	if onDisk, err := os.ReadFile(filepath.Join(repo, "sample.go")); err != nil || string(onDisk) != sampleGo {
 		t.Fatalf("source repository was mutated by private write task: %q %v", onDisk, err)
@@ -1016,6 +1013,66 @@ func TestServeLeaderWaitsForActiveProxyClients(t *testing.T) {
 	}
 }
 
+type reconnectTestProcess struct {
+	cmd    *exec.Cmd
+	in     io.WriteCloser
+	out    io.ReadCloser
+	done   chan struct{}
+	stderr bytes.Buffer
+	err    error
+}
+
+func startReconnectTestProcess(t *testing.T, ctx context.Context, cfgPath string) *reconnectTestProcess {
+	t.Helper()
+	return startReconnectTestBinary(t, ctx, os.Args[0], cfgPath)
+}
+
+func startReconnectTestBinary(t *testing.T, ctx context.Context, binary, cfgPath string) *reconnectTestProcess {
+	t.Helper()
+	p := &reconnectTestProcess{
+		cmd:  exec.CommandContext(ctx, binary, "serve", "--stdio", "--config", cfgPath),
+		done: make(chan struct{}),
+	}
+	p.cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=/var/empty", "LC_ALL=C"}
+	p.cmd.Stderr = &p.stderr
+	in, err := p.cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = in.Close() })
+	out, childOut, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer childOut.Close()
+	t.Cleanup(func() { _ = out.Close() })
+	p.cmd.Stdout = childOut
+	if err := p.cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	p.in, p.out = in, out
+	t.Cleanup(func() {
+		_ = p.cmd.Process.Kill()
+		<-p.done
+	})
+	go func() {
+		p.err = p.cmd.Wait()
+		close(p.done)
+	}()
+	return p
+}
+
+func (p *reconnectTestProcess) connect(t *testing.T, ctx context.Context) *mcp.ClientSession {
+	t.Helper()
+	client := mcp.NewClient(&mcp.Implementation{Name: "reconnect-test", Version: "1.0"}, nil)
+	session, err := client.Connect(ctx, &mcp.IOTransport{Reader: p.out, Writer: p.in}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	return session
+}
+
 func TestServeReconnectsAfterIPCLeaderCrash(t *testing.T) {
 	root := t.TempDir()
 	cfgPath := filepath.Join(root, "config.json")
@@ -1038,55 +1095,18 @@ func TestServeReconnectsAfterIPCLeaderCrash(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	type serverProcess struct {
-		cmd     *exec.Cmd
-		session *mcp.ClientSession
-		done    chan struct{}
-		stderr  bytes.Buffer
-		err     error
-	}
-	start := func() *serverProcess {
+	call := func(session *mcp.ClientSession, name string, args map[string]any) map[string]any {
 		t.Helper()
-		p := &serverProcess{cmd: exec.CommandContext(ctx, os.Args[0], "serve", "--stdio", "--config", cfgPath), done: make(chan struct{})}
-		p.cmd.Stderr = &p.stderr
-		in, err := p.cmd.StdinPipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-		out, err := p.cmd.StdoutPipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := p.cmd.Start(); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			_ = in.Close()
-			_ = p.cmd.Process.Kill()
-			<-p.done
-		})
-		go func() {
-			p.err = p.cmd.Wait()
-			close(p.done)
-		}()
-		client := mcp.NewClient(&mcp.Implementation{Name: "reconnect-test", Version: "1.0"}, nil)
-		p.session, err = client.Connect(ctx, &mcp.IOTransport{Reader: out, Writer: in}, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = p.session.Close() })
-		return p
-	}
-	call := func(p *serverProcess, name string, args map[string]any) map[string]any {
-		t.Helper()
-		result, err := p.session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+		result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
 		if err != nil || result == nil || result.IsError {
 			t.Fatalf("%s returned %+v, %v", name, result, err)
 		}
 		return result.StructuredContent.(map[string]any)
 	}
-	leader, proxy := start(), start()
-	job := call(proxy, "spawn_subagent", map[string]any{
+	leader := startReconnectTestProcess(t, ctx, cfgPath)
+	leader.connect(t, ctx)
+	proxy := startReconnectTestProcess(t, ctx, cfgPath)
+	job := call(proxy.connect(t, ctx), "spawn_subagent", map[string]any{
 		"repo_id": "demo", "task": "Inspect fixture", "execution_mode": "async",
 	})
 	if err := leader.cmd.Process.Kill(); err != nil {
@@ -1102,9 +1122,140 @@ func TestServeReconnectsAfterIPCLeaderCrash(t *testing.T) {
 	case <-time.After(4 * time.Second):
 		t.Fatal("proxy kept a disconnected MCP session open")
 	}
-	replacement := start()
+	replacement := startReconnectTestProcess(t, ctx, cfgPath).connect(t, ctx)
 	if status := call(replacement, "get_job_status", map[string]any{"job_id": job["job_id"]}); status["job_id"] != job["job_id"] {
 		t.Fatalf("new session did not recover the persisted job: %+v", status)
+	}
+}
+
+func TestServeLeaderCrashRetainsRequestIdentity(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(root, "repo")
+	if err := os.Mkdir(repo, 0700); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("/usr/bin/git", append([]string{"-C", repo, "-c", "user.name=Ahenk Fixture", "-c", "user.email=fixture@example.invalid",
+			"-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"}, args...)...)
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=/var/empty", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("fixture git: %v %s", err, out)
+		}
+	}
+	git("init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "fixture.txt"), []byte("fixture\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "fixture.txt")
+	git("commit", "-m", "synthetic fixture")
+
+	const repoID = "demo"
+	const requestID = "lost-ack"
+	const objective = "Inspect the synthetic fixture"
+	stateDir := filepath.Join(root, "state")
+	cfgPath := filepath.Join(root, "config.json")
+	cfg, err := json.Marshal(model.Config{
+		StateDir: stateDir, EnableFixture: true,
+		Repositories: map[string]model.Repo{repoID: {Root: repo, AllowedPaths: []string{"fixture.txt"}, Providers: []string{"fixture-a"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, cfg, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	leader := startReconnectTestProcess(t, ctx, cfgPath)
+	leader.connect(t, ctx)
+	proxy := startReconnectTestProcess(t, ctx, cfgPath)
+	enc := json.NewEncoder(proxy.in)
+	send := func(frame map[string]any) {
+		t.Helper()
+		frame["jsonrpc"] = "2.0"
+		if err := enc.Encode(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send(map[string]any{"id": 1, "method": "initialize", "params": mcp.InitializeParams{
+		ProtocolVersion: "2025-06-18", ClientInfo: &mcp.Implementation{Name: "lost-ack-test", Version: "1.0"},
+	}})
+	var init struct {
+		ID     int
+		Result mcp.InitializeResult
+	}
+	if err := json.NewDecoder(proxy.out).Decode(&init); err != nil {
+		t.Fatalf("proxy initialize: %v", err)
+	}
+	if init.ID != 1 || init.Result.ServerInfo == nil || init.Result.ServerInfo.Name != "ahenk" {
+		t.Fatalf("proxy initialize returned %+v", init)
+	}
+	send(map[string]any{"method": "notifications/initialized"})
+	params := &mcp.CallToolParams{Name: "delegate_task", Arguments: map[string]any{
+		"repo_id": repoID, "request_id": requestID, "task": objective, "execution_mode": "async", "mode": "read_only",
+	}}
+	// Leave the response stream unread after initialize. The database, rather
+	// than the job ACK, tells the test when it can kill the leader.
+	send(map[string]any{"id": 2, "method": "tools/call", "params": params})
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var accepted model.Job
+	for accepted.ID == "" {
+		_, jobs, err := store.ReadEvidence(ctx, stateDir)
+		if err != nil {
+			t.Fatalf("read durable admission: %v", err)
+		}
+		if len(jobs) > 0 {
+			if len(jobs) != 1 || jobs[0].RepoID != repoID || jobs[0].RequestID != requestID || jobs[0].Task.Objective != objective {
+				t.Fatalf("unexpected durable admission: %+v", jobs)
+			}
+			accepted = jobs[0].Job
+			break
+		}
+		select {
+		case <-proxy.done:
+			t.Fatalf("proxy exited before durable admission: %v, %q", proxy.err, proxy.stderr.String())
+		case <-ctx.Done():
+			t.Fatalf("waiting for durable admission: %v", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+	if err := leader.cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	<-leader.done
+	select {
+	case <-proxy.done:
+		if proxy.err == nil || !strings.Contains(proxy.stderr.String(), "Reconnect to start a new MCP session") {
+			t.Fatalf("proxy did not report the reconnect boundary: %v, %q", proxy.err, proxy.stderr.String())
+		}
+	case <-ctx.Done():
+		t.Fatal("old proxy kept the disconnected session open")
+	}
+	_ = proxy.out.Close()
+
+	newSession := startReconnectTestProcess(t, ctx, cfgPath).connect(t, ctx)
+	for _, call := range []*mcp.CallToolParams{
+		{Name: "get_job_status", Arguments: map[string]string{"job_id": accepted.ID}},
+		params,
+	} {
+		res, err := newSession.CallTool(ctx, call)
+		if err != nil || res == nil || res.IsError {
+			t.Fatalf("%s after restart returned %+v, %v", call.Name, res, err)
+		}
+		out, ok := res.StructuredContent.(map[string]any)
+		if !ok || out["job_id"] != accepted.ID || out["repo_id"] != repoID {
+			t.Fatalf("%s after restart did not return the accepted job %q: %+v", call.Name, accepted.ID, res)
+		}
+	}
+	_, jobs, err := store.ReadEvidence(ctx, stateDir)
+	if err != nil || len(jobs) != 1 || jobs[0].ID != accepted.ID || jobs[0].RequestID != requestID {
+		t.Fatalf("retry did not preserve one durable job %q: %+v, %v", accepted.ID, jobs, err)
 	}
 }
 

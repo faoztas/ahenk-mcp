@@ -7,17 +7,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/faoztas/ahenk-mcp/internal/model"
 )
 
 type harnessRequest struct {
+	AttemptID    string   `json:"attempt_id,omitempty"`
+	CheckID      string   `json:"check_id,omitempty"`
 	JSONRPC      string   `json:"jsonrpc,omitempty"`
 	ID           any      `json:"id,omitempty"`
 	Method       string   `json:"method,omitempty"`
@@ -44,6 +49,7 @@ type harnessResponse struct {
 }
 
 func sendHarnessCall(t *testing.T, sockPath string, req harnessRequest) harnessResponse {
+	t.Helper()
 	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
 	if err != nil {
 		t.Fatalf("failed to dial harness socket: %v", err)
@@ -636,5 +642,449 @@ func TestHarnessServer_JSONRPCErrorShape(t *testing.T) {
 	}
 	if rpcResp.Error.Code == 0 || rpcResp.Error.Message == "" {
 		t.Fatalf("expected populated error {code, message}, got %+v", rpcResp.Error)
+	}
+}
+
+func TestHarnessCheckOnlyRegisteredIDs(t *testing.T) {
+	root := privateHarnessDir(t)
+	approved := "fixture.format"
+	checks := map[string]HarnessCheck{
+		approved: func(ctx context.Context) error {
+			return os.WriteFile(filepath.Join(root, "ran"), []byte("ok"), 0600)
+		},
+		"fixture.fail": func(context.Context) error { return errors.New("fixture failure") },
+	}
+	h, err := StartHarnessWithConfig(t.Context(), HarnessConfig{WorktreeRoot: root, AttemptID: "one", Checks: checks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	checks["late"] = checks[approved]
+	for _, req := range []harnessRequest{
+		{Tool: "check", AttemptID: "one", CheckID: "late"},
+		{Tool: "check", AttemptID: "one", CheckID: "unknown"},
+		{Tool: "check", AttemptID: "other", CheckID: approved},
+		{Tool: "check", CheckID: approved},
+	} {
+		resp := sendHarnessCall(t, h.SocketPath(), req)
+		if resp.Success || !strings.Contains(resp.Error, "POLICY_DENIED") {
+			t.Errorf("denied check: %+v", resp)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "ran")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("denied check ran: %v", err)
+	}
+	resp := sendHarnessCall(t, h.SocketPath(), harnessRequest{Method: "tools/call", Params: map[string]any{"name": "check", "arguments": map[string]string{"attempt_id": "one", "check_id": approved}}})
+	if !resp.Success {
+		t.Errorf("registered check failed: %+v", resp)
+	}
+	if b, err := os.ReadFile(filepath.Join(root, "ran")); err != nil || string(b) != "ok" {
+		t.Errorf("missing check result: %q, %v", b, err)
+	}
+	resp = sendHarnessCall(t, h.SocketPath(), harnessRequest{Tool: "check", AttemptID: "one", CheckID: "fixture.fail"})
+	if resp.Success || !strings.Contains(resp.Error, "CHECK_FAILED") {
+		t.Errorf("failed registered check: %+v", resp)
+	}
+	if h.IsFinished() || h.IsSuccess() {
+		t.Fatal("check changed attempt completion")
+	}
+}
+
+func TestHarnessAttemptScopeKeepsFilesAndSessionsSeparate(t *testing.T) {
+	root := privateHarnessDir(t)
+	for _, file := range []string{"inside", "other"} {
+		if err := os.WriteFile(filepath.Join(root, file), []byte(file), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("other", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	h, err := StartHarnessWithConfig(t.Context(), HarnessConfig{WorktreeRoot: root, AttemptID: "one", CurrentDepth: 1, MaxDepth: 1, AllowedPaths: []string{"inside", "link"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	for _, req := range []harnessRequest{
+		{Tool: "read_file", AttemptID: "two", Path: "inside"},
+		{Tool: "edit_file", AttemptID: "two", Path: "inside", Content: "changed"},
+		{Tool: "finish", AttemptID: "two", Summary: "wrong"},
+		{Tool: "read_file", AttemptID: "one", Path: "other"},
+		{Tool: "edit_file", AttemptID: "one", Path: "other", Content: "changed"},
+		{Tool: "read_file", AttemptID: "one", Path: "link"},
+		{Tool: "edit_file", AttemptID: "one", Path: "link", Content: "changed"},
+		{Tool: "delegate_task", AttemptID: "one"},
+	} {
+		resp := sendHarnessCall(t, h.SocketPath(), req)
+		if resp.Success || resp.Data != "" || resp.Error == "" {
+			t.Errorf("allowed %+v: %+v", req, resp)
+		}
+	}
+	if h.IsFinished() || h.Summary() != "" {
+		t.Fatal("denied request finished attempt")
+	}
+	for _, file := range []string{"inside", "other"} {
+		if b, err := os.ReadFile(filepath.Join(root, file)); err != nil || string(b) != file {
+			t.Errorf("denied request modified %s: %q, %v", file, b, err)
+		}
+	}
+	if r := sendHarnessCall(t, h.SocketPath(), harnessRequest{Tool: "read_file", AttemptID: "one", Path: "inside"}); !r.Success || r.Data != "inside" {
+		t.Errorf("scoped read: %+v", r)
+	}
+}
+
+func TestHarnessClosesConnectionsAndPrivateSocketOnAttemptExit(t *testing.T) {
+	for _, exit := range []string{"eof", "cancel", "timeout"} {
+		t.Run(exit, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), strings.Repeat("long", 32))
+			if err := os.Mkdir(root, 0700); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if exit == "timeout" {
+				var stop context.CancelFunc
+				ctx, stop = context.WithTimeout(ctx, 1200*time.Millisecond)
+				defer stop()
+			}
+			h, err := StartHarness(ctx, root, []string{"."}, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Close()
+			conn, err := net.DialTimeout("unix", h.SocketPath(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if exit == "eof" {
+				if err := h.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else if exit == "cancel" {
+				cancel()
+			}
+			if err := conn.SetReadDeadline(time.Now().Add(4 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := conn.Read(make([]byte, 1)); err == nil {
+				t.Error("connection remains usable")
+			} else if e, ok := err.(net.Error); ok && e.Timeout() {
+				t.Fatal("attempt exit left an idle connection open")
+			}
+			if err := h.Close(); err != nil {
+				t.Fatalf("explicit cleanup after attempt exit: %v", err)
+			}
+			for _, path := range []string{h.SocketPath(), h.ActualSocketPath(), h.aliasDir} {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("socket remains at %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestHarnessAttemptPinsWorktreeAndRefusesSharedFiles(t *testing.T) {
+	base := filepath.Join(t.TempDir(), ".workspace")
+	if err := os.Mkdir(base, 0700); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(base, "work")
+	other := filepath.Join(base, "other")
+	for _, dir := range []string{root, other} {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "note"), []byte(filepath.Base(dir)), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Link(filepath.Join(other, "note"), filepath.Join(root, "shared")); err != nil {
+		t.Fatal(err)
+	}
+	h, err := StartHarnessWithConfig(t.Context(), HarnessConfig{WorktreeRoot: root, SocketPath: filepath.Join(base, "private.sock"), AllowedPaths: []string{"note", "shared"}, AttemptID: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if r := sendHarnessCall(t, h.SocketPath(), harnessRequest{Tool: "edit_file", AttemptID: "one", Path: "shared", Content: "changed"}); r.Success {
+		t.Error("attempt wrote a shared file")
+	}
+	if err := os.Rename(root, filepath.Join(base, "original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, root); err != nil {
+		t.Fatal(err)
+	}
+	r := sendHarnessCall(t, h.SocketPath(), harnessRequest{Tool: "read_file", AttemptID: "one", Path: "note"})
+	if r.Success && r.Data != "work" {
+		t.Errorf("read replacement worktree: %+v", r)
+	}
+	if b, err := os.ReadFile(filepath.Join(other, "note")); err != nil || string(b) != "other" {
+		t.Errorf("shared file changed: %q %v", b, err)
+	}
+}
+
+func TestHarnessCancelInterruptsRegisteredCheck(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	started, stopped := make(chan struct{}), make(chan struct{})
+	h, err := StartHarnessWithConfig(ctx, HarnessConfig{WorktreeRoot: privateHarnessDir(t), AttemptID: "one", Checks: map[string]HarnessCheck{"wait": func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		close(stopped)
+		return ctx.Err()
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	conn, err := DialHarness(h.SocketPath(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := json.NewEncoder(conn).Encode(harnessRequest{Tool: "check", AttemptID: "one", CheckID: "wait"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("check never started")
+	}
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("check outlived attempt cancellation")
+	}
+}
+
+func TestHarnessAttemptFinishIsTerminal(t *testing.T) {
+	root := privateHarnessDir(t)
+	h, err := StartHarnessWithConfig(t.Context(), HarnessConfig{WorktreeRoot: root, AttemptID: "one", AllowedPaths: []string{"note"}, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	edit := harnessRequest{Tool: "edit_file", AttemptID: "one", Path: "note", Content: "updated"}
+	if r := sendHarnessCall(t, h.SocketPath(), edit); r.Success {
+		t.Fatal("read-only attempt wrote a file")
+	}
+	if r := sendHarnessCall(t, h.SocketPath(), harnessRequest{Tool: "finish", AttemptID: "one", Summary: "first"}); !r.Success {
+		t.Fatal(r)
+	}
+	if r := sendHarnessCall(t, h.SocketPath(), harnessRequest{Tool: "finish", AttemptID: "one", Summary: "second"}); r.Success || h.Summary() != "first" {
+		t.Fatal("worker rewrote its completion report")
+	}
+	if _, err := os.Stat(filepath.Join(root, "note")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("read-only attempt changed worktree")
+	}
+}
+
+func TestHarnessClosePreservesReplacementSocketEntry(t *testing.T) {
+	h, err := StartHarness(t.Context(), privateHarnessDir(t), nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	path := h.ActualSocketPath()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err == nil {
+		t.Fatal("replaced endpoint accepted as clean shutdown")
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "replacement" {
+		t.Fatalf("replacement lost: %q %v", b, err)
+	}
+}
+
+func privateHarnessDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestHarnessRequiresIdentityForRegisteredChecks(t *testing.T) {
+	root := privateHarnessDir(t)
+	h, err := StartHarnessWithConfig(t.Context(), HarnessConfig{WorktreeRoot: root, Checks: map[string]HarnessCheck{"fixture": func(context.Context) error { return nil }}})
+	if err == nil {
+		h.Close()
+		t.Fatal("started an unbound check endpoint")
+	}
+	files, err := os.ReadDir(root)
+	if err != nil || len(files) != 0 {
+		t.Fatalf("attempt root after rejection: %v %v", files, err)
+	}
+	h, err = StartHarness(t.Context(), root, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHarnessScopedSiblingSocketsRemainIndependent(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), ".workspace")
+	for _, id := range []string{"one", "two"} {
+		if err := os.MkdirAll(filepath.Join(workspace, id), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := func(id string) *HarnessServer {
+		h, err := StartHarnessWithConfig(t.Context(), HarnessConfig{WorktreeRoot: filepath.Join(workspace, id), AttemptID: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = h.Close() })
+		return h
+	}
+	first, second := start("one"), start("two")
+	info, err := os.Lstat(second.ActualSocketPath())
+	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0600 || int(info.Sys().(*syscall.Stat_t).Uid) != os.Geteuid() {
+		t.Fatalf("unsafe attempt socket: %v %v", info, err)
+	}
+	if first.ActualSocketPath() == second.ActualSocketPath() {
+		t.Fatal("siblings share endpoint")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if r := sendHarnessCall(t, second.SocketPath(), harnessRequest{Tool: "finish", AttemptID: "two", Summary: "two done"}); !r.Success || second.Summary() != "two done" {
+		t.Fatal(r)
+	}
+}
+
+func TestHarnessRejectsUnownedOrUnconfinedSocketParent(t *testing.T) {
+	info, err := os.Lstat(privateHarnessDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if harnessDirectoryOwnedBy(info, os.Geteuid()+1) {
+		t.Fatal("accepted private directory owned by another identity")
+	}
+	for _, scenario := range []string{"workspace symlink", "worktree below workspace symlink", "foreign explicit parent", "shared writable parent", "nonprivate parent"} {
+		t.Run(scenario, func(t *testing.T) {
+			root, external := privateHarnessDir(t), privateHarnessDir(t)
+			cfg := HarnessConfig{WorktreeRoot: root, AttemptID: "one"}
+			switch scenario {
+			case "workspace symlink":
+				if err := os.Symlink(external, filepath.Join(root, ".workspace")); err != nil {
+					t.Fatal(err)
+				}
+			case "worktree below workspace symlink":
+				if err := os.Symlink(external, filepath.Join(root, ".workspace")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(filepath.Join(external, "work"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				cfg.WorktreeRoot = filepath.Join(root, ".workspace", "work")
+			case "foreign explicit parent":
+				cfg.SocketPath = filepath.Join(external, "socket")
+			case "shared writable parent":
+				if err := os.Chmod(root, 0777); err != nil {
+					t.Fatal(err)
+				}
+			case "nonprivate parent":
+				if err := os.Chmod(root, 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h, err := StartHarnessWithConfig(t.Context(), cfg)
+			if err == nil {
+				h.Close()
+				t.Fatal("opened endpoint in unsafe parent")
+			}
+			if err := filepath.WalkDir(external, func(path string, d os.DirEntry, err error) error {
+				if err == nil && d.Type()&os.ModeSocket != 0 {
+					t.Errorf("socket outside attempt: %s", path)
+				}
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestHarnessBoundsFramesAndEdits(t *testing.T) {
+	root := filepath.Join(privateHarnessDir(t), "work")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(root, "note")
+	if err := os.WriteFile(p, []byte("before"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h, err := StartHarness(t.Context(), root, []string{"note"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if err := h.EditFile("note", strings.Repeat("a", maxHarnessReadBytes+1), "before"); err == nil {
+		t.Error("oversize edit accepted")
+	}
+	c, err := net.Dial("unix", h.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	enc, dec := json.NewEncoder(c), json.NewDecoder(c)
+	for range 3 {
+		if err := enc.Encode(HarnessRequest{Tool: "read_file", Path: "note"}); err != nil {
+			t.Fatal(err)
+		}
+		var resp HarnessResponse
+		if err := dec.Decode(&resp); err != nil || !resp.Success || resp.Data != "before" {
+			t.Errorf("read after rejected edit: %v", err)
+			break
+		}
+	}
+	// An ignored padding member still counts against the frame budget.
+	err = enc.Encode(map[string]string{"tool": "edit_file", "path": "note", "content": "oversized frame", "padding": strings.Repeat("x", 9<<20)})
+	if err == nil {
+		var resp HarnessResponse
+		if dec.Decode(&resp) == nil && resp.Success {
+			t.Error("oversized frame dispatched")
+		}
+	}
+	if b, _ := os.ReadFile(p); string(b) != "before" {
+		t.Error("oversize input modified original")
+	}
+}
+
+func TestHarnessPartialEditPreservesOriginal(t *testing.T) {
+	dir := privateHarnessDir(t)
+	parent, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	if err := os.WriteFile(filepath.Join(dir, "note"), []byte("before"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("fixture write source failure")
+	for _, name := range []string{"note", "new"} {
+		input := io.MultiReader(strings.NewReader("partial"), iotest.ErrReader(injected))
+		if err := publishHarnessEdit(parent, name, input, ""); !errors.Is(err, injected) {
+			t.Fatal("expected injected error", err)
+		}
+	}
+	data, err := parent.ReadFile("note")
+	if err != nil || string(data) != "before" {
+		t.Fatal("original changed", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 {
+		t.Fatal("partial edit left an entry", err)
 	}
 }

@@ -83,7 +83,10 @@ func sanitizeCodexEffort(effort string) string {
 
 // BuildCodexArgs constructs the CLI argument list based on model, effort, sandbox mode, and work directory.
 func BuildCodexArgs(modelID, effort string, sandbox SandboxMode, work string) ([]string, error) {
-	effort = sanitizeCodexEffort(effort)
+	return codexCommandArgs(modelID, sanitizeCodexEffort(effort), sandbox, work), nil
+}
+
+func codexCommandArgs(modelID, effort string, sandbox SandboxMode, work string) []string {
 	args := []string{"exec", "--json", "--ephemeral", "--skip-git-repo-check"}
 	if sandbox == SandboxModeReadOnly {
 		args = append(args, "--sandbox", "read-only")
@@ -93,11 +96,14 @@ func BuildCodexArgs(modelID, effort string, sandbox SandboxMode, work string) ([
 	if modelID != "" {
 		args = append(args, "-m", modelID)
 	}
-	args = append(args, "-c", `model_reasoning_effort="`+effort+`"`, "-c", "mcp_servers.ahenk.enabled=false")
+	if effort != "" {
+		args = append(args, "-c", `model_reasoning_effort="`+effort+`"`)
+	}
+	args = append(args, "-c", "mcp_servers.ahenk.enabled=false")
 	if work != "" {
 		args = append(args, "-C", work)
 	}
-	return args, nil
+	return args
 }
 
 // codexArgs builds the codex exec argument list for compatibility.
@@ -115,13 +121,14 @@ func codexEnv(base []string, tempDir string, currentDepth, maxDepth int) []strin
 
 // RunCodexCLI executes the native codex CLI in a subprocess with process group isolation and streaming JSONL parsing.
 func RunCodexCLI(ctx context.Context, worktreeDir string, modelID string, effort string, prompt string, sandbox SandboxMode, binPath string) (*CLIRunResult, error) {
+	return runCodexCLI(ctx, worktreeDir, modelID, sanitizeCodexEffort(effort), prompt, sandbox, binPath)
+}
+
+func runCodexCLI(ctx context.Context, worktreeDir, modelID, effort, prompt string, sandbox SandboxMode, binPath string) (*CLIRunResult, error) {
 	if binPath == "" {
 		binPath = "codex"
 	}
-	args, err := BuildCodexArgs(modelID, effort, sandbox, worktreeDir)
-	if err != nil {
-		return nil, err
-	}
+	args := codexCommandArgs(modelID, effort, sandbox, worktreeDir)
 
 	cmd := exec.Command(binPath, args...)
 	if worktreeDir != "" {

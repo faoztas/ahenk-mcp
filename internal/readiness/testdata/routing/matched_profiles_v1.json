@@ -1,0 +1,1426 @@
+{
+  "fixture_version": "b1-routing-v1",
+  "schema_version": "2026-11-23.v1",
+  "protocol": {
+    "pre_registered": true,
+    "hypothesis": "Price-performance profile preserves verified task accuracy within 5pp of the fixed frontier reference while reducing measurable cost by at least 10% and keeping p95 latency within +25%.",
+    "primary_metric": "verified_success_rate",
+    "drift_thresholds": {
+      "fp_max_accuracy_drop_pp": 5.0,
+      "fp_min_measurable_cost_gain_pct": 10.0,
+      "fp_max_p95_latency_increase_pct": 25.0,
+      "quality_min_success_rate": 0.9,
+      "price_max_extra_spend": 0.0
+    },
+    "budget_limit": {
+      "max_total_calls": 64,
+      "max_paid_spend": 2.5,
+      "allow_live_quota_consumption": false
+    },
+    "sample_plan": {
+      "min_matched_cases_per_profile": 12,
+      "min_cases_per_role": 1,
+      "required_roles": [
+        "coding",
+        "debugging",
+        "code_review",
+        "planning"
+      ]
+    },
+    "recorded_at": "2026-11-23T15:00:00Z",
+    "environment": {
+      "cpu": "Intel(R) Core(TM) i9-9980HK CPU @ 2.40GHz",
+      "platform": "darwin/amd64",
+      "worktree": "synthetic-trusted-local-v1",
+      "stdout_json_ingestion_ms": 4,
+      "observer_io_ms": 7,
+      "provider_mode": "offline_simulated"
+    }
+  },
+  "runs": [
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-coding-01",
+      "role": "coding",
+      "task_variant": "go-window-slice-bounds-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestWindowSliceBounds"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "reference",
+      "run_order": 1,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 72.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-coding-01-ref",
+          "job_id": "job-coding-01-ref",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestWindowSliceBounds",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 14200,
+          "cost_unit": "usd",
+          "reported_cost": 0.12,
+          "cost_evidence": {
+            "policy": "METERED_API",
+            "status": "REPORTED_USAGE",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "VERIFIED",
+            "account": "codex-primary"
+          }
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 14200,
+      "cost_unit": "usd",
+      "reported_cost": 0.12
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-coding-01",
+      "role": "coding",
+      "task_variant": "go-window-slice-bounds-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestWindowSliceBounds"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price_performance",
+      "run_order": 2,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "agy",
+        "source": "codexbar_app",
+        "account": "SAME_NATIVE_CLI_CONTEXT",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "gemini-weekly",
+        "remaining_percent": 64.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-coding-01-fp",
+          "job_id": "job-coding-01-fp",
+          "provider": "agy",
+          "model": "gemini-3.8-flash-medium",
+          "effort": "medium",
+          "account": "SAME_NATIVE_CLI_CONTEXT",
+          "quota_window": "gemini-weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "1111111111111111111111111111111111111111111111111111111111111112",
+            "artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestWindowSliceBounds",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 9800,
+          "cost_unit": "quota_percent_weekly",
+          "reported_cost": 0.4,
+          "cost_evidence": {
+            "policy": "SUBSCRIPTION_ONLY",
+            "status": "DOCUMENTED_COST_PROTECTION",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "UNKNOWN",
+            "account": "SAME_NATIVE_CLI_CONTEXT"
+          }
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 9800,
+      "cost_unit": "quota_percent_weekly",
+      "reported_cost": 0.4
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-coding-01",
+      "role": "coding",
+      "task_variant": "go-window-slice-bounds-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestWindowSliceBounds"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "quality",
+      "run_order": 3,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 70.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-coding-01-qual",
+          "job_id": "job-coding-01-qual",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "1111111111111111111111111111111111111111111111111111111111111113",
+            "artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestWindowSliceBounds",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 14500,
+          "cost_unit": "usd",
+          "reported_cost": 0.12,
+          "cost_evidence": {
+            "policy": "METERED_API",
+            "status": "REPORTED_USAGE",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "VERIFIED",
+            "account": "codex-primary"
+          }
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 14500,
+      "cost_unit": "usd",
+      "reported_cost": 0.12
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-coding-01",
+      "role": "coding",
+      "task_variant": "go-window-slice-bounds-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestWindowSliceBounds"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price",
+      "run_order": 4,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "source": "opencode_cooldown_history",
+        "account": "ANONYMOUS",
+        "account_bound": false,
+        "fresh": true,
+        "state": "UNKNOWN"
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-coding-01-price",
+          "job_id": "job-coding-01-price",
+          "provider": "opencode",
+          "model": "opencode/glm-5.3-flash-free",
+          "account": "ANONYMOUS",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "1111111111111111111111111111111111111111111111111111111111111114",
+            "artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestWindowSliceBounds",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 3200,
+          "cost_unit": "usd",
+          "reported_cost": 0.0,
+          "cost_evidence": {
+            "policy": "FREE_ONLY",
+            "status": "ZERO_PRICE_CATALOG",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "VERIFIED",
+            "account": "ANONYMOUS"
+          }
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 3200,
+      "cost_unit": "usd",
+      "reported_cost": 0.0
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-debugging-01",
+      "role": "debugging",
+      "task_variant": "go-nil-map-recovery-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestNilMapRecovery"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "reference",
+      "run_order": 2,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 68.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-debug-01-ref",
+          "job_id": "job-debug-01-ref",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "2222222222222222222222222222222222222222222222222222222222222221",
+            "artifact_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestNilMapRecovery",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 15100,
+          "cost_unit": "usd",
+          "reported_cost": 0.14
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 15100,
+      "cost_unit": "usd",
+      "reported_cost": 0.14
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-debugging-01",
+      "role": "debugging",
+      "task_variant": "go-nil-map-recovery-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestNilMapRecovery"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price_performance",
+      "run_order": 3,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "agy",
+        "source": "codexbar_app",
+        "account": "SAME_NATIVE_CLI_CONTEXT",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "gemini-weekly",
+        "remaining_percent": 63.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-debug-01-fp",
+          "job_id": "job-debug-01-fp",
+          "provider": "agy",
+          "model": "gemini-3.8-flash-medium",
+          "effort": "medium",
+          "account": "SAME_NATIVE_CLI_CONTEXT",
+          "quota_window": "gemini-weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "artifact_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestNilMapRecovery",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 10300,
+          "cost_unit": "quota_percent_weekly",
+          "reported_cost": 0.4
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 10300,
+      "cost_unit": "quota_percent_weekly",
+      "reported_cost": 0.4
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-debugging-01",
+      "role": "debugging",
+      "task_variant": "go-nil-map-recovery-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestNilMapRecovery"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "quality",
+      "run_order": 4,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 66.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-debug-01-qual",
+          "job_id": "job-debug-01-qual",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "2222222222222222222222222222222222222222222222222222222222222223",
+            "artifact_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestNilMapRecovery",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 14900,
+          "cost_unit": "usd",
+          "reported_cost": 0.14
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 14900,
+      "cost_unit": "usd",
+      "reported_cost": 0.14
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-debugging-01",
+      "role": "debugging",
+      "task_variant": "go-nil-map-recovery-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestNilMapRecovery"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price",
+      "run_order": 1,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "source": "opencode_cooldown_history",
+        "account": "ANONYMOUS",
+        "account_bound": false,
+        "fresh": true,
+        "state": "UNKNOWN"
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-debug-01-price",
+          "job_id": "job-debug-01-price",
+          "provider": "opencode",
+          "model": "opencode/glm-5.3-flash-free",
+          "account": "ANONYMOUS",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "2222222222222222222222222222222222222222222222222222222222222224",
+            "artifact_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbd",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestNilMapRecovery",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 3450,
+          "cost_unit": "usd",
+          "reported_cost": 0.0
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 3450,
+      "cost_unit": "usd",
+      "reported_cost": 0.0
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-review-defective-01",
+      "role": "code_review",
+      "task_variant": "review-unlocked-map-write-defective-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-review-handoff-v1",
+        "artifact_expectation": "defective",
+        "expected_verdict": "CHANGES_REQUESTED",
+        "artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "reference",
+      "run_order": 3,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 65.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-rev-def-01-ref",
+          "job_id": "job-rev-def-01-ref",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "3333333333333333333333333333333333333333333333333333333333333331",
+            "artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "reported_success": true
+          },
+          "verification": {
+            "review_result": {
+              "verdict": "CHANGES_REQUESTED",
+              "findings": [
+                {
+                  "severity": "high",
+                  "path": "cache.go",
+                  "message": " concurrent map write without mutex lock"
+                }
+              ],
+              "artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "source_job_id": "job-source-defective-01",
+              "source_attempt": 1,
+              "deterministic_check_status": "PASSED"
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 11200,
+          "cost_unit": "usd",
+          "reported_cost": 0.09
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 11200,
+      "cost_unit": "usd",
+      "reported_cost": 0.09
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-review-defective-01",
+      "role": "code_review",
+      "task_variant": "review-unlocked-map-write-defective-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-review-handoff-v1",
+        "artifact_expectation": "defective",
+        "expected_verdict": "CHANGES_REQUESTED",
+        "artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price_performance",
+      "run_order": 4,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "agy",
+        "source": "codexbar_app",
+        "account": "SAME_NATIVE_CLI_CONTEXT",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "gemini-weekly",
+        "remaining_percent": 61.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-rev-def-01-fp",
+          "job_id": "job-rev-def-01-fp",
+          "provider": "agy",
+          "model": "gemini-3.8-flash-medium",
+          "effort": "medium",
+          "account": "SAME_NATIVE_CLI_CONTEXT",
+          "quota_window": "gemini-weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "3333333333333333333333333333333333333333333333333333333333333332",
+            "artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "reported_success": true
+          },
+          "verification": {
+            "review_result": {
+              "verdict": "CHANGES_REQUESTED",
+              "findings": [
+                {
+                  "severity": "high",
+                  "path": "cache.go",
+                  "message": "concurrent map mutation requires synchronization"
+                }
+              ],
+              "artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "source_job_id": "job-source-defective-01",
+              "source_attempt": 1,
+              "deterministic_check_status": "PASSED"
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 8400,
+          "cost_unit": "quota_percent_weekly",
+          "reported_cost": 0.3
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 8400,
+      "cost_unit": "quota_percent_weekly",
+      "reported_cost": 0.3
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-review-defective-01",
+      "role": "code_review",
+      "task_variant": "review-unlocked-map-write-defective-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-review-handoff-v1",
+        "artifact_expectation": "defective",
+        "expected_verdict": "CHANGES_REQUESTED",
+        "artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "quality",
+      "run_order": 1,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 64.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-rev-def-01-qual",
+          "job_id": "job-rev-def-01-qual",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "reported_success": true
+          },
+          "verification": {
+            "review_result": {
+              "verdict": "CHANGES_REQUESTED",
+              "findings": [
+                {
+                  "severity": "critical",
+                  "path": "cache.go",
+                  "message": "data race on shared map write"
+                }
+              ],
+              "artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "source_job_id": "job-source-defective-01",
+              "source_attempt": 1,
+              "deterministic_check_status": "PASSED"
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 11500,
+          "cost_unit": "usd",
+          "reported_cost": 0.09
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 11500,
+      "cost_unit": "usd",
+      "reported_cost": 0.09
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-review-defective-01",
+      "role": "code_review",
+      "task_variant": "review-unlocked-map-write-defective-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-review-handoff-v1",
+        "artifact_expectation": "defective",
+        "expected_verdict": "CHANGES_REQUESTED",
+        "artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price",
+      "run_order": 2,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "source": "opencode_cooldown_history",
+        "account": "ANONYMOUS",
+        "account_bound": false,
+        "fresh": true,
+        "state": "UNKNOWN"
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-rev-def-01-price",
+          "job_id": "job-rev-def-01-price",
+          "provider": "opencode",
+          "model": "opencode/glm-5.3-flash-free",
+          "account": "ANONYMOUS",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "3333333333333333333333333333333333333333333333333333333333333334",
+            "artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "reported_success": true
+          },
+          "verification": {
+            "review_result": {
+              "verdict": "CHANGES_REQUESTED",
+              "findings": [
+                {
+                  "severity": "high",
+                  "path": "cache.go",
+                  "message": "unsynchronized map write in Set()"
+                }
+              ],
+              "artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "source_job_id": "job-source-defective-01",
+              "source_attempt": 1,
+              "deterministic_check_status": "PASSED"
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 2900,
+          "cost_unit": "usd",
+          "reported_cost": 0.0
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 2900,
+      "cost_unit": "usd",
+      "reported_cost": 0.0
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-review-clean-01",
+      "role": "code_review",
+      "task_variant": "review-mutex-guarded-clean-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-review-handoff-v1",
+        "artifact_expectation": "clean",
+        "expected_verdict": "APPROVED",
+        "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "reference",
+      "run_order": 4,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 62.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-rev-clean-01-ref",
+          "job_id": "job-rev-clean-01-ref",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "4444444444444444444444444444444444444444444444444444444444444441",
+            "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "reported_success": true
+          },
+          "verification": {
+            "review_result": {
+              "verdict": "APPROVED",
+              "findings": [],
+              "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "source_job_id": "job-source-clean-01",
+              "source_attempt": 1,
+              "deterministic_check_status": "PASSED"
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 10800,
+          "cost_unit": "usd",
+          "reported_cost": 0.08
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 10800,
+      "cost_unit": "usd",
+      "reported_cost": 0.08
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-review-clean-01",
+      "role": "code_review",
+      "task_variant": "review-mutex-guarded-clean-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-review-handoff-v1",
+        "artifact_expectation": "clean",
+        "expected_verdict": "APPROVED",
+        "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price_performance",
+      "run_order": 1,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "agy",
+        "source": "codexbar_app",
+        "account": "SAME_NATIVE_CLI_CONTEXT",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "gemini-weekly",
+        "remaining_percent": 60.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-rev-clean-01-fp",
+          "job_id": "job-rev-clean-01-fp",
+          "provider": "agy",
+          "model": "gemini-3.8-flash-medium",
+          "effort": "medium",
+          "account": "SAME_NATIVE_CLI_CONTEXT",
+          "quota_window": "gemini-weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "4444444444444444444444444444444444444444444444444444444444444442",
+            "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "reported_success": true
+          },
+          "verification": {
+            "review_result": {
+              "verdict": "APPROVED",
+              "findings": [],
+              "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "source_job_id": "job-source-clean-01",
+              "source_attempt": 1,
+              "deterministic_check_status": "PASSED"
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 7900,
+          "cost_unit": "quota_percent_weekly",
+          "reported_cost": 0.3
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 7900,
+      "cost_unit": "quota_percent_weekly",
+      "reported_cost": 0.3
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-review-clean-01",
+      "role": "code_review",
+      "task_variant": "review-mutex-guarded-clean-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-review-handoff-v1",
+        "artifact_expectation": "clean",
+        "expected_verdict": "APPROVED",
+        "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "quality",
+      "run_order": 2,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 61.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-rev-clean-01-qual",
+          "job_id": "job-rev-clean-01-qual",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "4444444444444444444444444444444444444444444444444444444444444443",
+            "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "reported_success": true
+          },
+          "verification": {
+            "review_result": {
+              "verdict": "APPROVED",
+              "findings": [],
+              "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "source_job_id": "job-source-clean-01",
+              "source_attempt": 1,
+              "deterministic_check_status": "PASSED"
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 11000,
+          "cost_unit": "usd",
+          "reported_cost": 0.08
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 11000,
+      "cost_unit": "usd",
+      "reported_cost": 0.08
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-review-clean-01",
+      "role": "code_review",
+      "task_variant": "review-mutex-guarded-clean-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-review-handoff-v1",
+        "artifact_expectation": "clean",
+        "expected_verdict": "APPROVED",
+        "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price",
+      "run_order": 3,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "source": "opencode_cooldown_history",
+        "account": "ANONYMOUS",
+        "account_bound": false,
+        "fresh": true,
+        "state": "UNKNOWN"
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-rev-clean-01-price",
+          "job_id": "job-rev-clean-01-price",
+          "provider": "opencode",
+          "model": "opencode/glm-5.3-flash-free",
+          "account": "ANONYMOUS",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+            "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "reported_success": true
+          },
+          "verification": {
+            "review_result": {
+              "verdict": "APPROVED",
+              "findings": [],
+              "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "source_job_id": "job-source-clean-01",
+              "source_attempt": 1,
+              "deterministic_check_status": "PASSED"
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 2750,
+          "cost_unit": "usd",
+          "reported_cost": 0.0
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 2750,
+      "cost_unit": "usd",
+      "reported_cost": 0.0
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-planning-01",
+      "role": "planning",
+      "task_variant": "dag-three-stage-migration-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-plan-dag-v1",
+        "require_dag_valid": true,
+        "required_plan_nodes": [
+          "prepare",
+          "migrate",
+          "verify"
+        ]
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "reference",
+      "run_order": 1,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 58.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-plan-01-ref",
+          "job_id": "job-plan-01-ref",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "5555555555555555555555555555555555555555555555555555555555555551",
+            "reported_success": true
+          },
+          "verification": {
+            "plan_nodes": [
+              {
+                "key": "prepare"
+              },
+              {
+                "key": "migrate",
+                "depends_on": [
+                  "prepare"
+                ]
+              },
+              {
+                "key": "verify",
+                "depends_on": [
+                  "migrate"
+                ]
+              }
+            ],
+            "independent_verified": true
+          },
+          "latency_ms": 12400,
+          "cost_unit": "usd",
+          "reported_cost": 0.1
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 12400,
+      "cost_unit": "usd",
+      "reported_cost": 0.1
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-planning-01",
+      "role": "planning",
+      "task_variant": "dag-three-stage-migration-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-plan-dag-v1",
+        "require_dag_valid": true,
+        "required_plan_nodes": [
+          "prepare",
+          "migrate",
+          "verify"
+        ]
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price_performance",
+      "run_order": 2,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "agy",
+        "source": "codexbar_app",
+        "account": "SAME_NATIVE_CLI_CONTEXT",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "gemini-weekly",
+        "remaining_percent": 57.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-plan-01-fp",
+          "job_id": "job-plan-01-fp",
+          "provider": "agy",
+          "model": "gemini-3.8-flash-medium",
+          "effort": "medium",
+          "account": "SAME_NATIVE_CLI_CONTEXT",
+          "quota_window": "gemini-weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "5555555555555555555555555555555555555555555555555555555555555552",
+            "reported_success": true
+          },
+          "verification": {
+            "plan_nodes": [
+              {
+                "key": "prepare"
+              },
+              {
+                "key": "migrate",
+                "depends_on": [
+                  "prepare"
+                ]
+              },
+              {
+                "key": "verify",
+                "depends_on": [
+                  "migrate"
+                ]
+              }
+            ],
+            "independent_verified": true
+          },
+          "latency_ms": 9100,
+          "cost_unit": "quota_percent_weekly",
+          "reported_cost": 0.35
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 9100,
+      "cost_unit": "quota_percent_weekly",
+      "reported_cost": 0.35
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-planning-01",
+      "role": "planning",
+      "task_variant": "dag-three-stage-migration-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-plan-dag-v1",
+        "require_dag_valid": true,
+        "required_plan_nodes": [
+          "prepare",
+          "migrate",
+          "verify"
+        ]
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "quality",
+      "run_order": 3,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-primary",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 56.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-plan-01-qual",
+          "job_id": "job-plan-01-qual",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-primary",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "5555555555555555555555555555555555555555555555555555555555555553",
+            "reported_success": true
+          },
+          "verification": {
+            "plan_nodes": [
+              {
+                "key": "prepare"
+              },
+              {
+                "key": "migrate",
+                "depends_on": [
+                  "prepare"
+                ]
+              },
+              {
+                "key": "verify",
+                "depends_on": [
+                  "migrate"
+                ]
+              }
+            ],
+            "independent_verified": true
+          },
+          "latency_ms": 12700,
+          "cost_unit": "usd",
+          "reported_cost": 0.1
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 12700,
+      "cost_unit": "usd",
+      "reported_cost": 0.1
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-planning-01",
+      "role": "planning",
+      "task_variant": "dag-three-stage-migration-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-plan-dag-v1",
+        "require_dag_valid": true,
+        "required_plan_nodes": [
+          "prepare",
+          "migrate",
+          "verify"
+        ]
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price",
+      "run_order": 4,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "agy",
+        "source": "codexbar_app",
+        "account": "SAME_NATIVE_CLI_CONTEXT",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "gemini-weekly",
+        "remaining_percent": 55.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-plan-01-price",
+          "job_id": "job-plan-01-price",
+          "provider": "agy",
+          "model": "gemini-3.8-flash-medium",
+          "effort": "medium",
+          "account": "SAME_NATIVE_CLI_CONTEXT",
+          "quota_window": "gemini-weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "5555555555555555555555555555555555555555555555555555555555555554",
+            "reported_success": true
+          },
+          "verification": {
+            "plan_nodes": [
+              {
+                "key": "prepare"
+              },
+              {
+                "key": "migrate",
+                "depends_on": [
+                  "prepare"
+                ]
+              },
+              {
+                "key": "verify",
+                "depends_on": [
+                  "migrate"
+                ]
+              }
+            ],
+            "independent_verified": true
+          },
+          "latency_ms": 8900,
+          "cost_unit": "quota_percent_weekly",
+          "reported_cost": "UNKNOWN"
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 8900,
+      "cost_unit": "quota_percent_weekly",
+      "reported_cost": "UNKNOWN"
+    }
+  ]
+}

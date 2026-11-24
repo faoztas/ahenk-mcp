@@ -4,6 +4,7 @@
 package orchestration
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -480,7 +481,7 @@ func TestImplementationPreservesPrimaryErrorOnCleanupFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	e, err := New(cfg, db, providers.New(cfg))
+	e, err := newEngine(cfg, db, providers.New(cfg), syntheticPrivateWrite)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,8 +572,9 @@ func TestImplementationPreservesPrimaryErrorOnCleanupFailure(t *testing.T) {
 }
 
 func TestPatchWithCheckIDCannotSkipGoChecks(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
+	// Every attempt runs its registered test with a fresh private Go cache.
+	// Bound each wait independently so the previous runs don't shorten it.
+	ctx := t.Context()
 
 	tempDir := canonicalTempDir(t)
 	sourceRepo := filepath.Join(tempDir, "source_check_required")
@@ -719,4 +721,308 @@ func TestPatchWithCheckIDCannotSkipGoChecks(t *testing.T) {
 		consumer, _ := e.Get(gotBatch.Children[1])
 		t.Fatalf("expected batch with handoff into subagent implementation to complete, got batch=%s(%s) consumer=%s(%s)", gotBatch.Status, gotBatch.Reason, consumer.Status, consumer.Reason)
 	}
+}
+
+func TestPrivateArtifactAcceptanceRequiresBoundReviewAndCheck(t *testing.T) {
+	privateArtifactFixture(t, "bindings")
+}
+
+func TestProductionPrivateWriteRequiresRuntimeHostIsolation(t *testing.T) {
+	privateArtifactFixture(t, "production")
+}
+
+func TestSyntheticPrivateWriteStillRequiresBoundReviewAndCheck(t *testing.T) {
+	privateArtifactFixture(t, "synthetic")
+}
+
+func TestProductionRejectsSyntheticIsolationEvidence(t *testing.T) {
+	privateArtifactFixture(t, "production replay")
+}
+
+func privateArtifactFixture(t *testing.T, mode string) {
+	root := canonicalTempDir(t)
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	const before = "package fixture\n\nfunc Value() string { return \"before\" }\n"
+	const after = "package fixture\n\nfunc Value() string { return \"after\" }\n"
+	files := map[string]string{
+		"go.mod":        "module example.test/fixture\n\ngo 1.24\n",
+		"value.go":      before,
+		"value_test.go": "package fixture\n\nimport \"testing\"\n\nfunc TestAfter(t *testing.T) {\n\tif Value() != \"after\" {\n\t\tt.Fatal(\"patch did not change Value\")\n\t}\n}\n",
+	}
+	paths := []string{"go.mod", "value.go", "value_test.go"}
+	policy := &model.PrivateSourcePolicy{
+		ExpiresAt: time.Now().Add(time.Hour), WriterIsolationVerified: true, AllowWrite: true, RequireIndependentReview: true,
+		Files: make(map[string]string), GoChecks: map[string]string{"unit": "TestAfter"},
+	}
+	for _, name := range paths {
+		if err := os.WriteFile(filepath.Join(source, name), []byte(files[name]), 0600); err != nil {
+			t.Fatal(err)
+		}
+		policy.Files[name] = model.Hash([]byte(files[name]))
+	}
+	setupTestGitRepo(t, source)
+	readIndex := func() []byte {
+		t.Helper()
+		index, err := os.ReadFile(filepath.Join(source, ".git", "index"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return index
+	}
+	indexBefore := readIndex()
+	writerTask := model.Task{
+		Objective: "Update Value to return after", Mode: "patch", DataClass: model.PrivateSourceData,
+		ExecutionProfile: "implementation", PreferredProvider: "fixture-a", AllowedPaths: paths,
+		Acceptance: []model.Check{{ID: "check-value", Description: "Value returns after", CheckID: "unit"}},
+	}
+	policy.Briefs = []string{model.PrivateBriefDigest(writerTask.Objective, writerTask.Acceptance)}
+	cfg := model.Config{StateDir: filepath.Join(root, "state"), EnableFixture: true}
+	for _, id := range []string{"fixture-a", "fixture-b"} {
+		cfg.Providers = append(cfg.Providers, model.ProviderConfig{ID: id, AttestedAccount: "fixture-owner"})
+		policy.Routes = append(policy.Routes, model.PrivateRoute{Provider: id, Model: "synthetic", Fingerprint: execution.SelfBinarySHA256(),
+			DataHandlingReviewed: true, ExpectedAccount: "fixture-owner"})
+	}
+	cfg.Repositories = map[string]model.Repo{"private-fixture": {
+		Root: source, AllowedPaths: paths, Providers: []string{"fixture-a", "fixture-b"}, PrivateSource: policy,
+		Limits: model.ProjectLimits{RequireIndependentReview: true},
+	}}
+	batch := model.Batch{RepoID: "private-fixture", RequestID: "bound-review", Independence: "distinct_provider", Items: []model.Item{
+		{Key: "write", Task: writerTask},
+		{Key: "review", DependsOn: []string{"write"}, HandoffFrom: []model.HandoffFrom{{Key: "write", Kind: "diff"}}, Task: model.Task{
+			Objective: "fixture:review-approve", Mode: "read_only", DataClass: model.PrivateSourceData,
+			ExecutionProfile: "review", PreferredProvider: "fixture-b", AllowedPaths: paths,
+			Acceptance: []model.Check{{ID: "review-diff", Description: "Review the verified diff"}},
+		}},
+	}}
+	db, err := store.Open(cfg.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var executor privateWriteExecutor
+	if mode != "production" {
+		executor = syntheticPrivateWrite
+	}
+	e, err := newEngine(cfg, db, providers.New(cfg), executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	submitted, err := e.SubmitBatch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := e.Wait(t.Context(), submitted.ID, 90*time.Second)
+	if mode == "production" {
+		if err != nil || len(parent.Children) != 2 {
+			t.Fatal(err, parent)
+		}
+		writer, err := e.Get(parent.Children[0])
+		if err != nil || writer.Status != model.Blocked || writer.Reason != "WRITER_ISOLATION_UNVERIFIED" || len(writer.Attempts) != 0 || writer.Result != nil {
+			t.Fatalf("unisolated writer %s %s attempts %d", writer.Status, writer.Reason, len(writer.Attempts))
+		}
+		return
+	}
+	if err != nil || parent.Status != model.Completed || len(parent.Children) != 2 {
+		t.Fatalf("private fixture batch did not complete: status=%s reason=%s err=%v", parent.Status, parent.Reason, err)
+	}
+	writer, err := e.Get(parent.Children[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewer, err := e.Get(parent.Children[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writer.Result == nil || reviewer.Result == nil || reviewer.Result.Review == nil || len(writer.Attempts) != 1 || len(reviewer.Attempts) != 1 {
+		t.Fatal("private fixture batch did not produce writer and reviewer evidence")
+	}
+	artifact, err := os.ReadFile(filepath.Join(e.artifacts, writer.Result.ArtifactID+".diff"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := model.Hash(artifact)
+	if !bytes.Contains(artifact, []byte(`+func Value() string { return "after" }`)) || writer.Result.ArtifactSHA256 != digest || writer.Result.GrantDigest != model.Digest(policy) ||
+		writer.Result.Preimages["value.go"] != model.Hash([]byte(before)) || writer.Result.Postimages["value.go"] != model.Hash([]byte(after)) ||
+		!slices.Contains(writer.Result.Verification, "SOURCE_SCOPE_AND_INDEX_UNCHANGED") || !bytes.Equal(indexBefore, readIndex()) {
+		t.Fatal("writer diff, source index or image digests did not match the fixture")
+	}
+	if len(writer.Result.Checks) != 1 || writer.Result.Checks[0].ID != "unit" || writer.Result.Checks[0].Test != "TestAfter" ||
+		writer.Result.Checks[0].Status != "PASSED" || writer.Result.Checks[0].ExitStatus != 0 {
+		t.Fatalf("expected passing registered check, got %+v", writer.Result.Checks)
+	}
+	review := reviewer.Result.Review
+	if review.Verdict != "APPROVED" || review.ArtifactSHA256 != digest || review.SourceJobID != writer.ID ||
+		review.SourceAttempt != writer.Attempts[0].Number || review.CheckStatus != "PASSED" ||
+		writer.Attempts[0].Provider != "fixture-a" || reviewer.Attempts[0].Provider != "fixture-b" {
+		t.Fatalf("expected independent review of the verified diff and check, got %+v", review)
+	}
+
+	if mode == "production replay" {
+		queued := parent
+		queued.Status = model.Queued
+		e.mu.Lock()
+		production := Engine{cfg: cfg, artifacts: e.artifacts, jobs: map[string]model.Job{writer.ID: writer, reviewer.ID: reviewer, parent.ID: queued}}
+		valid := e.privateBatchReviewsBound(queued)
+		e.mu.Unlock()
+		if !valid {
+			t.Fatal("intact fixture must satisfy the review and check bindings")
+		}
+		if production.privateBatchReviewsBound(queued) {
+			t.Fatal("production accepted fixture isolation evidence")
+		}
+		return
+	}
+	if mode == "synthetic" && !slices.Contains(writer.Result.Verification, "SYNTHETIC_PRIVATE_WRITE") {
+		t.Error("missing synthetic evidence label")
+	}
+	// Replay final acceptance with the completed child evidence captured above.
+	// Keep the scheduler out of the replay so each change happens after review.
+	assertBlocked := func(t *testing.T, replayCfg model.Config, queued, w, r model.Job, diff []byte) {
+		t.Helper()
+		replay := Engine{privateWriter: syntheticPrivateWrite, cfg: replayCfg, artifacts: t.TempDir(), jobs: map[string]model.Job{w.ID: w, r.ID: r}}
+		if err := replay.saveArtifact(w.Result.ArtifactID, diff); err != nil {
+			t.Fatal(err)
+		}
+		queued.Status = model.Queued
+		replay.jobs[queued.ID] = queued
+		if !replay.repoAllowed(queued) {
+			t.Fatal("fixture changed the policy binding")
+		}
+		replay.aggregate(queued)
+		if got := replay.jobs[queued.ID]; got.Status != model.Blocked || got.Reason != "HANDOFF_INVALID" {
+			t.Fatalf("invalid evidence passed final acceptance: status=%s reason=%s", got.Status, got.Reason)
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*model.Job, *model.Job, *[]byte)
+	}{
+		{"diff changed after review", func(_, _ *model.Job, diff *[]byte) { *diff = []byte("changed diff\n") }},
+		{"review bound to a different diff", func(_, r *model.Job, _ *[]byte) {
+			r.Result.Review.ArtifactSHA256 = model.Hash([]byte("different diff"))
+		}},
+		{"review bound to different attempt", func(_ *model.Job, r *model.Job, _ *[]byte) { r.Result.Review.SourceAttempt++ }},
+		{"review missing", func(_, r *model.Job, _ *[]byte) { r.Result.Review = nil }},
+		{"reviewer from writer family", func(w, r *model.Job, _ *[]byte) {
+			w.Attempts[0].Provider, r.Attempts[0].Provider = "agy", "agy-headless"
+		}},
+		{"writer provider missing", func(w, _ *model.Job, _ *[]byte) { w.Attempts[0].Provider = "" }},
+		{"failed check", func(w, _ *model.Job, _ *[]byte) {
+			w.Result.Checks[0].Status, w.Result.Checks[0].ExitStatus = model.Failed, 1
+		}},
+		{"unregistered check", func(w, _ *model.Job, _ *[]byte) { w.Result.Checks[0].Test = "TestDifferent" }},
+		{"missing source index verification", func(w, _ *model.Job, _ *[]byte) {
+			w.Result.Verification = slices.DeleteFunc(slices.Clone(w.Result.Verification), func(marker string) bool { return marker == "SOURCE_SCOPE_AND_INDEX_UNCHANGED" })
+		}},
+		{"writer cleanup unconfirmed", func(w, _ *model.Job, _ *[]byte) { w.Attempts[0].FinishedAt = nil }},
+		{"reviewer cleanup unconfirmed", func(_, r *model.Job, _ *[]byte) { r.Attempts[0].FinishedAt = nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, r, diff := writer, reviewer, artifact
+			writerResult, reviewerResult, reviewResult := *w.Result, *r.Result, *r.Result.Review
+			w.Result, r.Result, reviewerResult.Review = &writerResult, &reviewerResult, &reviewResult
+			w.Result.Checks = slices.Clone(w.Result.Checks)
+			w.Attempts, r.Attempts = slices.Clone(w.Attempts), slices.Clone(r.Attempts)
+			tc.change(&w, &r, &diff)
+			assertBlocked(t, cfg, parent, w, r, diff)
+		})
+	}
+
+	t.Run("grant expired with matching policy digest", func(t *testing.T) {
+		repo := cfg.Repositories[batch.RepoID]
+		expired := *repo.PrivateSource
+		expired.ExpiresAt = time.Now().Add(-time.Minute)
+		repo.PrivateSource = &expired
+		replayCfg := cfg
+		replayCfg.Repositories = map[string]model.Repo{batch.RepoID: repo}
+		queued, w, r := parent, writer, reviewer
+		digest := model.Digest(repo)
+		queued.PolicyDigest, w.PolicyDigest, r.PolicyDigest = digest, digest, digest
+		assertBlocked(t, replayCfg, queued, w, r, artifact)
+	})
+
+	t.Run("writer isolation unverified at admission", func(t *testing.T) {
+		repo := cfg.Repositories[batch.RepoID]
+		unverified := *repo.PrivateSource
+		unverified.WriterIsolationVerified = false
+		repo.PrivateSource = &unverified
+		admission := Engine{cfg: model.Config{Repositories: map[string]model.Repo{batch.RepoID: repo}}}
+		var fault *model.Fault
+		if job, err := admission.SubmitBatch(batch); job.ID != "" || !errors.As(err, &fault) || fault.Gate != "WRITER_ISOLATION_UNVERIFIED" {
+			t.Fatalf("unverified isolation passed submission: job=%s err=%v", job.ID, err)
+		}
+	})
+}
+
+func syntheticPrivateWrite(e *Engine, ctx context.Context, dir string, c model.Capability, t model.Task,
+	snapshot execution.Snapshot, files map[string]string, handoffs []model.Handoff, policy *model.PrivateSourcePolicy,
+) (out execution.FixtureInput, collected *execution.WorktreeResult, checks []model.CheckEvidence, err error) {
+	if c.Mode != "fixture" {
+		return out, nil, nil, model.Error("POLICY_DENIED", "synthetic executor requires an offline fixture")
+	}
+	writerVerified := policy != nil && policy.WriterIsolationVerified
+	if policy == nil || !writerVerified || !policy.AllowWrite || len(policy.GoChecks) == 0 {
+		return out, nil, nil, model.GateError("POLICY_DENIED", "WRITER_ISOLATION_UNVERIFIED", "private write requires verified writer isolation and registered Go checks", "verify_writer_isolation_and_enable_allow_write")
+	}
+	for _, criterion := range t.Acceptance {
+		id := criterion.CheckID
+		if id != "" && !slices.ContainsFunc(checks, func(check model.CheckEvidence) bool { return check.ID == id }) {
+			checks = append(checks, model.CheckEvidence{ID: id, Test: policy.GoChecks[id], Status: model.NotRun, ExitStatus: -1})
+		}
+	}
+	if len(checks) == 0 {
+		return out, nil, nil, model.GateError("POLICY_DENIED", "DETERMINISTIC_CHECK_NOT_CONFIGURED", "private write requires a registered Go check", "configure_registered_go_check_for_private_patch")
+	}
+	tool, err := execution.GoCheckTool()
+	if err != nil {
+		return out, nil, checks, err
+	}
+	w, err := execution.PrepareWorktree(ctx, dir, snapshot, t)
+	if err != nil {
+		return out, nil, checks, err
+	}
+	defer func() {
+		if cleanupErr := w.Close(); cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
+		}
+	}()
+	out, err = e.reg.RunPrivate(ctx, dir, c, t, files, handoffs, policy)
+	if err != nil || out.Failure != "" {
+		return out, nil, checks, err
+	}
+	if err = w.ApplyPatch(ctx, []byte(out.Patch)); err != nil {
+		return out, nil, checks, err
+	}
+	result, err := w.Collect(ctx, e.scratch)
+	if err != nil {
+		return out, nil, checks, err
+	}
+	if !result.SourceUnchanged {
+		return out, nil, checks, model.Error("SNAPSHOT_CHANGED", "source changed during the private worktree attempt")
+	}
+	verifiedChecks, err := execution.RunGoChecks(ctx, dir, w.Dir, tool, checks)
+	if err != nil {
+		return out, nil, checks, err
+	}
+	if len(verifiedChecks) != len(checks) {
+		return out, nil, checks, model.Error("CHECK_FAILED", "registered Go check evidence is incomplete")
+	}
+	for i, check := range verifiedChecks {
+		if check.ID != checks[i].ID || check.Test != checks[i].Test || check.Status != "PASSED" || check.ExitStatus != 0 {
+			return out, nil, verifiedChecks, model.Error("CHECK_FAILED", "a registered Go check did not pass")
+		}
+	}
+	after, err := w.Collect(ctx, e.scratch)
+	if err != nil {
+		return out, nil, verifiedChecks, err
+	}
+	if after.ArtifactSHA256 != result.ArtifactSHA256 || !after.SourceUnchanged {
+		return out, nil, verifiedChecks, model.Error("SNAPSHOT_CHANGED", "Go verification changed the worktree or source")
+	}
+	out.Patch = string(after.Patch)
+	return out, &after, verifiedChecks, nil
 }

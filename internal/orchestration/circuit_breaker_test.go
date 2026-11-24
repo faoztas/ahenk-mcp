@@ -36,12 +36,13 @@ func TestCircuitBreakerLifecycle(t *testing.T) {
 	if st := cb.State("codex"); st != CircuitHalfOpen {
 		t.Fatalf("expected state HALF_OPEN after cooldown, got %s", st)
 	}
-	if !cb.Allow("codex") {
+	probeID, allowed := cb.Acquire("codex")
+	if !allowed {
 		t.Fatalf("expected HALF_OPEN to admit single probe")
 	}
 
 	// Record success -> CLOSED
-	cb.Success("codex")
+	cb.probeSucceeded("codex", probeID)
 	if st := cb.State("codex"); st != CircuitClosed {
 		t.Fatalf("expected state CLOSED after success, got %s", st)
 	}
@@ -53,7 +54,8 @@ func TestCircuitBreakerProbeRelease(t *testing.T) {
 	time.Sleep(15 * time.Millisecond)
 
 	// In HALF_OPEN state, first Allow admits probe
-	if !cb.Allow("codex") {
+	probeID, allowed := cb.Acquire("codex")
+	if !allowed {
 		t.Fatalf("expected first probe to be admitted")
 	}
 	// Second Allow should be blocked while probing
@@ -62,7 +64,7 @@ func TestCircuitBreakerProbeRelease(t *testing.T) {
 	}
 
 	// Release probe
-	cb.Release("codex")
+	cb.Release("codex", probeID)
 
 	// After release, a new probe should be admitted immediately
 	if !cb.Allow("codex") {
@@ -156,7 +158,8 @@ func TestCircuitBreakerActiveTrippedVisibility(t *testing.T) {
 	}
 
 	// Admit probe for agy
-	if !cb.Allow("agy") {
+	probeID, allowed := cb.Acquire("agy")
+	if !allowed {
 		t.Fatalf("expected agy probe to be admitted")
 	}
 
@@ -171,7 +174,7 @@ func TestCircuitBreakerActiveTrippedVisibility(t *testing.T) {
 	}
 
 	// Success removes agy from ActiveTripped
-	cb.Success("agy")
+	cb.probeSucceeded("agy", probeID)
 	tripped = cb.ActiveTripped()
 	if _, ok := tripped["agy"]; ok {
 		t.Fatalf("expected agy to be removed after Success")
@@ -194,7 +197,8 @@ func TestEngineCircuitBreakerProbeReleasedOnRouteEliminationAndFinish(t *testing
 	}
 
 	// 1. In finish(), if an attempt fails with non-rate-limit error, probe lock is released
-	if !cb.Allow("codex") {
+	probeID, allowed := cb.Acquire("codex")
+	if !allowed {
 		t.Fatalf("expected probe to be admitted")
 	}
 	if !cb.IsProbing("codex") {
@@ -204,7 +208,7 @@ func TestEngineCircuitBreakerProbeReleasedOnRouteEliminationAndFinish(t *testing
 	j := model.Job{
 		ID: "job-fail-test",
 		Attempts: []model.Attempt{
-			{Number: 1, Provider: "codex"},
+			{Number: 1, Provider: "codex", ProbeID: probeID},
 		},
 	}
 	eng.finish(context.Background(), j, errors.New("SYNTAX_ERROR"))
@@ -364,7 +368,7 @@ func TestRememberRateLimit_UsesRemainingDurationFromAttemptFinishedAt(t *testing
 	freshAt := time.Now().UTC().Add(-5 * time.Second)
 	expectedUntil := freshAt.Add(60 * time.Second)
 	e.mu.Lock()
-	e.rememberRateLimit(model.Attempt{
+	e.rememberRateLimit(&model.Attempt{
 		Number:       1,
 		Provider:     "antigravity",
 		Code:         "RATE_LIMIT",
@@ -389,7 +393,7 @@ func TestRememberRateLimit_UsesRemainingDurationFromAttemptFinishedAt(t *testing
 	// must NOT shrink the longer active cooldown.
 	olderAt := time.Now().UTC().Add(-30 * time.Second)
 	e.mu.Lock()
-	e.rememberRateLimit(model.Attempt{
+	e.rememberRateLimit(&model.Attempt{
 		Number:       1,
 		Provider:     "agy",
 		Code:         "RATE_LIMIT",
@@ -406,11 +410,10 @@ func TestRememberRateLimit_UsesRemainingDurationFromAttemptFinishedAt(t *testing
 func TestRoute_MultiModelProviderAndEarlyReturnReleasesProbe(t *testing.T) {
 	now := time.Now().UTC()
 
-	// 1. Multi-model / alias normalization in route() allowedProviders
+	// Multiple aliases share one half-open probe.
 	t.Run("mixed_alias_candidates_share_probe_and_release_properly", func(t *testing.T) {
 		cb := NewCircuitBreaker()
-		cb.Trip("agy", 10*time.Millisecond)
-		time.Sleep(15 * time.Millisecond)
+		cb.Trip("agy", -time.Hour)
 
 		e := &Engine{
 			cfg: model.Config{
@@ -458,7 +461,7 @@ func TestRoute_MultiModelProviderAndEarlyReturnReleasesProbe(t *testing.T) {
 			},
 		}
 		e.mu.Lock()
-		c, _ := e.route(&j, now)
+		c, _, probeID := e.routeWithMode(&j, now, false)
 		e.mu.Unlock()
 		if c.Provider != "agy" || c.Model != "claude-sonnet" {
 			t.Fatalf("expected alias candidate agy/claude-sonnet to be selected without false CIRCUIT_BREAKER_OPEN, got %+v, route=%+v", c, j.Route)
@@ -469,7 +472,7 @@ func TestRoute_MultiModelProviderAndEarlyReturnReleasesProbe(t *testing.T) {
 
 		// Now reject the second alias ("agy") via ALREADY_ATTEMPTED while first alias ("antigravity") remains eligible.
 		// The probe lock for "agy" MUST stay held because "antigravity" is still in options.
-		cb.Release("agy")
+		cb.Release("agy", probeID)
 		j2 := model.Job{
 			ID:         "job-alias-keep",
 			RepoID:     "demo",
@@ -604,8 +607,7 @@ exit 0
 	// 3. Multi-model provider where all models are eliminated in route() must release probe lock
 	t.Run("multi_model_provider_eliminated_releases_probe", func(t *testing.T) {
 		cb := NewCircuitBreaker()
-		cb.Trip("codex", 10*time.Millisecond)
-		time.Sleep(15 * time.Millisecond)
+		cb.Trip("codex", -time.Hour)
 
 		e := &Engine{
 			cfg: model.Config{
@@ -653,7 +655,8 @@ exit 0
 		cb := NewCircuitBreaker()
 		cb.Trip("agy", 10*time.Millisecond)
 		time.Sleep(15 * time.Millisecond)
-		if !cb.Allow("agy") {
+		probeID, allowed := cb.Acquire("agy")
+		if !allowed {
 			t.Fatalf("expected probe to be admitted")
 		}
 		if !cb.IsProbing("agy") {
@@ -669,7 +672,7 @@ exit 0
 		j := model.Job{
 			ID:         "job-reserve-early",
 			DeadlineAt: end.Add(10 * time.Minute),
-			Attempts:   []model.Attempt{{Number: 1, Provider: "agy", Code: reserveReason, FinishedAt: &end}},
+			Attempts:   []model.Attempt{{Number: 1, Provider: "agy", Code: reserveReason, ProbeID: probeID, FinishedAt: &end}},
 		}
 		eng.mu.Lock()
 		handled := eng.settleEarlyAttempt(&j, &j.Attempts[0], end)

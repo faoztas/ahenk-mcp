@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -82,6 +83,19 @@ func AllowsAGYProfile(c model.Capability, t model.Task) bool {
 		(t.Mode != "read_only" || t.ExecutionProfile == "review") {
 		return false
 	}
+	name := agyExecutionProfile(c, t)
+	if t.DataClass != "synthetic" || (name == "analysis" || name == "review") && t.Mode != "read_only" {
+		return false
+	}
+	if name == "restricted" && t.Mode == "patch" && c.Fingerprint != "" && !AGYIdentityMatches(c.Model, c.Fingerprint) {
+		return false
+	}
+	return slices.ContainsFunc(c.Profiles, func(p model.ExecutionProfile) bool {
+		return p.Name == name && (p.Status == "verified" || name != "implementation" && p.Status == "preflight_required")
+	})
+}
+
+func agyExecutionProfile(c model.Capability, t model.Task) string {
 	name := t.ExecutionProfile
 	if name == "" {
 		switch {
@@ -95,15 +109,7 @@ func AllowsAGYProfile(c model.Capability, t model.Task) bool {
 			name = "analysis"
 		}
 	}
-	if t.DataClass != "synthetic" || (name == "analysis" || name == "review") && t.Mode != "read_only" {
-		return false
-	}
-	if name == "restricted" && t.Mode == "patch" && c.Fingerprint != "" && !AGYIdentityMatches(c.Model, c.Fingerprint) {
-		return false
-	}
-	return slices.ContainsFunc(c.Profiles, func(p model.ExecutionProfile) bool {
-		return p.Name == name && (p.Status == "verified" || name != "implementation" && p.Status == "preflight_required")
-	})
+	return name
 }
 
 // AttestAGYAccount resolves the AGY account attestation SHA-256 used by
@@ -392,6 +398,8 @@ func agyFailure(s string) string {
 	case strings.Contains(s, "rate limit"), strings.Contains(s, "quota exceeded"), strings.Contains(s, "quota exhausted"),
 		strings.Contains(s, "resource_exhausted"):
 		return "RATE_LIMIT"
+	case strings.Contains(s, "timeout"), strings.Contains(s, "deadline exceeded"):
+		return "ATTEMPT_TIMEOUT"
 	default:
 		return "INVALID_OUTPUT"
 	}
@@ -470,39 +478,80 @@ func (p AGYPolicy) checkTool(step agyStep, sessions map[string]bool) bool {
 }
 
 func (p AGYPolicy) scopedNativeChild(step agyStep, sessions map[string]bool) bool {
-	if !p.ChildAndMessageScopeVerified || len(step.Subagent.Children) > 1 {
-		return false
+	return p.checkNativeChildStep(step, sessions) == nil
+}
+
+func (p AGYPolicy) checkNativeChildStep(step agyStep, sessions map[string]bool) *model.Fault {
+	if step.Tool.Name != "" && step.Tool.Name != step.ToolName ||
+		!slices.Contains(p.Tools, "invoke_subagent") || !p.ChildAndMessageScopeVerified {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_TOOL_PROFILE_DENIED", "AGY tool exceeded the execution profile")
 	}
-	if len(step.Subagent.Children) == 0 {
+	if fault := step.Tool.checkWorkspaceInherit(); fault != nil {
+		return fault
+	}
+	children := step.Subagent.Children
+	if len(children) > 1 {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_MULTIPLE_CHILDREN", "AGY native child invocation reported multiple children")
+	}
+	if len(children) == 0 {
+		if step.State != "ACTIVE" {
+			return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_OWNERSHIP_MISSING", "AGY native child invocation completed without child metadata")
+		}
 		role := step.Tool.param("SubagentType", "AgentType", "TypeName", "subagent_type", "agent_type", "type_name", "agent", "name")
-		workspace := step.Tool.param("WorkspaceMode", "Workspace", "workspace_mode", "workspace")
-		return step.State == "ACTIVE" && role == p.NativeChildRole && (workspace == "" || workspace == "inherit")
+		if role != p.NativeChildRole {
+			return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_ROLE_INVALID", "AGY native child role did not match policy")
+		}
+		return nil
 	}
-	child := step.Subagent.Children[0]
+	child := children[0]
 	role := child.TypeName
 	if role == "" {
 		role = child.Role
 	}
 	if role != "" && role != p.NativeChildRole {
-		return false
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_ROLE_INVALID", "AGY native child role did not match policy")
 	}
-	if len(child.Workspaces) != 0 {
-		if len(child.Workspaces) != 1 {
-			return false
-		}
+	if len(child.Workspaces) > 1 {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_WORKSPACE_INVALID", "AGY native child reported multiple workspaces")
+	}
+	if len(child.Workspaces) == 1 {
 		u, err := url.Parse(child.Workspaces[0])
 		if err != nil || u.Scheme != "file" || u.Host != "" || u.Path != p.Root || u.RawQuery != "" || u.Fragment != "" {
-			return false
+			return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_WORKSPACE_URI_DENIED", "AGY native child workspace did not match parent root")
 		}
 	}
-	if role == "" || !model.ValidID(child.Conversation) || len(child.Workspaces) != 1 {
-		return step.State == "ACTIVE"
+	if step.State == "ACTIVE" {
+		if child.Conversation == step.Session {
+			return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_IDENTITY_ALIAS", "AGY child session identity must be distinct from parent session")
+		}
+		if child.Conversation != "" && !model.ValidID(child.Conversation) {
+			return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_ID_MISSING", "AGY native child conversation ID is invalid")
+		}
+		if role != "" && model.ValidID(child.Conversation) && len(child.Workspaces) == 1 {
+			if len(sessions) >= 2 && !sessions[child.Conversation] {
+				return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_MULTIPLE_CHILDREN", "AGY native child invocation exceeded single child session")
+			}
+			sessions[child.Conversation] = true
+		}
+		return nil
 	}
-	if child.Conversation == step.Session || len(sessions) >= 2 && !sessions[child.Conversation] {
-		return false
+	if role == "" {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_ROLE_INVALID", "AGY native child completed without a verified role")
+	}
+	if !model.ValidID(child.Conversation) {
+		return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_ID_MISSING", "AGY native child completed without a valid conversation ID")
+	}
+	if child.Conversation == step.Session {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_IDENTITY_ALIAS", "AGY child session identity must be distinct from parent session")
+	}
+	if len(child.Workspaces) != 1 {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_WORKSPACE_MISSING", "AGY native child completed without a verified workspace URI")
+	}
+	if len(sessions) >= 2 && !sessions[child.Conversation] {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_MULTIPLE_CHILDREN", "AGY native child invocation exceeded single child session")
 	}
 	sessions[child.Conversation] = true
-	return true
+	return nil
 }
 
 var agyPathKeys = []string{"TargetFile", "AbsolutePath", "FilePath", "Path", "path", "file_path",
@@ -621,6 +670,77 @@ func agyFinishParametersAllowed(raw json.RawMessage) bool {
 	return err == nil && end == json.Delim('}')
 }
 
+var agyWorkspaceKeys = []string{"WorkspaceMode", "Workspace", "workspaceMode", "workspace_mode", "workspace"}
+
+type agyWorkspaceEntry struct {
+	isString bool
+	str      string
+	compact  string
+}
+
+func (t agyTool) checkWorkspaceInherit() *model.Fault {
+	raw := bytes.TrimSpace(t.RawParameters)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	start, err := dec.Token()
+	if err != nil || start != json.Delim('{') {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_WORKSPACE_INVALID", "AGY native child tool parameters were malformed")
+	}
+	var entries []agyWorkspaceEntry
+	for dec.More() {
+		keyTok, err := dec.Token()
+		key, isKey := keyTok.(string)
+		if err != nil || !isKey {
+			return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_WORKSPACE_INVALID", "AGY native child tool parameters were malformed")
+		}
+		var valRaw json.RawMessage
+		if err := dec.Decode(&valRaw); err != nil {
+			return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_WORKSPACE_INVALID", "AGY native child tool parameters were malformed")
+		}
+		if !slices.Contains(agyWorkspaceKeys, key) {
+			continue
+		}
+		trimmed := bytes.TrimSpace(valRaw)
+		var valStr string
+		if len(trimmed) > 0 && trimmed[0] == '"' && json.Unmarshal(trimmed, &valStr) == nil {
+			entries = append(entries, agyWorkspaceEntry{isString: true, str: valStr})
+		} else {
+			var compacted bytes.Buffer
+			if err := json.Compact(&compacted, trimmed); err != nil {
+				return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_WORKSPACE_INVALID", "AGY native child tool parameters were malformed")
+			}
+			entries = append(entries, agyWorkspaceEntry{isString: false, compact: compacted.String()})
+		}
+	}
+	end, err := dec.Token()
+	if err != nil || end != json.Delim('}') {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_WORKSPACE_INVALID", "AGY native child tool parameters were malformed")
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_WORKSPACE_INVALID", "AGY native child tool parameters were malformed")
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	first := entries[0]
+	for _, entry := range entries[1:] {
+		if entry.isString != first.isString ||
+			(entry.isString && entry.str != first.str) ||
+			(!entry.isString && entry.compact != first.compact) {
+			return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_WORKSPACE_CONFLICT", "AGY native child workspace parameters conflicted")
+		}
+	}
+	if !first.isString || first.str == "" {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_WORKSPACE_INVALID", "AGY native child workspace parameter was empty or invalid")
+	}
+	if first.str != "inherit" {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_WORKSPACE_INVALID", "AGY native child must inherit the parent workspace")
+	}
+	return nil
+}
+
 func (t agyTool) param(keys ...string) string {
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(t.RawParameters, &fields) != nil {
@@ -723,6 +843,9 @@ func (e agyEvent) describe() *model.AGYStreamEventEvidence {
 
 type agyStreamState struct {
 	childInvocation *int
+	childInvokeDone bool
+	nativeChild     *model.NativeChildEvidence
+	childSession    string
 	childText       strings.Builder
 	result          AGYResult
 	sessions        map[string]bool
@@ -733,7 +856,7 @@ func (s *agyStreamState) accept(line []byte, expectedModel string, policy AGYPol
 	var e agyEvent
 	err := json.Unmarshal(line, &e)
 	if policy.NativeChildRole != "" && e.Event == "step_update" && e.Step.Kind == "subagent" &&
-		e.Step.ToolName == "" && len(e.Step.Subagent.Children) != 0 {
+		e.Step.ToolName == "" && (e.Step.Tool.Name == "" || e.Step.Tool.Name == "invoke_subagent") {
 		e.Step.ToolName = "invoke_subagent"
 	}
 	if policy.Profile == model.TrustedLocalProfile && e.Event == "step_update" && e.Step.Kind == "tool" && e.Step.ToolName == "" {
@@ -797,7 +920,8 @@ func (s *agyStreamState) accept(line []byte, expectedModel string, policy AGYPol
 		}
 	case "step_update":
 		step := e.Step
-		if !s.sessions[step.Session] {
+		if !s.sessions[step.Session] ||
+			(policy.NativeChildRole != "" && step.Session != s.result.Session && (s.nativeChild == nil || step.Session != s.childSession)) {
 			if evidence != nil {
 				evidence.RejectedStep = step.rejectionLabel()
 			}
@@ -855,39 +979,81 @@ func (s *agyStreamState) accept(line []byte, expectedModel string, policy AGYPol
 				}
 				return agyProviderFault("PERMISSION_DENIED", "AGY_FINISH_SCOPE_DENIED", "AGY finish carried an unsupported payload")
 			}
-			if evidence != nil && step.State == "DONE" {
-				if evidence.NativeChild != nil && step.Session != s.result.Session {
-					s.finishChild(step, evidence)
-				} else {
+			if step.State == "DONE" {
+				if policy.NativeChildRole != "" && step.Session != s.result.Session {
+					if err := s.finishChild(step); err != nil {
+						if evidence != nil {
+							evidence.RejectedStep = step.rejectionLabel()
+						}
+						return err
+					}
+				} else if evidence != nil && step.Session == s.result.Session {
 					evidence.NativeFinishObserved = true
 				}
 			}
 		case "error_message":
 			return agyProviderFault(agyFailure(step.TextDelta), "AGY_STEP_ERROR", "AGY reported an error step")
 		case "tool", "subagent":
-			if (step.State != "ACTIVE" && step.State != "DONE") || !policy.checkTool(step, s.sessions) {
+			if step.State != "ACTIVE" && step.State != "DONE" {
 				if evidence != nil {
 					evidence.RejectedStep = step.rejectionLabel()
 				}
 				return agyProviderFault("PERMISSION_DENIED", "AGY_TOOL_PROFILE_DENIED", "AGY tool exceeded the execution profile")
 			}
-			if evidence != nil && policy.NativeChildRole != "" && step.ToolName == "invoke_subagent" && len(step.Subagent.Children) == 1 {
-				child := step.Subagent.Children[0]
-				if evidence.NativeChild == nil && child.Conversation != s.result.Session && s.sessions[child.Conversation] {
-					evidence.NativeChild = &model.NativeChildEvidence{ParentSHA256: model.Hash([]byte(s.result.Session)),
-						ChildSHA256: model.Hash([]byte(child.Conversation))}
+			if policy.NativeChildRole != "" && step.ToolName == "invoke_subagent" {
+				if s.childInvokeDone {
+					if evidence != nil {
+						evidence.RejectedStep = "invoke_subagent"
+					}
+					return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_INVOCATION_DUPLICATE", "AGY native child invocation completed more than once")
+				}
+				if fault := policy.checkNativeChildStep(step, s.sessions); fault != nil {
+					if evidence != nil {
+						evidence.RejectedStep = "invoke_subagent"
+					}
+					return fault
+				}
+			} else if !policy.checkTool(step, s.sessions) {
+				if evidence != nil {
+					evidence.RejectedStep = step.rejectionLabel()
+				}
+				return agyProviderFault("PERMISSION_DENIED", "AGY_TOOL_PROFILE_DENIED", "AGY tool exceeded the execution profile")
+			}
+			if policy.NativeChildRole != "" && step.ToolName == "invoke_subagent" {
+				if len(step.Subagent.Children) == 1 {
+					child := step.Subagent.Children[0]
+					if s.nativeChild == nil && child.Conversation != s.result.Session && s.sessions[child.Conversation] {
+						s.childSession = child.Conversation
+						s.nativeChild = &model.NativeChildEvidence{
+							ParentSHA256: model.Hash([]byte(s.result.Session)),
+							ChildSHA256:  model.Hash([]byte(child.Conversation)),
+						}
+						if evidence != nil {
+							evidence.NativeChild = s.nativeChild
+						}
+					}
+				}
+				if step.State == "DONE" {
+					s.childInvokeDone = true
 				}
 			}
-			if evidence != nil && step.State == "DONE" {
-				if evidence.ObservedTools == nil {
-					evidence.ObservedTools = map[string]int{}
+			if step.State == "DONE" {
+				if evidence != nil {
+					if evidence.ObservedTools == nil {
+						evidence.ObservedTools = map[string]int{}
+					}
+					evidence.ObservedTools[step.ToolName]++
 				}
-				evidence.ObservedTools[step.ToolName]++
-				if evidence.NativeChild != nil && step.ToolName == "send_message" {
-					evidence.NativeChild.ScopedMessage = true
+				if s.nativeChild != nil && step.ToolName == "send_message" {
+					s.nativeChild.ScopedMessage = true
 				}
-				if evidence.NativeChild != nil && step.ToolName == "finish" && step.Session != s.result.Session {
-					s.finishChild(step, evidence)
+				if policy.NativeChildRole != "" && step.ToolName == "finish" && step.Session != s.result.Session {
+					if err := s.finishChild(step); err != nil {
+						if evidence != nil {
+							evidence.RejectedStep = step.rejectionLabel()
+						}
+						return err
+					}
 				}
 			}
 		default:
@@ -901,6 +1067,15 @@ func (s *agyStreamState) accept(line []byte, expectedModel string, policy AGYPol
 			(e.Result.Response == "" && (len(e.Result.Structured) == 0 || bytes.Equal(e.Result.Structured, []byte("null")))) {
 			return agyProviderFault(agyFailure(e.Result.Error), "AGY_TERMINAL_REJECTED", "AGY did not emit a verified success")
 		}
+		if policy.NativeChildRole != "" {
+			if s.nativeChild == nil || !s.childInvokeDone || !s.nativeChild.ChildFinished {
+				return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_RESULT_UNVERIFIED", "AGY parent finished without an owned child terminal result")
+			}
+			parentSummary, ok := agyParentSummary(e.Result.Structured, e.Result.Response)
+			if !ok || model.Hash([]byte(parentSummary)) != s.nativeChild.ResultSHA256 {
+				return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_DIGEST_MISMATCH", "AGY parent summary did not match an owned child terminal result")
+			}
+		}
 		s.finished = true
 		s.result.Text, s.result.Structured = e.Result.Response, e.Result.Structured
 		if e.Result.Usage != nil {
@@ -912,16 +1087,144 @@ func (s *agyStreamState) accept(line []byte, expectedModel string, policy AGYPol
 	return nil
 }
 
-func (s *agyStreamState) finishChild(step agyStep, evidence *model.AGYRunEvidence) {
+func (s *agyStreamState) finishChild(step agyStep) error {
+	if s.nativeChild == nil {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_UNOWNED_SESSION", "AGY child finished without an owned invocation")
+	}
+	if s.nativeChild.ChildFinished {
+		return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_RESULT_UNVERIFIED", "AGY child emitted duplicate or conflicting terminal results")
+	}
 	summary := strings.TrimSpace(step.Tool.param("summary", "Summary"))
 	if summary == "" {
 		summary = strings.TrimSpace(s.childText.String())
 	}
-	if summary == "" || len(summary) > 16384 || model.ContainsSecret([]byte(summary)) {
-		return
+	if summary == "" {
+		return nil
 	}
-	evidence.NativeChild.ChildFinished = true
-	evidence.NativeChild.ResultSHA256 = model.Hash([]byte(summary))
+	if len(summary) > 16384 || model.ContainsSecret([]byte(summary)) {
+		return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_RESULT_UNVERIFIED", "AGY child result is oversized or sensitive")
+	}
+	s.nativeChild.ChildFinished = true
+	s.nativeChild.ResultSHA256 = model.Hash([]byte(summary))
+	return nil
+}
+
+func agyParentSummary(structured json.RawMessage, response string) (string, bool) {
+	payload := bytes.TrimSpace(structured)
+	if len(payload) == 0 || bytes.Equal(payload, []byte("null")) {
+		trimmed := strings.TrimSpace(response)
+		if trimmed == "" {
+			return "", false
+		}
+		if !strings.HasPrefix(trimmed, "{") {
+			return trimmed, true
+		}
+		payload = []byte(trimmed)
+	}
+	var reply struct {
+		Summary string `json:"summary"`
+		Patch   string `json:"patch"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
+	if dec.Decode(&reply) != nil || dec.Decode(new(any)) != io.EOF || strings.TrimSpace(reply.Summary) == "" || reply.Patch != "" {
+		return "", false
+	}
+	return strings.TrimSpace(reply.Summary), true
+}
+
+// AGYNativeChildAcceptance specifies the offline schema and correlation checks
+// required for an AGY Headless native-child evidence record.
+//
+// Passing ValidateAGYNativeChildAcceptance verifies only evidence schema,
+// parent/child ownership correlation, terminal child digest parity, and local
+// cleanup; it does NOT assert live G-013 availability or lift the G-013 gate.
+type AGYNativeChildAcceptance struct {
+	Evidence           model.AGYRunEvidence
+	ExpectedParentHash string
+	ExpectedResultHash string
+	CleanupVerified    bool
+}
+
+// ValidateAGYNativeChildAcceptance verifies that an AGY native-child evidence
+// record proves parent/child ownership, a distinct provider-owned child ID,
+// independent child terminal completion matching the expected result digest,
+// preflight cost/quota verification, and attempt cleanup.
+//
+// Offline validation of synthetic evidence does NOT assert live G-013
+// availability by itself; G-013 remains gated unless a live signed Headless
+// run succeeds and passes cleanup.
+func ValidateAGYNativeChildAcceptance(in AGYNativeChildAcceptance) error {
+	if err := verifyAGYNativeChildEvidence(&in.Evidence, in.ExpectedParentHash, in.ExpectedResultHash); err != nil {
+		return err
+	}
+	if !in.CleanupVerified {
+		return agyProviderFault("CLEANUP_UNVERIFIED", "AGY_CHILD_CLEANUP_UNVERIFIED", "AGY native child acceptance requires verified attempt cleanup")
+	}
+	return nil
+}
+
+func validAGYUsage(input, output, total int64) bool {
+	return total > 0 && input >= 0 && output >= 0 && input <= total-output
+}
+
+func verifyAGYNativeChildEvidence(ev *model.AGYRunEvidence, expectedParentHash, expectedResultHash string) error {
+	if ev == nil {
+		return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_RESULT_UNVERIFIED", "AGY run evidence is missing")
+	}
+	if ev.Profile != "native_child" {
+		return agyProviderFault("POLICY_DENIED", "AGY_CHILD_PROFILE_INVALID", "AGY native child evidence requires native_child profile")
+	}
+	if ev.Model != agySyntheticModel {
+		return agyProviderFault("MODEL_UNVERIFIED", "AGY_CHILD_MODEL_UNVERIFIED", "AGY native child evidence requires the pinned synthetic model")
+	}
+	if ev.PermissionMode != "request-review" {
+		return agyProviderFault("POLICY_DENIED", "AGY_CHILD_PERMISSION_MODE_INVALID", "AGY native child evidence requires request-review permission mode")
+	}
+	if ev.Cost == nil || ev.Cost.Policy != "SUBSCRIPTION_ONLY" || ev.Cost.Status != "DOCUMENTED_COST_PROTECTION" || ev.Cost.Documented != "VERIFIED" || !ev.SubscriptionQuotaVerified {
+		return agyProviderFault("ZERO_COST_UNVERIFIED", "AGY_CHILD_COST_UNVERIFIED", "AGY native child evidence requires verified subscription quota and cost protection")
+	}
+	if !ev.StartupVerified || !ev.PromptSent || !ev.TerminalVerified || !validAGYUsage(ev.InputTokens, ev.OutputTokens, ev.TotalTokens) {
+		return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_TERMINAL_UNVERIFIED", "AGY native child evidence requires verified startup, prompt, terminal event, and token usage")
+	}
+	if ev.RejectedStep != "" {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_REJECTED_STEP", "AGY native child evidence recorded a rejected step")
+	}
+	if ev.NativeChild == nil {
+		return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_OWNERSHIP_MISSING", "AGY native child evidence is missing child ownership metadata")
+	}
+	if !isSHA256Hex(ev.NativeChild.ParentSHA256) || !isSHA256Hex(expectedParentHash) || ev.NativeChild.ParentSHA256 != expectedParentHash {
+		return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_PARENT_OWNERSHIP_INVALID", "AGY parent session ownership digest is missing or mismatched")
+	}
+	if !isSHA256Hex(ev.NativeChild.ChildSHA256) {
+		return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_ID_MISSING", "AGY provider-owned child session digest is missing or invalid")
+	}
+	if ev.NativeChild.ChildSHA256 == ev.NativeChild.ParentSHA256 {
+		return agyProviderFault("PERMISSION_DENIED", "AGY_CHILD_IDENTITY_ALIAS", "AGY child session identity must be distinct from parent session")
+	}
+	if ev.ObservedTools["invoke_subagent"] != 1 {
+		return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_INVOCATION_COUNT_INVALID", "AGY parent did not record exactly one completed invoke_subagent tool step")
+	}
+	if !ev.NativeChild.ChildFinished {
+		return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_RESULT_UNVERIFIED", "AGY native child did not record terminal completion")
+	}
+	if !isSHA256Hex(expectedResultHash) || !isSHA256Hex(ev.NativeChild.ResultSHA256) || ev.NativeChild.ResultSHA256 != expectedResultHash {
+		return agyProviderFault("INVALID_OUTPUT", "AGY_CHILD_DIGEST_MISMATCH", "AGY native child result digest did not match expected output")
+	}
+	return nil
+}
+
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func ParseAGY(stdout, stderr []byte, expectedModel string, policy AGYPolicy) (AGYResult, error) {

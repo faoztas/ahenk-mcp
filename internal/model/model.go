@@ -75,7 +75,75 @@ type Check struct {
 	CheckID     string `json:"check_id,omitempty"`
 }
 
+type RoutingProfile string
+
+const (
+	RoutingProfilePricePerformance RoutingProfile = "price_performance"
+	RoutingProfileQuality          RoutingProfile = "quality"
+	RoutingProfilePrice            RoutingProfile = "price"
+)
+
+func RoutingProfiles() []RoutingProfile {
+	return []RoutingProfile{RoutingProfilePricePerformance, RoutingProfileQuality, RoutingProfilePrice}
+}
+
+func (p RoutingProfile) Valid() bool { return slices.Contains(RoutingProfiles(), p) }
+
+func (p *RoutingProfile) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil || !RoutingProfile(value).Valid() {
+		return Error("INVALID_INPUT", "invalid routing profile")
+	}
+	*p = RoutingProfile(value)
+	return nil
+}
+
+// inspectRoutingFields inspects one object before encoding/json can fold
+// field names by case or overwrite a repeated key.
+func inspectRoutingFields(data []byte, batch bool) (bool, error) {
+	d := json.NewDecoder(bytes.NewReader(data))
+	first, err := d.Token()
+	if err != nil || first != json.Delim('{') {
+		return false, err
+	}
+	const field = "routing_profile"
+	var seenProfile, seenItems, seenComplexity, hasComplexity bool
+	for d.More() {
+		key, err := d.Token()
+		if err != nil {
+			return false, err
+		}
+		name := key.(string)
+		if strings.EqualFold(name, field) {
+			if seenProfile || name != field {
+				return false, Error("INVALID_INPUT", "routing_profile must use its canonical spelling and appear at most once per object")
+			}
+			seenProfile = true
+		}
+		if batch && strings.EqualFold(name, "items") {
+			if seenItems {
+				return false, Error("INVALID_INPUT", "batch items must appear at most once")
+			}
+			seenItems = true
+		}
+		var value json.RawMessage
+		if err := d.Decode(&value); err != nil {
+			return false, err
+		}
+		if !batch && strings.EqualFold(name, "complexity") {
+			if seenComplexity {
+				return false, Error("INVALID_INPUT", "complexity must appear at most once per object")
+			}
+			seenComplexity = true
+			hasComplexity = !bytes.Equal(bytes.TrimSpace(value), []byte("null"))
+		}
+	}
+	return hasComplexity, nil
+}
+
 type Task struct {
+	RoutingProfile RoutingProfile `json:"routing_profile,omitempty"`
+
 	Decompose             bool     `json:"decompose,omitempty"`
 	NativeChildBackground bool     `json:"native_child_background,omitempty"`
 	RoleCalibration       bool     `json:"role_calibration,omitempty"`
@@ -106,6 +174,7 @@ type Task struct {
 	MaxDepth              int      `json:"max_depth,omitempty"`
 	Category              string   `json:"category,omitempty"`
 	Complexity            float64  `json:"complexity,omitempty"`
+	HasComplexity         bool     `json:"-"`
 }
 
 type HandoffFrom struct {
@@ -166,6 +235,14 @@ type Submission struct {
 	RequestID string `json:"request_id"`
 	RepoID    string `json:"repo_id"`
 	Task
+}
+
+// SubmissionIntentDigest identifies a validated submission before automatic route selection.
+func SubmissionIntentDigest(s Submission) string {
+	return "v2:" + Digest(struct {
+		Submission
+		HasComplexity bool `json:"has_complexity,omitempty"`
+	}{Submission: s, HasComplexity: s.HasComplexity || s.Complexity != 0})
 }
 
 func (s *Submission) Normalize(defaultCwd string, cfg *Config) error {
@@ -232,6 +309,8 @@ func (t *TargetSpec) UnmarshalJSON(data []byte) error {
 // DelegateTaskInput is the universal subagent input schema accepting either a single 'task' string
 // or full explicit parameters with backwards compatibility.
 type DelegateTaskInput struct {
+	RoutingProfile RoutingProfile `json:"routing_profile,omitempty"`
+
 	Task               string      `json:"task,omitempty" jsonschema:"Clear, self-contained instructions for the subagent (no parent chat history is shared)."`
 	Objective          string      `json:"objective,omitempty" jsonschema:"Alias for task (backwards compatibility)."`
 	Category           string      `json:"category,omitempty" jsonschema:"Task category: 'coding', 'debugging', 'code_review', 'architecture', 'planning', 'research', 'agent_orchestration'."`
@@ -276,6 +355,10 @@ type DelegateTaskInput struct {
 }
 
 func (in *DelegateTaskInput) UnmarshalJSON(data []byte) error {
+	hasComplexity, err := inspectRoutingFields(data, false)
+	if err != nil {
+		return err
+	}
 	type Alias DelegateTaskInput
 	var raw struct {
 		Alias
@@ -287,12 +370,7 @@ func (in *DelegateTaskInput) UnmarshalJSON(data []byte) error {
 	}
 	*in = DelegateTaskInput(raw.Alias)
 
-	var topMap map[string]json.RawMessage
-	if err := json.Unmarshal(data, &topMap); err == nil {
-		if val, ok := topMap["complexity"]; ok && len(bytes.TrimSpace(val)) > 0 && string(bytes.TrimSpace(val)) != "null" {
-			in.HasComplexity = true
-		}
-	}
+	in.HasComplexity = hasComplexity
 
 	// Process task
 	if trimmedTask := bytes.TrimSpace(raw.RawTask); len(trimmedTask) > 0 && string(trimmedTask) != "null" {
@@ -300,17 +378,23 @@ func (in *DelegateTaskInput) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(trimmedTask, &s); err == nil {
 			in.Task = s
 		} else {
+			nestedComplexity, err := inspectRoutingFields(trimmedTask, false)
+			if err != nil {
+				return err
+			}
 			var t Task
 			if err := json.Unmarshal(trimmedTask, &t); err != nil {
 				return err
 			}
-			var taskMap map[string]json.RawMessage
-			_ = json.Unmarshal(trimmedTask, &taskMap)
-			if !in.HasComplexity {
-				if val, ok := taskMap["complexity"]; ok && len(bytes.TrimSpace(val)) > 0 && string(bytes.TrimSpace(val)) != "null" {
-					in.Complexity = t.Complexity
-					in.HasComplexity = true
+			if !in.HasComplexity && nestedComplexity {
+				in.Complexity = t.Complexity
+				in.HasComplexity = true
+			}
+			if t.RoutingProfile != "" {
+				if in.RoutingProfile != "" && in.RoutingProfile != t.RoutingProfile {
+					return Error("INVALID_INPUT", "conflicting routing_profile values")
 				}
+				in.RoutingProfile = t.RoutingProfile
 			}
 			if in.Category == "" {
 				in.Category = t.Category
@@ -521,6 +605,7 @@ func (in *DelegateTaskInput) Normalize(defaultCwd string, cfg *Config) (Submissi
 		RequestID: reqID,
 		RepoID:    in.RepoID,
 		Task: Task{
+			RoutingProfile:        in.RoutingProfile,
 			Decompose:             in.Decompose,
 			NativeChildBackground: in.NativeChildBackground,
 			RoleCalibration:       in.RoleCalibration,
@@ -550,6 +635,7 @@ func (in *DelegateTaskInput) Normalize(defaultCwd string, cfg *Config) (Submissi
 			MaxDepth:              in.MaxDepth,
 			Category:              in.Category,
 			Complexity:            in.Complexity,
+			HasComplexity:         in.HasComplexity,
 		},
 	}
 	return sub, execMode, waitTimeout, nil
@@ -599,6 +685,8 @@ func (w WaitJobsInput) Normalize() (WaitJobsInput, error) {
 }
 
 type Batch struct {
+	RoutingProfile RoutingProfile `json:"routing_profile,omitempty"`
+
 	RequestID           string   `json:"request_id"`
 	RepoID              string   `json:"repo_id"`
 	Items               []Item   `json:"items"`
@@ -607,6 +695,48 @@ type Batch struct {
 	DeadlineSeconds     int      `json:"deadline_seconds,omitempty"`
 	WorkspaceMode       string   `json:"workspace_mode,omitempty"`
 	UntrackedPaths      []string `json:"untracked_paths,omitempty"`
+}
+
+// BatchIntentDigest distinguishes explicit zero complexity from omission.
+// The prefix separates records that support this distinction from legacy rows.
+func BatchIntentDigest(b Batch) string {
+	var zeros []string
+	for _, it := range b.Items {
+		if it.HasComplexity && it.Complexity == 0 {
+			zeros = append(zeros, it.Key)
+		}
+	}
+	return "v2:batch:" + Digest(struct {
+		Batch
+		ExplicitZeroItems []string `json:"explicit_zero_items,omitempty"`
+	}{b, zeros})
+}
+
+// BatchInput is the MCP wire form. Batch retains standard decoding for callers
+// that set decoding options such as DisallowUnknownFields.
+type BatchInput Batch
+
+func (in *BatchInput) UnmarshalJSON(data []byte) error {
+	if _, err := inspectRoutingFields(data, true); err != nil {
+		return err
+	}
+	var raw struct {
+		Items []json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, (*Batch)(in)); err != nil {
+		return err
+	}
+	for i, item := range raw.Items {
+		hasComplexity, err := inspectRoutingFields(item, false)
+		if err != nil {
+			return err
+		}
+		in.Items[i].HasComplexity = hasComplexity
+	}
+	return nil
 }
 
 const TrustedLocalProfile = "trusted-local"
@@ -634,6 +764,7 @@ type ProjectLimits struct {
 }
 
 type Repo struct {
+	DefaultRoutingProfile   RoutingProfile       `json:"default_routing_profile,omitempty"`
 	PrivateSource           *PrivateSourcePolicy `json:"private_source,omitempty"`
 	Limits                  ProjectLimits        `json:"limits,omitzero"`
 	AllowAGYReserveOverride bool                 `json:"allow_agy_weekly_reserve_override,omitempty"`
@@ -641,6 +772,12 @@ type Repo struct {
 	Root                    string               `json:"root"`
 	AllowedPaths            []string             `json:"allowed_paths"`
 	Providers               []string             `json:"providers"`
+}
+
+// PolicyDigest identifies repository admission policy across routing preference changes.
+func (r Repo) PolicyDigest() string {
+	r.DefaultRoutingProfile = ""
+	return Digest(r)
 }
 
 type ProviderConfig struct {
@@ -884,6 +1021,9 @@ func Digest(v any) string {
 }
 
 func (t *Task) Validate(repo Repo) *Fault {
+	if t.RoutingProfile != "" && !t.RoutingProfile.Valid() {
+		return Error("INVALID_INPUT", "invalid routing_profile")
+	}
 	if t.Decompose && (t.DataClass != "synthetic" || t.ExecutionProfile == "implementation" ||
 		t.ExecutionProfile == "review" || t.NativeChild || t.OpenCodeRecheck || t.RoleCalibration ||
 		t.FollowUp != "" || t.CheckpointObjective != "" || t.AGYReserveOverride != "") {
@@ -1105,6 +1245,19 @@ type Checkpoint struct {
 	Preimages         map[string]string `json:"preimages"`
 }
 
+// AttemptScope is the task scope sent to the adapter after planner transformation.
+type AttemptScope struct {
+	Mode             string `json:"mode"`
+	ExecutionProfile string `json:"execution_profile"`
+	DataClass        string `json:"data_class"`
+	NativeChild      bool   `json:"native_child,omitempty"`
+	FollowUp         bool   `json:"follow_up,omitempty"`
+}
+
+func (t Task) AttemptScope() AttemptScope {
+	return AttemptScope{Mode: t.Mode, ExecutionProfile: t.ExecutionProfile, DataClass: t.DataClass, NativeChild: t.NativeChild, FollowUp: t.FollowUp != ""}
+}
+
 type RetryHint struct {
 	Source  string     `json:"source"`
 	Value   string     `json:"value"`
@@ -1113,7 +1266,21 @@ type RetryHint struct {
 	ResetAt *time.Time `json:"effective_at,omitempty"`
 }
 
+// OpenCodeCircuitDecision records the last state accepted by the shared breaker.
+// An absent deadline means the owning probe recovered. Sequence orders commits
+// independently of provider clocks and scoped observations.
+type OpenCodeCircuitDecision struct {
+	Sequence uint64     `json:"sequence"`
+	Until    *time.Time `json:"until,omitempty"`
+}
+
 type Attempt struct {
+	OpenCodeCircuit *OpenCodeCircuitDecision `json:"opencode_circuit,omitempty"`
+	ResolvedEffort  string                   `json:"resolved_effort,omitempty"`
+	EffectiveScope  *AttemptScope            `json:"effective_scope,omitempty"`
+	// ProbeID identifies an in-process half-open circuit acquisition.
+	ProbeID                uint64               `json:"-"`
+	RateLimitSuppressed    bool                 `json:"rate_limit_suppressed,omitempty"`
 	OpenCodeRecheck        bool                 `json:"opencode_recheck,omitempty"`
 	OpenCodeEndpoint       string               `json:"opencode_endpoint,omitempty"`
 	RetryHints             []RetryHint          `json:"retry_hints,omitempty"`
@@ -1150,6 +1317,10 @@ type Attempt struct {
 }
 
 type Decision struct {
+	ResolvedEffort      string        `json:"resolved_effort,omitempty"`
+	RankingReason       string        `json:"ranking_reason,omitempty"`
+	CostClass           string        `json:"cost_class,omitempty"`
+	ProfileScore        float64       `json:"profile_score,omitempty"`
 	CooldownScope       string        `json:"cooldown_scope,omitempty"`
 	RecoveryState       string        `json:"recovery_state,omitempty"`
 	RetrySource         string        `json:"retry_source,omitempty"`
@@ -1227,6 +1398,9 @@ type AGYReserveEvidence struct {
 	ObservedAt time.Time  `json:"observed_at"`
 }
 type AGYRunEvidence struct {
+	// Only sample-derived identity is replayable. Older reserve_account_sha256
+	// records came from configuration and deliberately decode as unbound.
+	ReserveAccountSHA256      string                  `json:"observed_reserve_account_sha256,omitempty"`
 	WeeklyReserve             *AGYReserveEvidence     `json:"weekly_reserve,omitempty"`
 	NativeChild               *NativeChildEvidence    `json:"native_child,omitempty"`
 	Session                   *SessionEvidence        `json:"session,omitempty"`
@@ -1284,12 +1458,25 @@ type OpenCodeRunEvidence struct {
 	ReportedCost     *float64             `json:"reported_cost,omitempty"`
 }
 
+// CostRoute identifies the worker and task scope that supplied a direct receipt.
+type CostRoute struct {
+	Provider    string       `json:"provider"`
+	Model       string       `json:"model"`
+	Fingerprint string       `json:"fingerprint"`
+	Adapter     string       `json:"adapter"`
+	Transport   string       `json:"transport,omitempty"`
+	Endpoint    string       `json:"endpoint,omitempty"`
+	Account     string       `json:"account"`
+	Scope       AttemptScope `json:"scope"`
+}
+
 type CostEvidence struct {
-	Documented      string `json:"documented_cost_protection,omitempty"`
-	RuntimeVerified string `json:"runtime_cost_protection_verified,omitempty"`
-	Policy          string `json:"policy"`
-	Status          string `json:"status"`
-	Account         string `json:"account,omitempty"`
+	VerifiedRoute   *CostRoute `json:"verified_route,omitempty"`
+	Documented      string     `json:"documented_cost_protection,omitempty"`
+	RuntimeVerified string     `json:"runtime_cost_protection_verified,omitempty"`
+	Policy          string     `json:"policy"`
+	Status          string     `json:"status"`
+	Account         string     `json:"account,omitempty"`
 }
 
 type Result struct {
@@ -1315,7 +1502,28 @@ type OpenCodeRoute struct {
 	OpenCodeTransport string `json:"opencode_transport,omitempty"`
 }
 
+type InitialRoute struct {
+	CapacityState  string  `json:"capacity_state,omitempty"`
+	CostClass      string  `json:"cost_class,omitempty"`
+	ProfileScore   float64 `json:"profile_score,omitempty"`
+	Provider       string  `json:"provider,omitempty"`
+	Model          string  `json:"model,omitempty"`
+	SelectedModel  string  `json:"selected_model,omitempty"`
+	ResolvedEffort string  `json:"resolved_effort,omitempty"`
+	Reason         string  `json:"reason,omitempty"`
+	TaskCategory   string  `json:"task_category,omitempty"`
+	Stage          string  `json:"stage,omitempty"`
+	QuotaPressure  float64 `json:"quota_pressure,omitempty"`
+	AutoRouted     bool    `json:"auto_routed,omitempty"`
+	LatencyMS      int64   `json:"latency_ms,omitempty"`
+}
+
 type Job struct {
+	RoutingProfile           RoutingProfile `json:"routing_profile,omitempty"`
+	RoutingProfileSource     string         `json:"routing_profile_source,omitempty"`
+	RoutingPreferenceWarning string         `json:"routing_preference_warning,omitempty"`
+
+	InitialRoute         *InitialRoute     `json:"initial_route,omitempty"`
 	PlanSHA256           string            `json:"plan_sha256,omitempty"`
 	CapacityWarningCodes []string          `json:"capacity_warning_codes,omitempty"`
 	RoutingMode          string            `json:"routing_mode,omitempty"`

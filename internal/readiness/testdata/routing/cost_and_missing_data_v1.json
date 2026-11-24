@@ -1,0 +1,627 @@
+{
+  "fixture_version": "b1-routing-v1",
+  "schema_version": "2026-11-23.v1",
+  "protocol": {
+    "pre_registered": true,
+    "hypothesis": "Cost aggregation preserves UNKNOWN cost and quota without coercing to 0, includes failed attempt measurable costs, and separates accounts and cost units.",
+    "primary_metric": "verified_success_rate",
+    "drift_thresholds": {
+      "fp_max_accuracy_drop_pp": 5.0,
+      "fp_min_measurable_cost_gain_pct": 10.0,
+      "fp_max_p95_latency_increase_pct": 25.0,
+      "quality_min_success_rate": 0.85,
+      "price_max_extra_spend": 0.0
+    },
+    "budget_limit": {
+      "max_total_calls": 32,
+      "max_paid_spend": 1.5,
+      "allow_live_quota_consumption": false
+    },
+    "sample_plan": {
+      "min_matched_cases_per_profile": 12,
+      "min_cases_per_role": 1,
+      "required_roles": [
+        "coding",
+        "debugging",
+        "code_review",
+        "planning"
+      ]
+    },
+    "recorded_at": "2026-11-23T16:00:00Z",
+    "environment": {
+      "cpu": "Intel(R) Core(TM) i9-9980HK CPU @ 2.40GHz",
+      "platform": "darwin/amd64",
+      "worktree": "synthetic-trusted-local-v1",
+      "stdout_json_ingestion_ms": 3,
+      "observer_io_ms": 6,
+      "provider_mode": "offline_simulated"
+    }
+  },
+  "runs": [
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-cost-01",
+      "role": "coding",
+      "task_variant": "go-retry-cost-accounting-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestRetryCostAccounting"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "reference",
+      "run_order": 1,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-acct-a",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "five_hour",
+        "remaining_percent": 80.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-cost-01-ref",
+          "job_id": "job-cost-01-ref",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-acct-a",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "6111111111111111111111111111111111111111111111111111111111111111",
+            "artifact_sha256": "6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestRetryCostAccounting",
+              "status": "FAILED",
+              "exit_status": 1
+            },
+            "independent_verified": false
+          },
+          "latency_ms": 6000,
+          "cost_unit": "usd",
+          "reported_cost": 0.05,
+          "cost_evidence": {
+            "policy": "METERED_API",
+            "status": "REPORTED_USAGE",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "VERIFIED",
+            "account": "codex-acct-a"
+          }
+        },
+        {
+          "number": 2,
+          "request_id": "req-cost-01-ref",
+          "job_id": "job-cost-01-ref",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-acct-a",
+          "quota_window": "five_hour",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "6111111111111111111111111111111111111111111111111111111111111112",
+            "artifact_sha256": "6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestRetryCostAccounting",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 8000,
+          "cost_unit": "usd",
+          "reported_cost": 0.1,
+          "cost_evidence": {
+            "policy": "METERED_API",
+            "status": "REPORTED_USAGE",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "VERIFIED",
+            "account": "codex-acct-a"
+          }
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 14000,
+      "cost_unit": "usd",
+      "reported_cost": 0.15
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-cost-01",
+      "role": "coding",
+      "task_variant": "go-retry-cost-accounting-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestRetryCostAccounting"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price_performance",
+      "run_order": 2,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "source": "unconfigured",
+        "account": "claude-unbound",
+        "account_bound": false,
+        "fresh": false,
+        "state": "UNKNOWN"
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-cost-01-fp",
+          "job_id": "job-cost-01-fp",
+          "provider": "claude",
+          "model": "claude-sonnet-4-6",
+          "effort": "medium",
+          "account": "claude-unbound",
+          "quota_window": "weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "6111111111111111111111111111111111111111111111111111111111111113",
+            "artifact_sha256": "6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestRetryCostAccounting",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 9500,
+          "cost_unit": "quota_percent_weekly",
+          "reported_cost": "UNKNOWN",
+          "cost_evidence": {
+            "policy": "SUBSCRIPTION_ONLY",
+            "status": "UNVERIFIED_RUNTIME_COST",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "UNKNOWN",
+            "account": "claude-unbound"
+          }
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 9500,
+      "cost_unit": "quota_percent_weekly",
+      "reported_cost": "UNKNOWN"
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-cost-01",
+      "role": "coding",
+      "task_variant": "go-retry-cost-accounting-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestRetryCostAccounting"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "quality",
+      "run_order": 3,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-acct-b",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "weekly",
+        "remaining_percent": 90.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-cost-01-qual",
+          "job_id": "job-cost-01-qual",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-acct-b",
+          "quota_window": "weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 1,
+          "provider_reply": {
+            "status": "ERROR",
+            "http_status": 500,
+            "reported_success": false
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestRetryCostAccounting",
+              "status": "FAILED",
+              "exit_status": 1
+            },
+            "independent_verified": false
+          },
+          "latency_ms": 11000,
+          "cost_unit": "usd",
+          "reported_cost": 0.08,
+          "cost_evidence": {
+            "policy": "METERED_API",
+            "status": "REPORTED_USAGE",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "VERIFIED",
+            "account": "codex-acct-b"
+          }
+        }
+      ],
+      "verified_success": false,
+      "latency_ms": 11000,
+      "cost_unit": "usd",
+      "reported_cost": 0.08
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-cost-01",
+      "role": "coding",
+      "task_variant": "go-retry-cost-accounting-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestRetryCostAccounting"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price",
+      "run_order": 4,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "source": "opencode_cooldown_history",
+        "account": "ANONYMOUS",
+        "account_bound": false,
+        "fresh": true,
+        "state": "UNKNOWN"
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-cost-01-price",
+          "job_id": "job-cost-01-price",
+          "provider": "opencode",
+          "model": "opencode/glm-5.3-flash-free",
+          "account": "ANONYMOUS",
+          "quota_window": "catalog_free",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "6111111111111111111111111111111111111111111111111111111111111114",
+            "artifact_sha256": "6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestRetryCostAccounting",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 2800,
+          "cost_unit": "usd",
+          "reported_cost": 0.0,
+          "cost_evidence": {
+            "policy": "FREE_ONLY",
+            "status": "ZERO_PRICE_CATALOG",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "VERIFIED",
+            "account": "ANONYMOUS"
+          }
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 2800,
+      "cost_unit": "usd",
+      "reported_cost": 0.0
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-cost-02",
+      "role": "debugging",
+      "task_variant": "go-channel-close-fix-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestChannelCloseFix"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "reference",
+      "run_order": 2,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-acct-b",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "weekly",
+        "remaining_percent": 88.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-cost-02-ref",
+          "job_id": "job-cost-02-ref",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-acct-b",
+          "quota_window": "weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "6222222222222222222222222222222222222222222222222222222222222221",
+            "artifact_sha256": "6bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestChannelCloseFix",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 18000,
+          "cost_unit": "usd",
+          "reported_cost": 0.2,
+          "cost_evidence": {
+            "policy": "METERED_API",
+            "status": "REPORTED_USAGE",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "VERIFIED",
+            "account": "codex-acct-b"
+          }
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 18000,
+      "cost_unit": "usd",
+      "reported_cost": 0.2
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-cost-02",
+      "role": "debugging",
+      "task_variant": "go-channel-close-fix-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestChannelCloseFix"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price_performance",
+      "run_order": 3,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "agy",
+        "source": "codexbar_app",
+        "account": "SAME_NATIVE_CLI_CONTEXT",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "gemini-weekly",
+        "remaining_percent": 50.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-cost-02-fp",
+          "job_id": "job-cost-02-fp",
+          "provider": "agy",
+          "model": "gemini-3.8-flash-medium",
+          "effort": "medium",
+          "account": "SAME_NATIVE_CLI_CONTEXT",
+          "quota_window": "gemini-weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "6222222222222222222222222222222222222222222222222222222222222222",
+            "artifact_sha256": "6bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestChannelCloseFix",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 12500,
+          "cost_unit": "quota_percent_weekly",
+          "reported_cost": "UNKNOWN",
+          "cost_evidence": {
+            "policy": "SUBSCRIPTION_ONLY",
+            "status": "DOCUMENTED_COST_PROTECTION",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "UNKNOWN",
+            "account": "SAME_NATIVE_CLI_CONTEXT"
+          }
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 12500,
+      "cost_unit": "quota_percent_weekly",
+      "reported_cost": "UNKNOWN"
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-cost-02",
+      "role": "debugging",
+      "task_variant": "go-channel-close-fix-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestChannelCloseFix"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "quality",
+      "run_order": 4,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "provider": "codex",
+        "source": "codexbar_oauth",
+        "account": "codex-acct-b",
+        "account_bound": true,
+        "fresh": true,
+        "state": "KNOWN",
+        "window": "weekly",
+        "remaining_percent": 87.0
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-cost-02-qual",
+          "job_id": "job-cost-02-qual",
+          "provider": "codex",
+          "model": "gpt-5.4",
+          "effort": "high",
+          "account": "codex-acct-b",
+          "quota_window": "weekly",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "6222222222222222222222222222222222222222222222222222222222222223",
+            "artifact_sha256": "6bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestChannelCloseFix",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 17000,
+          "cost_unit": "usd",
+          "reported_cost": 0.12,
+          "cost_evidence": {
+            "policy": "METERED_API",
+            "status": "REPORTED_USAGE",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "VERIFIED",
+            "account": "codex-acct-b"
+          }
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 17000,
+      "cost_unit": "usd",
+      "reported_cost": 0.12
+    },
+    {
+      "fixture_version": "b1-routing-v1",
+      "schema_version": "2026-11-23.v1",
+      "case_id": "case-cost-02",
+      "role": "debugging",
+      "task_variant": "go-channel-close-fix-v1",
+      "repo_policy_version": "trusted-local-go-v1",
+      "acceptance_rubric": {
+        "rubric_version": "rubric-go-check-v1",
+        "go_check": "TestChannelCloseFix"
+      },
+      "reference_baseline": "codex:gpt-5.4:high",
+      "profile": "price",
+      "run_order": 1,
+      "scenario": "NORMAL",
+      "quota_provenance": {
+        "source": "opencode_cooldown_history",
+        "account": "ANONYMOUS",
+        "account_bound": false,
+        "fresh": true,
+        "state": "UNKNOWN"
+      },
+      "attempts": [
+        {
+          "number": 1,
+          "request_id": "req-cost-02-price",
+          "job_id": "job-cost-02-price",
+          "provider": "opencode",
+          "model": "opencode/glm-5.3-flash-free",
+          "account": "ANONYMOUS",
+          "quota_window": "catalog_free",
+          "route_status": "SELECTED",
+          "process_exit_code": 0,
+          "provider_reply": {
+            "status": "OK",
+            "http_status": 200,
+            "summary_sha256": "6222222222222222222222222222222222222222222222222222222222222224",
+            "artifact_sha256": "6bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbd",
+            "reported_success": true
+          },
+          "verification": {
+            "check_result": {
+              "id": "go-unit",
+              "test": "TestChannelCloseFix",
+              "status": "PASSED",
+              "exit_status": 0
+            },
+            "independent_verified": true
+          },
+          "latency_ms": 4200,
+          "cost_unit": "usd",
+          "reported_cost": 0.0,
+          "cost_evidence": {
+            "policy": "FREE_ONLY",
+            "status": "ZERO_PRICE_CATALOG",
+            "documented_cost_protection": "VERIFIED",
+            "runtime_cost_protection_verified": "VERIFIED",
+            "account": "ANONYMOUS"
+          }
+        }
+      ],
+      "verified_success": true,
+      "latency_ms": 4200,
+      "cost_unit": "usd",
+      "reported_cost": 0.0
+    }
+  ]
+}

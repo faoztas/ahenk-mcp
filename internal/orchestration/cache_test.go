@@ -95,7 +95,7 @@ func TestQuotaCacheKeepsObservationsWithCodexBarDisabled(t *testing.T) {
 		readQuotas: func() { <-release },
 	}
 	zero := 0.0
-	e.SetQuotaForTest("codex", []providers.Quota{{Bucket: providers.BarCodexBurst, Remaining: &zero}})
+	e.SetQuotaForTest("codex", []providers.Quota{{AccountMatch: "MATCHED", Unit: "percent", State: "KNOWN", Bucket: providers.BarCodexBurst, Remaining: &zero}})
 
 	_ = e.Quota("claude")
 	// A started refresh holds the flag until the fake reader is released.
