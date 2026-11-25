@@ -91,7 +91,8 @@ func git(ctx context.Context, dir string, stdin []byte, args ...string) ([]byte,
 	out := Limited{Limit: maxSnapshot}
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		return nil, err
+		// CommandContext can report a killed process when its deadline interrupts Git.
+		return nil, errors.Join(err, ctx.Err())
 	}
 	return out.Bytes(), nil
 }

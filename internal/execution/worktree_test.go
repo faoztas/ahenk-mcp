@@ -5,14 +5,53 @@ package execution
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/faoztas/ahenk-mcp/internal/model"
 )
+
+func TestGitPreservesCancellationDuringHashObject(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "input")
+	if err := syscall.Mkfifo(input, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := git(ctx, dir, nil, "hash-object", "--no-filters", input)
+		done <- err
+	}()
+	// A writer can open the FIFO once Git is waiting to read its input.
+	for {
+		writer, err := os.OpenFile(input, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			cancel()
+			err = <-done
+			writer.Close()
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("interrupted Git lost its cancellation cause: %v", err)
+			}
+			return
+		}
+		if !errors.Is(err, syscall.ENXIO) {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("Git exited before opening its input: %v", err)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
 
 func TestPrivateWorktreePreservesSnapshotAndSource(t *testing.T) {
 	source, attempt, snapshot, task := worktreeFixture(t)

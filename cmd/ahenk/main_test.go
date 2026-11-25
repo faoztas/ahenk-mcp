@@ -94,7 +94,7 @@ func TestStdioSnapshotAndLifecycle(t *testing.T) {
 	if err := os.WriteFile(config, b, 0600); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 180*time.Second)
 	defer cancel()
 	connect := func() *mcp.ClientSession {
 		t.Helper()
@@ -123,7 +123,7 @@ func TestStdioSnapshotAndLifecycle(t *testing.T) {
 	wait := func(s *mcp.ClientSession, id string, wanted ...string) map[string]any {
 		t.Helper()
 		var out map[string]any
-		for until := time.Now().Add(12 * time.Second); time.Now().Before(until); time.Sleep(40 * time.Millisecond) {
+		for until := time.Now().Add(90 * time.Second); time.Now().Before(until); time.Sleep(40 * time.Millisecond) {
 			out = call(s, "get_job_status", map[string]string{"job_id": id})
 			status, _ := out["status"].(string)
 			for _, state := range wanted {

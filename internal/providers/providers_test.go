@@ -31,6 +31,29 @@ func TestBudgetKeepsHardDeadline(t *testing.T) {
 	}
 }
 
+func TestFixtureImplementationBudget(t *testing.T) {
+	now := time.Now()
+	c := model.Capability{Speed: "fixture"}
+	for _, tc := range []struct {
+		name               string
+		task               model.Task
+		deadline, estimate time.Duration
+	}{
+		{"plain patch", model.Task{Mode: "patch"}, 30 * time.Second, 5 * time.Second},
+		{"worktree patch", model.Task{Mode: "patch", ExecutionProfile: "implementation"}, 60 * time.Second, 25 * time.Second},
+		{"checked worktree patch", model.Task{Mode: "patch", ExecutionProfile: "implementation",
+			Acceptance: []model.Check{{CheckID: "go-check"}}}, 120 * time.Second, 90 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			estimate := Estimate(c, tc.task)
+			budget, fits := Budget(now, now.Add(tc.deadline), tc.task, estimate)
+			if estimate != tc.estimate || !fits || budget < tc.estimate || budget > tc.deadline-20*time.Second {
+				t.Fatalf("estimate %v, budget %v, fits %v", estimate, budget, fits)
+			}
+		})
+	}
+}
+
 func TestDecodeCodexBarSeparatesWindowsAndUnknown(t *testing.T) {
 	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
 	input := "[{\"provider\":\"antigravity\",\"account\":\"redacted@example.invalid\",\"usage\":{\"updatedAt\":\"2026-11-09T11:59:00Z\",\"primary\":{\"usedPercent\":100,\"usageKnown\":false},\"secondary\":{\"usedPercent\":75},\"tertiary\":{\"usedPercent\":100}}}]"

@@ -450,6 +450,9 @@ func Estimate(c model.Capability, t model.Task) time.Duration {
 			secs = 25
 		} else if slices.ContainsFunc(t.Acceptance, func(ch model.Check) bool { return ch.CheckID != "" }) {
 			secs = 90
+		} else if t.ExecutionProfile == "implementation" {
+			// The synthetic writer prepares and verifies a private Git worktree.
+			secs = 25
 		}
 	case t.Risk == "critical":
 		secs = 480
