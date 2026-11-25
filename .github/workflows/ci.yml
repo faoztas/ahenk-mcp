@@ -31,11 +31,27 @@ jobs:
       - run: go vet -mod=readonly ./...
       - name: Verify Intel package
         run: |
-          make dist
-          tar -xzf dist/ahenk-darwin-amd64.tar.gz -C "$RUNNER_TEMP"
-          package="$RUNNER_TEMP/ahenk-darwin-amd64"
-          test -x "$package/ahenk"
-          "$package/ahenk" --version
-          cmp LICENSE "$package/LICENSE"
-          cmp docs/third-party-licenses.md "$package/THIRD_PARTY.md"
-          test -s "$package/licenses/go/LICENSE"
+          set -euo pipefail
+          smoke="$(mktemp -d "$RUNNER_TEMP/ahenk-package.XXXXXXXX")"
+          trap 'rm -rf "$smoke"' EXIT
+          mkdir "$smoke/first" "$smoke/second"
+
+          package=ahenk-darwin-amd64
+          archive="$package.tar.gz"
+          source_sha="$(git rev-parse HEAD)"
+          for build in first second; do
+            make dist
+            mv "dist/$archive" "$smoke/$build/"
+            tar -xzf "$smoke/$build/$archive" -C "$smoke/$build"
+          done
+          first_sha="$(shasum -a 256 "$smoke/first/$archive" | awk '{print $1}')"
+          second_sha="$(shasum -a 256 "$smoke/second/$archive" | awk '{print $1}')"
+          test -n "$first_sha"
+          test "$first_sha" = "$second_sha"
+          diff -qr "$smoke/first/$package" "$smoke/second/$package"
+
+          AHENK_PACKAGE_BINARY="$smoke/first/$package/ahenk" \
+            AHENK_PACKAGE_SOURCE_SHA="$source_sha" \
+            AHENK_PACKAGE_SHA_FIRST="$first_sha" \
+            AHENK_PACKAGE_SHA_SECOND="$second_sha" \
+            go test -mod=readonly ./cmd/ahenk -run '^TestIntelPackageMCPContract$' -count=1 -v

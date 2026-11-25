@@ -10,9 +10,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -56,6 +56,12 @@ type response map[string]any
 
 func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "ahenk", Version: model.Version}, nil)
+	knownModel := func(provider, name string) bool {
+		return slices.ContainsFunc(r.Candidates, func(c model.Capability) bool {
+			return c.Status == "available" && c.Model == name &&
+				(provider == "" || orchestration.NormalizeProvider(c.Provider) == orchestration.NormalizeProvider(provider))
+		})
+	}
 	jobResponse := func(j model.Job) response {
 		out := status(j)
 		if j.ID == "" {
@@ -80,7 +86,7 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 			out["summary"] = j.Result.Summary
 			out["verification"] = j.Result.Verification
 			if j.Result.Cost != nil {
-				out["cost"] = j.Result.Cost
+				out["cost"] = publicView{j.Result.Cost, publicCost}
 			}
 		}
 		if len(j.Attempts) > 0 {
@@ -141,7 +147,8 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 		}
 		sub.Task.MaxDepth = effectiveMaxDepth
 
-		var routeDecision map[string]any
+		var initial *model.InitialRoute
+		var j model.Job
 		isAuto := (in.Target == nil || in.Target.Provider == "" || in.Target.Provider == "auto") &&
 			in.PreferredProvider == "" && in.PreferredModel == "" && sub.Task.PreferredProvider == "" && sub.Task.PreferredModel == ""
 		if isAuto && e != nil {
@@ -150,31 +157,28 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 				c := in.Complexity
 				complexityPtr = &c
 			}
-			decision, selectedCap := e.EvaluateAutoRoute(in.RepoID, in.Category, complexityPtr, sub.Task, time.Now().UTC())
-			if selectedCap != nil {
-				routeDecision = map[string]any{
-					"selected_model":  decision.SelectedModel,
-					"resolved_effort": decision.ResolvedEffort,
-					"reason":          decision.Reason,
-					"task_category":   decision.TaskCategory,
-					"quota_pressure":  decision.QuotaPressure,
-				}
-				sub.Task.PreferredProvider = orchestration.NormalizeProvider(selectedCap.Provider)
-				if selectedCap.Model != "" {
-					sub.Task.PreferredModel = selectedCap.Model
-				} else if parts := strings.SplitN(decision.SelectedModel, "/", 2); len(parts) == 2 {
-					sub.Task.PreferredModel = parts[1]
-				} else {
-					sub.Task.PreferredModel = decision.SelectedModel
-				}
-				if sub.Task.TargetEffort == "" {
-					sub.Task.TargetEffort = decision.ResolvedEffort
+			j, initial, err = e.SubmitAutoRouted(sub, in.Category, complexityPtr)
+		} else {
+			j, err = e.SubmitRouted(sub, nil)
+		}
+		route := j.InitialRoute
+		if err != nil {
+			route = initial
+		}
+		var routeDecision map[string]any
+		if route != nil {
+			routeDecision = map[string]any{
+				"selected_model": route.SelectedModel, "resolved_effort": route.ResolvedEffort,
+				"reason": route.Reason, "task_category": route.TaskCategory, "quota_pressure": route.QuotaPressure,
+			}
+			if route.CapacityState != "" {
+				routeDecision["capacity_state"] = route.CapacityState
+				routeDecision["cost_class"] = route.CostClass
+				if route.CapacityState == "UNKNOWN" || route.CapacityState == "STALE" {
+					routeDecision["quota_pressure"] = nil
 				}
 			}
 		}
-
-		dispatchStart := time.Now()
-		j, err := e.Submit(sub)
 		if err != nil {
 			out := jobResponse(j)
 			if routeDecision != nil {
@@ -182,26 +186,6 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 			}
 			return out, err
 		}
-
-		auditCreatedAt := time.Now().UTC()
-		if routeDecision != nil && e.Store() != nil && j.ID != "" {
-			_ = e.Store().RecordRoutingAudit(store.JobRoutingAudit{
-				JobID:                   j.ID,
-				TaskCategory:            routeDecision["task_category"].(string),
-				AttemptNumber:           1,
-				AssignedModel:           routeDecision["selected_model"].(string),
-				AssignedEffort:          routeDecision["resolved_effort"].(string),
-				RouteReason:             routeDecision["reason"].(string),
-				QuotaPressureAtDispatch: routeDecision["quota_pressure"].(float64),
-				DispatchStatus:          "DISPATCHED",
-				LatencyMs:               time.Since(dispatchStart).Milliseconds(),
-				CreatedAt:               auditCreatedAt,
-			})
-			if cur, getErr := e.Get(j.ID); getErr == nil && model.Terminal(cur.Status) {
-				e.SyncTerminalAudit(cur)
-			}
-		}
-
 		if execMode == "wait" {
 			waitedJob, waitErr := e.Wait(ctx, j.ID, waitTimeout)
 			out := jobDetailedResponse(ctx, waitedJob)
@@ -237,7 +221,8 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 			return response{"jobs": results, "count": len(results)}, nil
 		})
 	add(s, e, "delegate_batch", "Queue up to eight tasks with dependencies and optional verified result handoffs.", false,
-		func(ctx context.Context, in model.Batch) (response, error) {
+		func(ctx context.Context, input model.BatchInput) (response, error) {
+			in := model.Batch(input)
 			if repo, ok := e.Repo(in.RepoID); ok && repo.PrivateSource != nil {
 				if !repo.PrivateSource.WriterIsolationVerified || !repo.PrivateSource.AllowWrite {
 					return nil, model.GateError("POLICY_DENIED", "WRITER_ISOLATION_UNVERIFIED", "private source batch requires verified writer isolation and explicit write admission", "verify_writer_isolation_and_enable_allow_write")
@@ -257,7 +242,12 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 				return nil, model.Error("INVALID_INPUT", "invalid job_id")
 			}
 			j, err := e.Get(in.JobID)
-			return jobResponse(j), err
+			if err != nil {
+				return nil, err
+			}
+			out := jobResponse(j)
+			addRoutingEvidence(out, store.ProjectRoutingEvidence(j, knownModel))
+			return out, nil
 		})
 	add(s, e, "list_jobs", "List durable jobs visible under current repository policies.", false,
 		func(_ context.Context, in listInput) (response, error) {
@@ -308,10 +298,10 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 			out := jobResponse(j)
 			switch in.View {
 			case "", "summary":
-				out["result"] = j.Result
+				out["result"] = publicView{j.Result, publicResult}
 			case "route":
-				out["route"] = j.Route
-				out["attempts"] = j.Attempts
+				out["route"] = publicView{j.Route, publicDecision}
+				out["attempts"] = publicView{j.Attempts, publicAttempt}
 				if j.PlanSHA256 != "" {
 					out["plan_sha256"] = j.PlanSHA256
 				}
@@ -400,40 +390,18 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 				if c.Status == "available" {
 					c.Quality = e.RoleQualities(c)
 					c.FPTier = providers.FPTier(c.Provider, c.Model)
-					switch orchestration.NormalizeProvider(c.Provider) {
-					case "agy":
-						if family := providers.AGYModelFamily(c.Model); family != "" {
-							for _, h := range capacity.Headroom {
-								if h.Family == family {
-									c.HeadroomPercent, c.HeadroomState = h.Effective*100, h.State
-									break
-								}
-							}
+					for _, d := range preview {
+						if !sameRoute(c, d) {
+							continue
 						}
-					case "opencode":
-						c.HeadroomPercent = e.HealthPercent(providers.BarOpenCodeFree) * 100
-						c.HeadroomState = e.BarState(providers.BarOpenCodeFree)
-					case "codex":
-						for _, h := range capacity.Headroom {
-							if h.Family == "codex" {
-								c.HeadroomPercent, c.HeadroomState = h.Effective*100, h.State
-								break
-							}
+						if d.HeadroomState != "" && orchestration.NormalizeProvider(c.Provider) == "agy" {
+							c.HeadroomPercent, c.HeadroomState = d.HeadroomPercent, d.HeadroomState
+						} else if d.QuotaRemaining != nil {
+							c.HeadroomPercent, c.HeadroomState = *d.QuotaRemaining, d.CapacityState
+						} else if d.HealthScope != "" {
+							c.HeadroomState = d.CapacityState
 						}
-						if c.HeadroomState == "" {
-							burst := e.HealthPercent(providers.BarCodexBurst)
-							weekly := e.HealthPercent(providers.BarCodexWeekly)
-							if burst <= 0 || weekly <= 0 {
-								c.HeadroomPercent, c.HeadroomState = 0, "EXHAUSTED"
-							}
-						}
-					case "claude":
-						for _, q := range e.Quota("claude") {
-							if q.State == "EXHAUSTED" || (q.Remaining != nil && *q.Remaining <= 0) {
-								c.HeadroomPercent, c.HeadroomState = 0, "EXHAUSTED"
-								break
-							}
-						}
+						break
 					}
 				}
 				items = append(items, c)
@@ -442,9 +410,9 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 				"scheduler_status": "active",
 				"version":          model.Version,
 				"binary_sha256":    execution.SelfBinarySHA256(),
-				"providers":        items,
+				"providers":        publicView{items, publicCapability},
 				"local_runners":    e.LocalRunners(),
-				"routing_summary":  routingSummary(items, e.ActiveCircuitBreakers(), e),
+				"routing_summary":  routingSummary(items, e.ActiveCircuitBreakers(), preview),
 			}
 			if in.RepoID != "" {
 				out["repo_admission"] = e.RepoAdmission(in.RepoID)
@@ -453,11 +421,11 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 				out["capacity_warnings"] = warnings
 			}
 			if in.IncludeQuota {
-				out["quota"] = e.Quota(in.Provider)
-				out["capacity"] = capacity
+				out["quota"] = publicView{e.Quota(in.Provider), publicQuota}
+				out["capacity"] = publicView{capacity, publicCapacity}
 				out["capacity_policy"] = cfg.CapacityPolicy.Defaults()
 				if in.RepoID != "" {
-					out["routing_preview"] = preview
+					out["routing_preview"] = publicView{preview, publicDecision}
 				}
 			}
 			return out, nil
@@ -465,46 +433,7 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 
 	add(s, e, "get_provider_quotas", "Read remaining percentages, states, and circuit states for all provider quota bars.", true,
 		func(_ context.Context, _ emptyInput) (response, error) {
-			trackedBars := []struct {
-				Bucket   string
-				Provider string
-			}{
-				{Bucket: providers.BarCodexBurst, Provider: "codex"},
-				{Bucket: providers.BarCodexWeekly, Provider: "codex"},
-				{Bucket: providers.BarAgyGemini, Provider: "antigravity"},
-				{Bucket: providers.BarAgyOpus, Provider: "antigravity"},
-				{Bucket: providers.BarAgyArgon, Provider: "antigravity"},
-				{Bucket: providers.BarOpenCodeFree, Provider: "opencode"},
-			}
-			bars := make([]map[string]any, 0, len(trackedBars))
-			for _, b := range trackedBars {
-				if e == nil {
-					bars = append(bars, map[string]any{
-						"bucket":            b.Bucket,
-						"provider":          b.Provider,
-						"remaining_percent": nil,
-						"health_pct":        nil,
-						"state":             "UNKNOWN",
-						"circuit_state":     "UNKNOWN",
-					})
-					continue
-				}
-				health := e.HealthPercent(b.Bucket)
-				state := e.BarState(b.Bucket)
-				circuitState := "CLOSED"
-				if e.CircuitBreaker() != nil {
-					circuitState = string(e.CircuitBreaker().State(b.Provider))
-				}
-				bars = append(bars, map[string]any{
-					"bucket":            b.Bucket,
-					"provider":          b.Provider,
-					"remaining_percent": health * 100.0,
-					"health_pct":        health,
-					"state":             state,
-					"circuit_state":     circuitState,
-				})
-			}
-			return response{"bars": bars}, nil
+			return response{"bars": e.QuotaBars(time.Now().UTC())}, nil
 		})
 
 	add(s, e, "get_active_circuit_breakers", "Read active provider circuit breakers and cooldown deadlines.", true,
@@ -523,118 +452,55 @@ func New(e *orchestration.Engine, cfg model.Config, r providers.Registry) *mcp.S
 			if e == nil {
 				return nil, model.GateError("STATE_BUSY", "STATE_BUSY", "another stdio session owns this state; reconnect after the owner exits", "reconnect_after_owner_exits")
 			}
-			if _, err := e.Get(in.JobID); err != nil {
+			j, history, err := e.GetWithRoutingAudit(in.JobID)
+			if err != nil {
 				return nil, err
-			}
-			var history []store.JobRoutingAudit
-			if e.Store() != nil {
-				var err error
-				history, err = e.Store().GetRoutingAudit(in.JobID)
-				if err != nil {
-					return nil, err
-				}
 			}
 			if history == nil {
 				history = []store.JobRoutingAudit{}
 			}
-			return response{
-				"job_id":   in.JobID,
-				"attempts": history,
-			}, nil
+			for i := range history {
+				history[i] = store.ProjectLegacyRoutingAudit(history[i], knownModel)
+			}
+			evidence := store.ProjectRoutingEvidence(j, knownModel)
+			out := response{"job_id": j.ID, "attempts": history, "status": j.Status}
+			addRoutingEvidence(out, evidence)
+			return out, nil
 		})
 
 	return s
 }
 
+func sameRoute(c model.Capability, d model.Decision) bool {
+	return d.Provider == c.Provider && d.Model == c.Model && d.Fingerprint == c.Fingerprint &&
+		d.OpenCodeAccount == c.OpenCodeAccount && d.OpenCodeTransport == c.OpenCodeTransport
+}
+
 // routingSummary recommends one available route per price/performance tier
 // and lists the active circuit breakers.
-func routingSummary(items []model.Capability, breakers []map[string]any, eng ...*orchestration.Engine) response {
+func routingSummary(items []model.Capability, breakers []map[string]any, routes []model.Decision) response {
 	if breakers == nil {
 		breakers = []map[string]any{}
 	}
-	var e *orchestration.Engine
-	if len(eng) > 0 {
-		e = eng[0]
-	}
-
-	trippedProviders := make(map[string]bool)
-	trippedModels := make(map[string]bool)
-	for _, b := range breakers {
-		p, _ := b["provider"].(string)
-		m, _ := b["model"].(string)
-		normP := orchestration.NormalizeProvider(p)
-		if normP == "" {
-			continue
-		}
-		if m != "" {
-			trippedModels[normP+":"+m] = true
-		} else {
-			trippedProviders[normP] = true
-		}
-	}
-
 	isCandidateHealthy := func(c model.Capability) bool {
-		normP := orchestration.NormalizeProvider(c.Provider)
-		if trippedProviders[normP] || trippedModels[normP+":"+c.Model] {
-			return false
-		}
-		if e != nil && e.CircuitBreaker() != nil && !e.CircuitBreaker().Eligible(c.Provider) {
-			return false
-		}
-		if c.HeadroomState == "EXHAUSTED" || c.HeadroomState == "CRITICAL" {
-			return false
-		}
-		if e != nil {
-			switch normP {
-			case "codex":
-				if e.HealthPercent(providers.BarCodexBurst) <= 0 || e.HealthPercent(providers.BarCodexWeekly) <= 0 {
-					return false
-				}
-			case "claude":
-				for _, q := range e.Quota("claude") {
-					if q.State == "EXHAUSTED" || (q.Remaining != nil && *q.Remaining <= 0) {
-						return false
-					}
-				}
-			case "opencode":
-				if e.HealthPercent(providers.BarOpenCodeFree) <= 0 {
-					return false
-				}
-			case "agy":
-				switch providers.AGYModelFamily(c.Model) {
-				case "gemini_argon":
-					if e.HealthPercent(providers.BarAgyArgon) <= 0 {
-						return false
-					}
-				case "claude_gpt":
-					if e.HealthPercent(providers.BarAgyOpus) <= 0 {
-						return false
-					}
-				case "gemini":
-					if e.HealthPercent(providers.BarAgyGemini) <= 0 {
-						return false
-					}
-				}
-			}
-		}
-		return true
+		return slices.ContainsFunc(routes, func(d model.Decision) bool {
+			return (d.Reason == "AVAILABLE_CANDIDATE" || d.Reason == "FALLBACK_CANDIDATE") &&
+				sameRoute(c, d)
+		})
 	}
-
 	summary := response{"active_circuit_breakers": breakers}
-	const criticalHeadroom = 5.0
+
 	for tier, key := range map[string]string{
 		"free": "recommended_free", "cheap": "recommended_cheap",
 		"balanced": "recommended_balanced", "hard": "recommended_frontier",
 	} {
-		best, bestHeadroom := "", criticalHeadroom
+		best, bestHeadroom := "", -1.0
 		for _, c := range items {
 			if c.Status != "available" || c.FPTier != tier || !isCandidateHealthy(c) {
 				continue
 			}
-			if c.HeadroomState != "" && c.HeadroomPercent <= criticalHeadroom {
-				continue
-			}
-			if c.HeadroomPercent > bestHeadroom || (best == "" && c.HeadroomState == "") {
+
+			if c.HeadroomPercent > bestHeadroom {
 				best, bestHeadroom = c.Provider+":"+c.Model, c.HeadroomPercent
 			}
 		}
@@ -643,6 +509,21 @@ func routingSummary(items []model.Capability, breakers []map[string]any, eng ...
 		}
 	}
 	return summary
+}
+
+func addRoutingEvidence(out response, evidence store.RoutingEvidence) {
+	out["reason_code"] = evidence.ReasonCode
+	if evidence.RoutingProfile != "" {
+		out["routing_profile"] = evidence.RoutingProfile
+	}
+	out["routing_profile_source"] = evidence.RoutingProfileSource
+	if evidence.FirstDecision != nil {
+		out["first_decision"] = evidence.FirstDecision
+	}
+	out["execution_attempts"] = evidence.ExecutionAttempts
+	if evidence.ExecutionAttemptsTruncated {
+		out["execution_attempts_truncated"] = true
+	}
 }
 
 func status(j model.Job) response {
@@ -690,6 +571,15 @@ func add[I any](s *mcp.Server, e *orchestration.Engine, name, description string
 		out["schema_version"] = 1
 		summary := "Ahenk " + name
 		if st, ok := out["status"].(string); ok {
+			if _, job := out["job_id"]; job {
+				switch st {
+				case model.Created, model.Queued, model.Running, model.Verifying, model.RetryWait, model.Cancelling, model.Paused, model.Interrupted,
+					model.Completed, model.Failed, model.Cancelled, model.TimedOut, model.Blocked, model.NotRun:
+				default:
+					st = "UNKNOWN"
+					out["status"] = st
+				}
+			}
 			summary += " " + st
 		}
 		if warnings, ok := out["capacity_warnings"].([]model.CapacityWarning); ok {
@@ -746,7 +636,13 @@ func delegateDualFormSchema(wire map[string]any) {
 }
 
 func schemaWire[T any]() map[string]any {
-	schema, err := jsonschema.For[T](nil)
+	var profiles []any
+	for _, profile := range model.RoutingProfiles() {
+		profiles = append(profiles, string(profile))
+	}
+	schema, err := jsonschema.For[T](&jsonschema.ForOptions{TypeSchemas: map[reflect.Type]*jsonschema.Schema{
+		reflect.TypeFor[model.RoutingProfile](): {Type: "string", Enum: profiles},
+	}})
 	if err != nil {
 		panic(err)
 	}

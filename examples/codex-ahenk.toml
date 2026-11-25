@@ -1,0 +1,3 @@
+[mcp_servers.ahenk]
+command = "/absolute/path/to/ahenk-mcp/bin/ahenk"
+args = ["serve", "--stdio", "--config", "/absolute/path/to/ahenk.json"]

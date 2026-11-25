@@ -7,6 +7,7 @@ import (
 	json "encoding/json/v2"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/faoztas/ahenk-mcp/internal/model"
 )
@@ -96,6 +97,68 @@ func reviewCheckStatus(source model.Job) string {
 		return model.Failed
 	}
 	return model.NotRun
+}
+
+// Recheck private acceptance under the scheduler lock. Artifact bytes can
+// change between resolving the review handoff and completing its batch.
+func (e *Engine) privateBatchReviewsBound(parent model.Job) bool {
+	policy := e.cfg.Repositories[parent.RepoID].PrivateSource
+	approved := make(map[string]bool)
+	for _, id := range parent.Children {
+		reviewer := e.jobs[id]
+		if reviewer.Task.ExecutionProfile != "review" {
+			continue
+		}
+		if !parent.Distinct || !e.repoAllowed(parent) || !policy.Active(time.Now()) || !policy.WriterIsolationVerified || !policy.AllowWrite {
+			return false
+		}
+		sourceID := e.boundPrivateReviewSource(reviewer, policy)
+		if sourceID == "" {
+			return false
+		}
+		approved[sourceID] = true
+	}
+	return !slices.ContainsFunc(parent.Children, func(id string) bool {
+		return e.jobs[id].Task.Mode == "patch" && !approved[id]
+	})
+}
+
+func (e *Engine) boundPrivateReviewSource(reviewer model.Job, policy *model.PrivateSourcePolicy) string {
+	if reviewer.Result == nil || reviewer.Result.Review == nil || len(reviewer.Attempts) == 0 {
+		return ""
+	}
+	attempt := reviewer.Attempts[len(reviewer.Attempts)-1]
+	if attempt.FinishedAt == nil || attempt.Code != "" || attempt.Provider == "" || e.distinctTaken(reviewer, attempt.Provider) {
+		return ""
+	}
+	handoffs, err := e.resolveHandoffs(reviewer)
+	if err != nil || len(handoffs) != 1 || handoffs[0].Review == nil ||
+		model.Digest(attempt.Handoffs) != model.Digest(handoffManifests(handoffs)) {
+		return ""
+	}
+	manifest := handoffs[0].Manifest
+	review := reviewer.Result.Review
+	if review.Verdict != "APPROVED" || review.ArtifactSHA256 != manifest.SHA256 || review.SourceJobID != manifest.SourceJobID ||
+		review.SourceAttempt != manifest.SourceAttempt || review.CheckStatus != "PASSED" || handoffs[0].Review.CheckStatus != "PASSED" {
+		return ""
+	}
+	writer := e.jobs[manifest.SourceJobID]
+	if e.privateWriter == nil || !slices.Contains(writer.Result.Verification, "SYNTHETIC_PRIVATE_WRITE") || strings.TrimSpace(writer.Attempts[len(writer.Attempts)-1].Provider) == "" ||
+		!slices.Contains(writer.Result.Verification, "SOURCE_SCOPE_AND_INDEX_UNCHANGED") {
+		return ""
+	}
+	for _, criterion := range writer.Task.Acceptance {
+		if criterion.CheckID == "" {
+			continue
+		}
+		name := policy.GoChecks[criterion.CheckID]
+		if name == "" || !slices.ContainsFunc(writer.Result.Checks, func(check model.CheckEvidence) bool {
+			return check.ID == criterion.CheckID && check.Test == name && check.Status == "PASSED" && check.ExitStatus == 0
+		}) {
+			return ""
+		}
+	}
+	return writer.ID
 }
 
 // A malformed review can be retried once. The original producer and its

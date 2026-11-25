@@ -192,7 +192,7 @@ func (o openCodeRuntime) runNativeSession(ctx context.Context, models []openCode
 	path := "/api/session/" + session.ID
 	defer func() {
 		if result != nil {
-			o.stopNative(path, session.ID)
+			o.stopNative(path, session.ID, "")
 		}
 	}()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -291,14 +291,19 @@ func (o openCodeRuntime) nativePermissions(ctx context.Context, path, sessionID 
 	return result.Data, nil
 }
 
-func (o openCodeRuntime) stopNative(path, sessionID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	pending, err := o.nativePermissions(ctx, path, sessionID)
-	cancel()
-	if err == nil && len(pending) != 0 {
-		o.rejectNativePermission(path, pending[0].ID)
+func (o openCodeRuntime) stopNative(path, sessionID, permission string) {
+	if permission == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		pending, err := o.nativePermissions(ctx, path, sessionID)
+		cancel()
+		if err == nil && len(pending) != 0 {
+			permission = pending[0].ID
+		}
 	}
-	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	if permission != "" {
+		o.rejectNativePermission(path, permission)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = o.request(ctx, http.MethodPost, path+"/interrupt?resume=false", nil, nil)
 }
@@ -376,18 +381,21 @@ func (f openCodeNativeFault) error() error {
 }
 
 type openCodeNativeMessage struct {
-	Metadata json.RawMessage      `json:"metadata"`
-	ID       string               `json:"id"`
-	Type     string               `json:"type"`
-	Agent    string               `json:"agent"`
-	Model    openCodeNativeRef    `json:"model"`
-	Text     string               `json:"text"`
-	Content  []openCodeNativePart `json:"content"`
-	Finish   string               `json:"finish"`
-	Outcome  string               `json:"outcome"`
-	Cost     *float64             `json:"cost"`
-	Error    *openCodeNativeFault `json:"error"`
-	Retry    *struct {
+	ParentID  string               `json:"parentID"`
+	MessageID string               `json:"messageID"`
+	SessionID string               `json:"sessionID"`
+	Metadata  json.RawMessage      `json:"metadata"`
+	ID        string               `json:"id"`
+	Type      string               `json:"type"`
+	Agent     string               `json:"agent"`
+	Model     openCodeNativeRef    `json:"model"`
+	Text      string               `json:"text"`
+	Content   []openCodeNativePart `json:"content"`
+	Finish    string               `json:"finish"`
+	Outcome   string               `json:"outcome"`
+	Cost      *float64             `json:"cost"`
+	Error     *openCodeNativeFault `json:"error"`
+	Retry     *struct {
 		Error openCodeNativeFault `json:"error"`
 	} `json:"retry"`
 	Time struct {
@@ -503,6 +511,17 @@ func nativeCompletion(messages []openCodeNativeMessage, messageID, id, prompt st
 	return nativeTextCompletion(messages, messageID, id, prompt, openCodeNativeAgent, evidence)
 }
 
+// A retry may arrive before the assistant has a completion time or an idle.
+func nativeTurnTimesMatch(input, answer, idle *openCodeNativeMessage) bool {
+	if input == nil || input.Time.Created <= 0 || answer.Time.Created < input.Time.Created {
+		return false
+	}
+	if answer.Time.Completed != 0 && answer.Time.Completed < answer.Time.Created {
+		return false
+	}
+	return idle == nil || idle.Time.Created >= max(answer.Time.Created, answer.Time.Completed)
+}
+
 func nativeTextCompletion(messages []openCodeNativeMessage, messageID, id, prompt, agent string, evidence *model.OpenCodeRunEvidence) (string, error) {
 	var input, answer, idle *openCodeNativeMessage
 	for i := range messages {
@@ -525,9 +544,13 @@ func nativeTextCompletion(messages []openCodeNativeMessage, messageID, id, promp
 			return "", model.Error("POLICY_DENIED", "OpenCode native returned unexpected session activity")
 		}
 	}
+	if answer != nil && answer.ParentID != "" && answer.ParentID != messageID ||
+		idle != nil && answer != nil && !idleReferences(idle, answer) {
+		return "", model.Error("INVALID_OUTPUT", "OpenCode native event refers to a different turn")
+	}
 	if answer == nil {
 		if idle != nil {
-			if idle.Error != nil {
+			if idle.Error != nil && agent != openCodeChildAgent && idle.MessageID == "" && idle.ParentID == "" {
 				return "", idle.Error.error()
 			}
 			return "", model.Error("INVALID_OUTPUT", "OpenCode native became idle without an assistant message")
@@ -544,22 +567,25 @@ func nativeTextCompletion(messages []openCodeNativeMessage, messageID, id, promp
 			return "", model.Error("PERMISSION_DENIED", "OpenCode native returned an unexpected tool or content event")
 		}
 	}
-	if answer.Retry != nil {
-		return "", answer.Retry.Error.error()
-	}
-	if answer.Error != nil {
-		return "", answer.Error.error()
-	}
-	if idle != nil && idle.Error != nil {
-		return "", idle.Error.error()
-	}
-	if answer.Time.Completed == 0 || idle == nil {
+	var fault *openCodeNativeFault
+	switch {
+	case answer.Retry != nil:
+		fault = &answer.Retry.Error
+	case answer.Error != nil:
+		fault = answer.Error
+	case idle != nil && idle.Error != nil:
+		fault = idle.Error
+	case answer.Time.Completed == 0 || idle == nil:
 		return "", nil
 	}
+	if !nativeTurnTimesMatch(input, answer, idle) {
+		return "", model.Error("INVALID_OUTPUT", "OpenCode native event timing does not match the prompt")
+	}
+	if fault != nil {
+		return "", fault.error()
+	}
 	summary := strings.TrimSpace(text.String())
-	if input == nil || input.Time.Created == 0 || answer.Time.Created < input.Time.Created ||
-		answer.Time.Completed < answer.Time.Created || idle.Time.Created < answer.Time.Completed ||
-		answer.Finish != "stop" || idle.Outcome != "succeeded" || summary == "" ||
+	if answer.Finish != "stop" || idle.Outcome != "succeeded" || summary == "" ||
 		answer.Tokens.Input <= 0 || answer.Tokens.Output <= 0 || answer.Tokens.Reasoning < 0 {
 		return "", model.Error("INVALID_OUTPUT", "OpenCode native terminal text and usage could not be verified")
 	}

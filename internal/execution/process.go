@@ -22,7 +22,13 @@ import (
 	"github.com/faoztas/ahenk-mcp/internal/model"
 )
 
+type FixtureHarness struct {
+	SocketPath string `json:"socket_path"`
+	AttemptID  string `json:"attempt_id"`
+}
+
 type FixtureInput struct {
+	Harness     *FixtureHarness            `json:"harness,omitempty"`
 	AGY         *model.AGYRunEvidence      `json:"agy,omitempty"`
 	OpenCode    *model.OpenCodeRunEvidence `json:"opencode,omitempty"`
 	Codex       *model.CLIRunEvidence      `json:"codex,omitempty"`
@@ -331,6 +337,12 @@ func FixtureWorker() error {
 		return errors.New("invalid fixture delay")
 	}
 	time.Sleep(time.Duration(in.DelayMillis) * time.Millisecond)
+	if in.Harness != nil {
+		if err := runFixtureHarness(in.Harness); err != nil {
+			return err
+		}
+		in.Harness = nil
+	}
 	return json.NewEncoder(os.Stdout).Encode(in)
 }
 

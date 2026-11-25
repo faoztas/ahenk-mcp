@@ -39,6 +39,8 @@ func run(args []string) error {
 		return errors.New(`usage:
   ahenk serve --stdio --config FILE
   ahenk readiness --config FILE
+  ahenk routing {get,set,reset} --config FILE --repo ID [PROFILE]
+  ahenk routing web --config FILE --repo ID
   ahenk m1-request --config FILE --repo ID
   ahenk verify-m1 --config FILE --request FILE --job ID
   ahenk local-test --config FILE
@@ -68,6 +70,8 @@ func run(args []string) error {
 		return importOpenCodeCooldown(args[1:])
 	case "m1-request", "verify-m1":
 		return runM1(args[0], args[1:])
+	case "routing":
+		return runRouting(args[1:])
 	case "readiness":
 		flags := flag.NewFlagSet("readiness", flag.ContinueOnError)
 		path := flags.String("config", "", "path to Ahenk configuration")

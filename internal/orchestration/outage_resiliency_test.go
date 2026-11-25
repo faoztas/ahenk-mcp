@@ -47,7 +47,8 @@ func TestOpenCodeRateLimitUpdatesCircuitState(t *testing.T) {
 		cb := NewCircuitBreaker()
 		cb.Trip("opencode", 10*time.Millisecond)
 		time.Sleep(15 * time.Millisecond)
-		if !cb.Allow("opencode") {
+		probeID, allowed := cb.Acquire("opencode")
+		if !allowed {
 			t.Fatalf("expected HALF_OPEN probe to be admitted")
 		}
 		if !cb.IsProbing("opencode") {
@@ -60,6 +61,7 @@ func TestOpenCodeRateLimitUpdatesCircuitState(t *testing.T) {
 			jobs:     map[string]model.Job{},
 		}
 		attempt := model.Attempt{
+			ProbeID:                probeID,
 			Number:                 1,
 			Provider:               "opencode",
 			Model:                  "opencode/free-a",
@@ -68,8 +70,7 @@ func TestOpenCodeRateLimitUpdatesCircuitState(t *testing.T) {
 			FinishedAt:             &now,
 			RetryAfterMS:           60_000,
 		}
-		e.openCodeHistory.Apply(&attempt)
-		e.recordOpenCodeObservation(&attempt)
+		e.rememberOpenCodeHealth(&attempt)
 
 		if cb.IsProbing("opencode") {
 			t.Fatalf("per-model 429 left a dangling probe lock on opencode")
@@ -87,7 +88,8 @@ func TestOpenCodeRateLimitUpdatesCircuitState(t *testing.T) {
 			cb := NewCircuitBreaker()
 			cb.Trip("opencode", 10*time.Millisecond)
 			time.Sleep(15 * time.Millisecond)
-			if !cb.Allow("opencode") {
+			probeID, allowed := cb.Acquire("opencode")
+			if !allowed {
 				t.Fatalf("expected HALF_OPEN probe to be admitted")
 			}
 
@@ -97,6 +99,7 @@ func TestOpenCodeRateLimitUpdatesCircuitState(t *testing.T) {
 				jobs:     map[string]model.Job{},
 			}
 			attempt := model.Attempt{
+				ProbeID:                probeID,
 				Number:                 1,
 				Provider:               "opencode",
 				Model:                  "opencode/free-a",
@@ -105,8 +108,7 @@ func TestOpenCodeRateLimitUpdatesCircuitState(t *testing.T) {
 				FinishedAt:             &finishedAt,
 				RetryAfterMS:           120_000,
 			}
-			e.openCodeHistory.Apply(&attempt)
-			e.recordOpenCodeObservation(&attempt)
+			e.rememberOpenCodeHealth(&attempt)
 
 			if cb.IsProbing("opencode") {
 				t.Fatalf("shared %s 429 left a dangling probe lock", scope)

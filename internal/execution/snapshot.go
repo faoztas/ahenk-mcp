@@ -91,7 +91,8 @@ func git(ctx context.Context, dir string, stdin []byte, args ...string) ([]byte,
 	out := Limited{Limit: maxSnapshot}
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		return nil, err
+		// CommandContext can report a killed process when its deadline interrupts Git.
+		return nil, errors.Join(err, ctx.Err())
 	}
 	return out.Bytes(), nil
 }
@@ -273,7 +274,7 @@ func capture(ctx context.Context, repo model.Repo, t model.Task) (Snapshot, erro
 	s.BaseSHA = strings.TrimSpace(string(head))
 	s.Root = real
 	s.Mode = t.WorkspaceMode
-	s.PolicyDigest = model.Digest(repo)
+	s.PolicyDigest = repo.PolicyDigest()
 	s.ScopeDigest = model.Digest(t.AllowedPaths)
 	tree, err := git(ctx, real, nil, append([]string{"ls-tree", "-r", "-z", s.BaseSHA, "--"}, t.AllowedPaths...)...)
 	if err != nil {

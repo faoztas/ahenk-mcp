@@ -219,11 +219,6 @@ func isOpenCodeSharedCircuitScope(a model.Attempt) bool {
 		a.RetryAfterMS >= 59_760_000
 }
 
-func (e *Engine) rememberOpenCodeHealth(a *model.Attempt) {
-	e.openCodeHistory.Apply(a)
-	e.recordOpenCodeObservation(a)
-}
-
 // OpenCodeVerifiedSuccess is shared by dispatch and read-only diagnostics.
 func OpenCodeVerifiedSuccess(a model.Attempt) bool {
 	return a.Provider == "opencode" && a.FinishedAt != nil && a.Code == "" && a.OpenCode != nil && a.OpenCode.GuardVerified && a.OpenCode.TerminalVerified &&
@@ -244,9 +239,6 @@ func (e *Engine) recordOpenCodeObservation(a *model.Attempt) {
 	}
 	id := openCodeRoute(a.Model, a.OpenCodeAccount, a.OpenCodeTransport, a.OpenCodeEndpoint)
 	if OpenCodeVerifiedSuccess(*a) {
-		if e.cb != nil {
-			e.cb.Success("opencode")
-		}
 		if e.openCodeSuccess == nil {
 			e.openCodeSuccess = make(map[openCodeIdentity]time.Time)
 		}
@@ -257,9 +249,6 @@ func (e *Engine) recordOpenCodeObservation(a *model.Attempt) {
 	}
 	scope := OpenCodeHealthScope(*a)
 	if scope == "" || scope == "session" || a.RetryAt == nil {
-		if e.cb != nil && a.Code != "" {
-			e.cb.Release(a.Provider)
-		}
 		return
 	}
 	var reset *time.Time
@@ -272,20 +261,57 @@ func (e *Engine) recordOpenCodeObservation(a *model.Attempt) {
 	key := openCodeObservedGateKey(scope, a.ProviderRateLimitScope, id)
 	e.rememberOpenCodeGate(key, openCodeHealth{resetAt: reset, origin: id, assertedScope: a.ProviderRateLimitScope, probe: a.OpenCodeRecheck,
 		suspect: openCodeSuspect(*a), until: *a.RetryAt, code: a.Code, observed: *a.FinishedAt, source: a.RetrySource})
-	if e.cb != nil {
-		if a.Code == "RATE_LIMIT" && isOpenCodeSharedCircuitScope(*a) {
+}
+
+// Serialize probe ownership with the durable write. A failed transaction
+// publishes neither a shared transition nor a scoped observation.
+func (e *Engine) commitOpenCodeCircuit(a *model.Attempt, save func() error) error {
+	cb := e.cb
+	if cb == nil {
+		return save()
+	}
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	const provider = "opencode"
+	owner := cb.probing[provider] == a.ProbeID
+	var decision *model.OpenCodeCircuitDecision
+	if owner && a.FinishedAt != nil {
+		switch {
+		case a.ProbeID != 0 && OpenCodeVerifiedSuccess(*a):
+			decision = &model.OpenCodeCircuitDecision{Sequence: e.openCodeSequence + 1}
+		case a.Code == "RATE_LIMIT" && a.HealthScope != "" && a.HealthScope != "session" && a.RetryAt != nil && isOpenCodeSharedCircuitScope(*a):
 			until := *a.RetryAt
 			if a.RetryAfterMS >= 59_760_000 {
-				candidateUntil := a.FinishedAt.Add(time.Duration(a.RetryAfterMS) * time.Millisecond)
-				if candidateUntil.After(until) {
-					until = candidateUntil
+				if raw := a.FinishedAt.Add(time.Duration(a.RetryAfterMS) * time.Millisecond); raw.After(until) {
+					until = raw
 				}
 			}
-			e.cb.TripUntil(a.Provider, until)
-		} else {
-			e.cb.Release(a.Provider)
+			if until.After(time.Now()) {
+				if existing := cb.cooldown[provider]; existing.After(until) {
+					until = existing
+				}
+				decision = &model.OpenCodeCircuitDecision{Sequence: e.openCodeSequence + 1, Until: &until}
+			}
 		}
 	}
+	a.OpenCodeCircuit = decision
+	if err := save(); err != nil {
+		a.OpenCodeCircuit = nil
+		return err
+	}
+	if decision != nil {
+		e.openCodeSequence = decision.Sequence
+		if decision.Until == nil {
+			delete(cb.cooldown, provider)
+		} else {
+			cb.cooldown[provider] = *decision.Until
+		}
+	}
+	if owner {
+		delete(cb.probing, provider)
+		delete(cb.probeExpiry, provider)
+	}
+	return nil
 }
 
 func openCodeSuspect(a model.Attempt) bool {

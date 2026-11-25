@@ -103,7 +103,8 @@ func TestEvaluateAutoRoute_UnifiedPolicyAndQuota(t *testing.T) {
 	defer db.Close()
 
 	cfg := model.Config{
-		StateDir: dbDir,
+		CodexBarAccountSHA256: map[string]string{"agy": model.Hash([]byte("fixture-account")), "codex": model.Hash([]byte("fixture-account"))},
+		StateDir:              dbDir,
 		Repositories: map[string]model.Repo{
 			"all-repo": {
 				Root:         repoDir,
@@ -119,10 +120,10 @@ func TestEvaluateAutoRoute_UnifiedPolicyAndQuota(t *testing.T) {
 	}
 	reg := providers.Registry{
 		Candidates: []model.Capability{
-			{Provider: "codex", Model: "gpt-6.1-sol", Status: "available", Mode: "cli", Speed: "fast"},
-			{Provider: "codex", Model: "gpt-6.1-terra", Status: "available", Mode: "cli", Speed: "slow"},
+			{AttestedAccount: "fixture-account", Provider: "codex", Model: "gpt-6.1-sol", Status: "available", Mode: "cli", Speed: "fast"},
+			{AttestedAccount: "fixture-account", Provider: "codex", Model: "gpt-6.1-terra", Status: "available", Mode: "cli", Speed: "slow"},
 			{
-				Provider: "agy", Model: "gemini-4-argon", Status: "available", Speed: "fast",
+				AttestedAccount: "fixture-account", Provider: "agy", Model: "gemini-4-argon", Status: "available", Speed: "fast",
 				Quality: []model.QualityEvidence{
 					{Role: "inference", Tier: 2, Source: "LIVE"},
 					{Role: "architecture", Tier: 2, Source: "LIVE"},
@@ -133,7 +134,7 @@ func TestEvaluateAutoRoute_UnifiedPolicyAndQuota(t *testing.T) {
 				},
 			},
 			{
-				Provider: "agy", Model: "gemini-3.8-flash", Status: "available", Speed: "fast",
+				AttestedAccount: "fixture-account", Provider: "agy", Model: "gemini-3.8-flash", Status: "available", Speed: "fast",
 				Quality: []model.QualityEvidence{
 					{Role: "inference", Tier: 1, Source: "LIVE"},
 				},
@@ -142,7 +143,7 @@ func TestEvaluateAutoRoute_UnifiedPolicyAndQuota(t *testing.T) {
 				},
 			},
 			{
-				Provider: "agy", Model: "claude-opus-5-5", Status: "available", Speed: "fast",
+				AttestedAccount: "fixture-account", Provider: "agy", Model: "claude-opus-5-5", Status: "available", Speed: "fast",
 				Quality: []model.QualityEvidence{
 					{Role: "inference", Tier: 2, Source: "LIVE"},
 					{Role: "architecture", Tier: 2, Source: "LIVE"},
@@ -165,12 +166,12 @@ func TestEvaluateAutoRoute_UnifiedPolicyAndQuota(t *testing.T) {
 	future := now.Add(2 * time.Hour)
 	h100, h80, h50, h15, h0 := 100.0, 80.0, 50.0, 15.0, 0.0
 	e.SetQuotaForTest("codex", []providers.Quota{
-		{Bucket: providers.BarCodexBurst, Remaining: &h100, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarCodexBurst, Remaining: &h100, State: "KNOWN", ObservedAt: now, ResetAt: &future},
 	})
 	e.SetQuotaForTest("agy", []providers.Quota{
-		{Bucket: providers.BarAgyGemini, Family: "gemini", Remaining: &h100, State: "KNOWN", ObservedAt: now, ResetAt: &future},
-		{Bucket: providers.BarAgyArgon, Family: "gemini_argon", Remaining: &h100, State: "KNOWN", ObservedAt: now, ResetAt: &future},
-		{Bucket: providers.BarAgyOpus, Family: "claude_gpt", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyGemini, Family: "gemini", Remaining: &h100, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyArgon, Family: "gemini_argon", Remaining: &h100, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyOpus, Family: "claude_gpt", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
 	})
 
 	// 1. Explicit complexity 0.0 must NOT be overwritten to 0.9 (must resolve to "low" effort).
@@ -200,12 +201,12 @@ func TestEvaluateAutoRoute_UnifiedPolicyAndQuota(t *testing.T) {
 
 	// 5. patch mode rejects opencode (read_only only) even when codex/agy are exhausted.
 	e.SetQuotaForTest("codex", []providers.Quota{
-		{Bucket: providers.BarCodexBurst, Remaining: &h0, State: "EXHAUSTED", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarCodexBurst, Remaining: &h0, State: "EXHAUSTED", ObservedAt: now, ResetAt: &future},
 	})
 	e.SetQuotaForTest("agy", []providers.Quota{
-		{Bucket: providers.BarAgyGemini, Family: "gemini", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
-		{Bucket: providers.BarAgyArgon, Family: "gemini_argon", Remaining: &h0, State: "EXHAUSTED", ObservedAt: now, ResetAt: &future},
-		{Bucket: providers.BarAgyOpus, Family: "claude_gpt", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyGemini, Family: "gemini", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyArgon, Family: "gemini_argon", Remaining: &h0, State: "EXHAUSTED", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyOpus, Family: "claude_gpt", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
 	})
 	d, capPatch := e.EvaluateAutoRoute("all-repo", "coding", nil, model.Task{Mode: "patch", DataClass: "synthetic"}, now)
 	if capPatch != nil && capPatch.Provider == "opencode" {
@@ -219,9 +220,9 @@ func TestEvaluateAutoRoute_UnifiedPolicyAndQuota(t *testing.T) {
 
 	// 6. Stage throttling: Codex exhausted (Stage3CodexExhausted) throttles Argon high -> medium effort.
 	e.SetQuotaForTest("agy", []providers.Quota{
-		{Bucket: providers.BarAgyGemini, Family: "gemini", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
-		{Bucket: providers.BarAgyArgon, Family: "gemini_argon", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
-		{Bucket: providers.BarAgyOpus, Family: "claude_gpt", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyGemini, Family: "gemini", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyArgon, Family: "gemini_argon", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyOpus, Family: "claude_gpt", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
 	})
 	d, _ = e.EvaluateAutoRoute("all-repo", "coding", nil, model.Task{Mode: "read_only", DataClass: "synthetic"}, now)
 	if d.SelectedModel != "antigravity/gemini-4-argon" || d.Stage != orchestration.Stage3CodexExhausted || d.ResolvedEffort != "medium" {
@@ -236,9 +237,9 @@ func TestEvaluateAutoRoute_UnifiedPolicyAndQuota(t *testing.T) {
 
 	// 8. Opus scarcity gate: when BarAgyOpus <= 0.20, architecture skips Opus and picks Argon.
 	e.SetQuotaForTest("agy", []providers.Quota{
-		{Bucket: providers.BarAgyGemini, Family: "gemini", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
-		{Bucket: providers.BarAgyArgon, Family: "gemini_argon", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
-		{Bucket: providers.BarAgyOpus, Family: "claude_gpt", Remaining: &h15, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyGemini, Family: "gemini", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyArgon, Family: "gemini_argon", Remaining: &h80, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarAgyOpus, Family: "claude_gpt", Remaining: &h15, State: "KNOWN", ObservedAt: now, ResetAt: &future},
 	})
 	d, _ = e.EvaluateAutoRoute("agy-only", "architecture", nil, model.Task{Mode: "read_only", DataClass: "synthetic"}, now)
 	if d.SelectedModel != "antigravity/gemini-4-argon" {
@@ -247,7 +248,7 @@ func TestEvaluateAutoRoute_UnifiedPolicyAndQuota(t *testing.T) {
 
 	// 9. DEADLINE_BUDGET: 120s deadline with slow candidate (240s) is rejected while fast candidate (60s) fits.
 	e.SetQuotaForTest("codex", []providers.Quota{
-		{Bucket: providers.BarCodexBurst, Remaining: &h50, State: "KNOWN", ObservedAt: now, ResetAt: &future},
+		{AccountMatch: "MATCHED", Unit: "percent", Bucket: providers.BarCodexBurst, Remaining: &h50, State: "KNOWN", ObservedAt: now, ResetAt: &future},
 	})
 	d, capBudget := e.EvaluateAutoRoute("all-repo", "debugging", nil, model.Task{Mode: "read_only", DataClass: "synthetic", DeadlineSeconds: 120}, now)
 	// debugging matrix[0] is codex/gpt-6.1-terra (slow=240s > 100s budget), matrix[1] is agy/gemini-4-argon (fast=60s <= 100s budget).

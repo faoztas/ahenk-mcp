@@ -135,12 +135,13 @@ func (o openCodeRuntime) runChild(ctx context.Context, id, objective string, rul
 	}
 	evidence.GuardVerified = true
 	path := "/api/session/" + session.ID
-	var childID string
+	var ownedChild string
+	var parentPermission, childPermission string
 	defer func() {
 		if result != nil {
-			o.stopNative(path, session.ID)
-			if childID != "" {
-				o.stopNative("/api/session/"+childID, childID)
+			o.stopNative(path, session.ID, parentPermission)
+			if ownedChild != "" {
+				o.stopNative("/api/session/"+ownedChild, ownedChild, childPermission)
 			}
 		}
 	}()
@@ -159,30 +160,56 @@ func (o openCodeRuntime) runChild(ctx context.Context, id, objective string, rul
 	tick := time.NewTicker(200 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		messages, err := o.childMessages(ctx, path, session.ID)
+		messages, err := o.childMessages(ctx, path, session.ID, &parentPermission)
 		if err != nil {
 			return out, err
 		}
-		child, done, err := openCodeChildInvocation(messages, id, objective, messageID, prompt, background)
-		if err != nil {
-			return out, err
+		child, done, parentErr := openCodeChildInvocation(messages, id, objective, messageID, prompt, background)
+		if child == "" && parentErr != nil {
+			return out, parentErr
 		}
 		if child != "" {
-			if child == session.ID || childID != "" && child != childID {
+			if child == session.ID || ownedChild != "" && child != ownedChild {
 				return out, model.Error("POLICY_DENIED", "OpenCode child identity changed")
 			}
-			childID = child
-		}
-		if done {
-			out.Summary, err = o.verifyChildResult(ctx, session, childID, id, objective, evidence)
-			if err == nil && background {
-				notice, _ := openCodeBackgroundNotice(messages, childID)
-				if notice != out.Summary {
-					return out, model.Error("INVALID_OUTPUT", "OpenCode background notification and child result differed")
-				}
-				evidence.NativeChild.BackgroundCompleted = true
+			owned, err := o.verifyChildOwnership(ctx, session, child, id)
+			if err != nil {
+				return out, err
 			}
-			return out, err
+			if !owned {
+				ownedChild = ""
+				return out, model.Error("POLICY_DENIED", "OpenCode child session ownership or permissions did not match")
+			}
+			ownedChild = child
+			// Poll owned child history even while waiting for a background
+			// notification or after a generic failure notification, so
+			// the child's typed upstream fault takes precedence.
+			verified := *evidence
+			summary, err := o.verifyChildResult(ctx, session, child, id, objective, &verified, &childPermission)
+			if err != nil {
+				return out, err
+			}
+			if parentErr != nil {
+				return out, parentErr
+			}
+			if done {
+				if summary == "" {
+					return out, model.Error("INVALID_OUTPUT", "OpenCode child did not reach an independent terminal result")
+				}
+				if background {
+					notice, err := openCodeBackgroundNotice(messages, child)
+					if err != nil {
+						return out, err
+					}
+					if notice != summary {
+						return out, model.Error("INVALID_OUTPUT", "OpenCode background notification and child result differed")
+					}
+					verified.NativeChild.BackgroundCompleted = true
+				}
+				*evidence = verified
+				out.Summary = summary
+				return out, nil
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -192,13 +219,14 @@ func (o openCodeRuntime) runChild(ctx context.Context, id, objective string, rul
 	}
 }
 
-func (o openCodeRuntime) childMessages(ctx context.Context, path, session string) ([]openCodeNativeMessage, error) {
+func (o openCodeRuntime) childMessages(ctx context.Context, path, session string, permission *string) ([]openCodeNativeMessage, error) {
 	pending, err := o.nativePermissions(ctx, path, session)
 	if err != nil {
 		return nil, err
 	}
 	if len(pending) != 0 {
-		o.rejectNativePermission(path, pending[0].ID)
+		// Retain the checked ID so shutdown can reject it without another read.
+		*permission = pending[0].ID
 		return nil, model.Error("PERMISSION_DENIED", "OpenCode subagent requested an unauthorized permission")
 	}
 	var history struct {
@@ -210,30 +238,52 @@ func (o openCodeRuntime) childMessages(ctx context.Context, path, session string
 	if history.Data == nil || len(history.Data) >= 10 {
 		return nil, model.Error("INVALID_OUTPUT", "OpenCode subagent history is incomplete")
 	}
+	for _, m := range history.Data {
+		if m.SessionID != "" && m.SessionID != session {
+			return nil, model.Error("INVALID_OUTPUT", "OpenCode event belongs to another session")
+		}
+	}
 	return history.Data, nil
 }
 
 func openCodeChildInvocation(messages []openCodeNativeMessage, modelID, objective, messageID, prompt string, backgroundMode ...bool) (string, bool, error) {
 	var child string
 	background := len(backgroundMode) == 1 && backgroundMode[0]
-	var invoked, completed, user, idle bool
-	for _, m := range messages {
+	var invoked, completed, idle bool
+	var user, launch, foregroundIdle *openCodeNativeMessage
+	var toolErr error
+	for i := range messages {
+		m := &messages[i]
 		switch m.Type {
 		case "user":
-			if user || m.ID != messageID || m.Text != prompt {
+			if user != nil || m.ID != messageID || m.Text != prompt {
 				return "", false, model.Error("INVALID_OUTPUT", "OpenCode parent prompt did not match")
 			}
-			user = true
+			user = m
 		case "idle":
-			if m.Error != nil {
+			if !background {
+				if foregroundIdle != nil {
+					toolErr = model.Error("INVALID_OUTPUT", "OpenCode parent has multiple terminal events")
+				}
+				foregroundIdle = m
+			} else if m.Error != nil {
 				return "", false, m.Error.error()
 			}
-			idle = m.Outcome == "succeeded"
+			idle = true
+			if m.Outcome != "succeeded" {
+				toolErr = model.Error("INVALID_OUTPUT", "OpenCode parent did not finish successfully")
+			}
 		case "synthetic":
 			if !background {
 				return "", false, model.Error("POLICY_DENIED", "unexpected OpenCode background notification")
 			}
 		case "assistant":
+			if !background {
+				if launch != nil || m.ParentID != "" && m.ParentID != messageID {
+					return "", false, model.Error("INVALID_OUTPUT", "OpenCode foreground assistant does not identify a unique launch turn")
+				}
+				launch = m
+			}
 			if m.Error != nil {
 				return "", false, m.Error.error()
 			}
@@ -268,36 +318,131 @@ func openCodeChildInvocation(messages []openCodeNativeMessage, modelID, objectiv
 					input.Background != background || input.Model != "" && input.Model != "opencode/"+modelID {
 					return "", false, model.Error("POLICY_DENIED", "OpenCode child invocation exceeded its scope")
 				}
-				if part.State.Status == "error" {
-					return "", false, model.Error("INVALID_OUTPUT", "OpenCode native subagent tool reported failure")
-				}
 				var metadata struct {
 					SessionID string
 					Status    string
 				}
-				_ = json.Unmarshal(part.State.Metadata, &metadata)
+				if len(part.State.Metadata) != 0 && json.Unmarshal(part.State.Metadata, &metadata) != nil {
+					return "", false, model.Error("INVALID_OUTPUT", "OpenCode child invocation metadata is malformed")
+				}
 				if metadata.SessionID != "" && !openCodeSessionID.MatchString(metadata.SessionID) {
 					return "", false, model.Error("INVALID_OUTPUT", "OpenCode child session identity is malformed")
 				}
 				child = metadata.SessionID
+				if part.State.Status == "error" {
+					toolErr = model.Error("INVALID_OUTPUT", "OpenCode native subagent tool reported failure")
+				}
 				wantStatus := "completed"
 				if background {
 					wantStatus = "running"
 				}
-				completed = part.State.Status == "completed" && metadata.Status == wantStatus && child != ""
+				completed = part.State.Status == "completed" && metadata.Status == wantStatus && child != "" && m.Time.Completed > 0
 			}
 		default:
 			return "", false, model.Error("POLICY_DENIED", "OpenCode parent returned unexpected session activity")
 		}
 	}
-	if idle && (!user || !completed) {
+	if user == nil {
+		if idle {
+			return "", false, model.Error("INVALID_OUTPUT", "OpenCode parent stopped without the owned prompt")
+		}
+		return "", false, nil
+	}
+	if foregroundIdle != nil {
+		if launch == nil || !idleReferences(foregroundIdle, launch) || !nativeTurnTimesMatch(user, launch, foregroundIdle) {
+			return child, false, model.Error("INVALID_OUTPUT", "OpenCode parent idle does not match its launch turn")
+		}
+		if foregroundIdle.Error != nil {
+			return child, false, foregroundIdle.Error.error()
+		}
+	}
+	if toolErr != nil {
+		return child, false, toolErr
+	}
+	if idle && !completed {
 		return child, false, model.Error("INVALID_OUTPUT", "OpenCode parent stopped without a verified native child")
 	}
 	if background && completed {
 		notice, err := openCodeBackgroundNotice(messages, child)
-		return child, user && idle && notice != "", err
+		if err != nil || notice == "" {
+			return child, false, err
+		}
+		done, err := backgroundAcknowledged(messages)
+		return child, done, err
 	}
-	return child, user && idle && completed, nil
+	return child, idle && completed, nil
+}
+
+// The API can return history newest first. Correlate turns by their times
+// within the owned parent history, rejecting ambiguous or foreign activity.
+func backgroundAcknowledged(messages []openCodeNativeMessage) (bool, error) {
+	var user, launch, notice, ack *openCodeNativeMessage
+	var idles []*openCodeNativeMessage
+	seen := map[string]bool{}
+	invalid := model.Error("INVALID_OUTPUT", "OpenCode background acknowledgement is ambiguous")
+	for i := range messages {
+		m := &messages[i]
+		if m.ID != "" {
+			if seen[m.ID] {
+				return false, invalid
+			}
+			seen[m.ID] = true
+		}
+		switch m.Type {
+		case "user":
+			user = m
+		case "synthetic":
+			notice = m
+		case "idle":
+			idles = append(idles, m)
+		case "assistant":
+			if slices.ContainsFunc(m.Content, func(p openCodeNativePart) bool { return p.Type == "tool" }) {
+				launch = m
+				continue
+			}
+			if ack != nil {
+				return false, invalid
+			}
+			ack = m
+		}
+	}
+	if user == nil || launch == nil || notice == nil || launch.ParentID != "" && launch.ParentID != user.ID ||
+		user.Time.Created <= 0 || launch.Time.Created < user.Time.Created || launch.Time.Completed < launch.Time.Created ||
+		notice.Time.Created <= launch.Time.Completed {
+		return false, invalid
+	}
+	if ack == nil || ack.Time.Completed == 0 {
+		return false, nil
+	}
+	if ack.ParentID != "" && ack.ParentID != notice.ID || ack.Time.Created <= notice.Time.Created || ack.Time.Completed < ack.Time.Created || ack.Finish != "stop" ||
+		!slices.ContainsFunc(ack.Content, func(p openCodeNativePart) bool { return p.Type == "text" && strings.TrimSpace(p.Text) != "" }) {
+		return false, invalid
+	}
+	var launchIdle, ackIdle bool
+	for _, idle := range idles {
+		switch {
+		case idle.Time.Created >= launch.Time.Completed && idle.Time.Created < notice.Time.Created && !launchIdle:
+			if !idleReferences(idle, launch) {
+				return false, invalid
+			}
+			launchIdle = true
+		case idle.Time.Created >= ack.Time.Completed && !ackIdle:
+			if !idleReferences(idle, ack) {
+				return false, invalid
+			}
+			ackIdle = true
+		default:
+			return false, invalid
+		}
+		if idle.Outcome != "succeeded" {
+			return false, invalid
+		}
+	}
+	return ackIdle, nil
+}
+
+func idleReferences(idle, assistant *openCodeNativeMessage) bool {
+	return (idle.MessageID == "" || idle.MessageID == assistant.ID) && (idle.ParentID == "" || idle.ParentID == assistant.ID)
 }
 
 func openCodeBackgroundNotice(messages []openCodeNativeMessage, child string) (string, error) {
@@ -333,31 +478,35 @@ func openCodeBackgroundNotice(messages []openCodeNativeMessage, child string) (s
 	return result, nil
 }
 
-func (o openCodeRuntime) verifyChildResult(ctx context.Context, parent openCodeNativeSession, child, id, objective string, evidence *model.OpenCodeRunEvidence) (string, error) {
-	path := "/api/session/" + child
+func (o openCodeRuntime) verifyChildOwnership(ctx context.Context, parent openCodeNativeSession, child, id string) (bool, error) {
 	var row struct{ Data openCodeNativeSession }
-	if err := o.request(ctx, http.MethodGet, path, nil, &row); err != nil {
-		return "", err
+	if err := o.request(ctx, http.MethodGet, "/api/session/"+child, nil, &row); err != nil {
+		return false, err
 	}
 	s := row.Data
-	if s.ID != child || s.Parent != parent.ID || s.Location != parent.Location || !slices.Equal(s.Permissions, parent.Permissions) ||
-		s.Agent != openCodeChildAgent || s.Title != openCodeChildTitle || !s.Model.matches(id, "") {
-		return "", model.Error("POLICY_DENIED", "OpenCode child session ownership or permissions did not match")
-	}
-	messages, err := o.childMessages(ctx, path, child)
+	return s.ID == child && s.Parent == parent.ID && s.Location == parent.Location && slices.Equal(s.Permissions, parent.Permissions) &&
+		s.Agent == openCodeChildAgent && s.Title == openCodeChildTitle && s.Model.matches(id, ""), nil
+}
+
+func (o openCodeRuntime) verifyChildResult(ctx context.Context, parent openCodeNativeSession, child, id, objective string, evidence *model.OpenCodeRunEvidence, permission *string) (string, error) {
+	messages, err := o.childMessages(ctx, "/api/session/"+child, child, permission)
 	if err != nil {
 		return "", err
 	}
 	user := slices.IndexFunc(messages, func(m openCodeNativeMessage) bool { return m.Type == "user" })
-	if user < 0 || messages[user].ID == "" {
-		return "", model.Error("INVALID_OUTPUT", "OpenCode child prompt is missing")
+	var messageID string
+	if user >= 0 {
+		messageID = messages[user].ID
+		if messageID == "" {
+			return "", model.Error("INVALID_OUTPUT", "OpenCode child prompt identity is missing")
+		}
 	}
-	summary, err := nativeTextCompletion(messages, messages[user].ID, id, openCodeChildPrefix+objective, openCodeChildAgent, evidence)
-	if err != nil {
+	summary, err := nativeTextCompletion(messages, messageID, id, openCodeChildPrefix+objective, openCodeChildAgent, evidence)
+	if err != nil || summary == "" {
 		return "", err
 	}
-	if summary == "" || model.ContainsSecret([]byte(summary)) {
-		return "", model.Error("INVALID_OUTPUT", "OpenCode child result was missing or invalid")
+	if model.ContainsSecret([]byte(summary)) {
+		return "", model.Error("INVALID_OUTPUT", "OpenCode child result was invalid")
 	}
 	evidence.NativeChild = &model.NativeChildEvidence{
 		ParentSHA256: model.Hash([]byte(parent.ID)), ChildSHA256: model.Hash([]byte(child)), ChildFinished: true,

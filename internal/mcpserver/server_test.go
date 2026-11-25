@@ -475,15 +475,15 @@ func TestDiagnosticTools_QuotasBreakersAuditWaitJobs(t *testing.T) {
 	session, e, _, _ := setupTestServer(t)
 	// routingSummary with no breakers returns [] (not nil) and skips 0% health codex/claude.
 	zero := 0.0
-	e.SetQuotaForTest("codex", []providers.Quota{{Bucket: providers.BarCodexBurst, Remaining: &zero}})
-	e.SetQuotaForTest("claude", []providers.Quota{{Bucket: "primary", Remaining: &zero, State: "EXHAUSTED"}})
+	e.SetQuotaForTest("codex", []providers.Quota{{AccountMatch: "MATCHED", Unit: "percent", State: "KNOWN", Bucket: providers.BarCodexBurst, Remaining: &zero}})
+	e.SetQuotaForTest("claude", []providers.Quota{{AccountMatch: "MATCHED", Unit: "percent", Bucket: "primary", Remaining: &zero, State: "EXHAUSTED"}})
 
 	items := []model.Capability{
 		{Provider: "codex", Model: "gpt-6.1-sol", Status: "available", FPTier: "hard"},
 		{Provider: "claude", Model: "claude-opus-4-6", Status: "available", FPTier: "hard"},
 		{Provider: "agy", Model: "gemini-4-argon", Status: "available", FPTier: "hard", HeadroomPercent: 80, HeadroomState: "HEALTHY"},
 	}
-	sum := routingSummary(items, e.ActiveCircuitBreakers(), e)
+	sum := routingSummary(items, e.ActiveCircuitBreakers(), []model.Decision{{Provider: "agy", Model: "gemini-4-argon", Reason: "AVAILABLE_CANDIDATE"}})
 	breakersVal, ok := sum["active_circuit_breakers"].([]map[string]any)
 	if !ok || breakersVal == nil {
 		t.Fatalf("expected non-nil []map[string]any for active_circuit_breakers, got %#v", sum["active_circuit_breakers"])
@@ -525,15 +525,16 @@ func TestDiagnosticTools_QuotasBreakersAuditWaitJobs(t *testing.T) {
 	}
 	t.Cleanup(func() { dbRS.Close() })
 	cfgRS := model.Config{
-		StateDir: filepath.Join(dirRS, "state"),
+		CodexBarAccountSHA256: map[string]string{"codex": model.Hash([]byte("fixture-account")), "claude": model.Hash([]byte("fixture-account"))},
+		StateDir:              filepath.Join(dirRS, "state"),
 		Repositories: map[string]model.Repo{
 			"r1": {Root: dirRS, AllowedPaths: []string{"."}, Providers: []string{"codex", "claude", "agy"}},
 		},
 	}
 	regRS := providers.Registry{
 		Candidates: []model.Capability{
-			{Provider: "codex", Model: "gpt-6.1-sol", Status: "available"},
-			{Provider: "claude", Model: "claude-opus-4-6", Status: "available"},
+			{AttestedAccount: "fixture-account", Provider: "codex", Model: "gpt-6.1-sol", Status: "available"},
+			{AttestedAccount: "fixture-account", Provider: "claude", Model: "claude-opus-4-6", Status: "available"},
 			{Provider: "agy", Model: "gemini-4-argon", Status: "available"},
 		},
 	}
@@ -542,8 +543,8 @@ func TestDiagnosticTools_QuotasBreakersAuditWaitJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { eRS.Close() })
-	eRS.SetQuotaForTest("codex", []providers.Quota{{Bucket: providers.BarCodexBurst, Remaining: &zero}})
-	eRS.SetQuotaForTest("claude", []providers.Quota{{Bucket: "primary", Remaining: &zero, State: "EXHAUSTED"}})
+	eRS.SetQuotaForTest("codex", []providers.Quota{{AccountMatch: "MATCHED", Unit: "percent", State: "KNOWN", Bucket: providers.BarCodexBurst, Remaining: &zero}})
+	eRS.SetQuotaForTest("claude", []providers.Quota{{AccountMatch: "MATCHED", Unit: "percent", Bucket: "primary", Remaining: &zero, State: "EXHAUSTED"}})
 	sRS := New(eRS, cfgRS, regRS)
 	ctRS, stRS := mcp.NewInMemoryTransports()
 	go func() { _ = sRS.Run(ctx, stRS) }()

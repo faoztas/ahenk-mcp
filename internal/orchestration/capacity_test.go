@@ -31,9 +31,12 @@ func quotaFixture(provider, bucket, family string, minutes int, left float64, no
 func capacityFixture(now time.Time) (*Engine, model.Job) {
 	q := []model.QualityEvidence{{Role: "inference", Tier: 1, Source: "SYNTHETIC_EVIDENCE"}}
 	e := &Engine{
-		cfg: model.Config{Repositories: map[string]model.Repo{"demo": {Providers: []string{"agy", "opencode"}}}},
+		cfg: model.Config{
+			CodexBarAccountSHA256: map[string]string{"agy": model.Hash([]byte("fixture-account")), "codex": model.Hash([]byte("fixture-account"))},
+			Repositories:          map[string]model.Repo{"demo": {Providers: []string{"agy", "opencode"}}},
+		},
 		reg: providers.Registry{Candidates: []model.Capability{
-			{Provider: "agy", Model: "gemini-3.8-flash-medium", Status: "available", Speed: "fast", Quality: slices.Clone(q),
+			{AttestedAccount: "fixture-account", Provider: "agy", Model: "gemini-3.8-flash-medium", Status: "available", Speed: "fast", Quality: slices.Clone(q),
 				Profiles: []model.ExecutionProfile{{Name: "restricted", Status: "preflight_required"}}},
 			{Provider: "opencode", Model: "opencode/glm-5.3-flash-free", Status: "available", Speed: "fast", Quality: slices.Clone(q)},
 		}},
@@ -189,11 +192,11 @@ func TestCapacityAGYFamilyResetAndPacingT08T09T15(t *testing.T) {
 	left := 82.0
 	older.Remaining = &left
 	e.agyHistory = []providers.Quota{older, q}
-	if r := e.agyReserve(j, "gemini", at, time.Minute, e.quotas["codex"][1]); r.reason != "AGY_WEEKLY_PACING" {
+	if r := e.agyReserve(j, "gemini", at, time.Minute, e.quotas["codex"][1], true); r.reason != "AGY_WEEKLY_PACING" {
 		t.Fatalf("weekly burn projection did not pace discretionary work: %+v", r)
 	}
 	j.Task.Priority = "high"
-	if r := e.agyReserve(j, "gemini", at, time.Minute, e.quotas["codex"][1]); r.reason != "" {
+	if r := e.agyReserve(j, "gemini", at, time.Minute, e.quotas["codex"][1], true); r.reason != "" {
 		t.Fatal("pacing blocked high-priority work above floor")
 	}
 }
@@ -292,8 +295,9 @@ func TestCapacityLegacySQLiteT18(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	now := capacityClock
+	now := time.Now().UTC()
 	e, j := capacityFixture(now)
+	j.CreatedAt = now
 	j.PolicyDigest = model.Digest(e.cfg.Repositories[j.RepoID])
 	j.Status = model.Completed
 	j.Task.TaskClass = "review"
@@ -305,6 +309,9 @@ func TestCapacityLegacySQLiteT18(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restored.Close()
+	restored.mu.Lock()
+	restored.collect(time.Now())
+	restored.mu.Unlock()
 	old, err := restored.Get(j.ID)
 	if err != nil || old.Status != model.Completed || jobQualityRole(old) != "inference" {
 		t.Fatalf("legacy row changed: %+v %v", old, err)
@@ -345,7 +352,7 @@ func TestCapacityReservationCoversAttemptsOverlappingObservation(t *testing.T) {
 	finish := now.Add(-time.Second)
 	e.jobs["previous"] = model.Job{Attempts: []model.Attempt{{Provider: "agy", Model: "gemini-3.8-flash-medium",
 		StartedAt: now.Add(-2 * time.Minute), FinishedAt: &finish, AGYWeeklyBuffer: 3}}}
-	r := e.agyReserve(j, "gemini", now, time.Minute, e.quotas["codex"][1])
+	r := e.agyReserve(j, "gemini", now, time.Minute, e.quotas["codex"][1], true)
 	if r.reason != reserveReason || r.floor != 20 {
 		t.Fatalf("unaccounted overlapping spend: %+v", r)
 	}

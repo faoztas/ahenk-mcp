@@ -14,6 +14,7 @@ import (
 	"github.com/faoztas/ahenk-mcp/internal/execution"
 	"github.com/faoztas/ahenk-mcp/internal/model"
 	"github.com/faoztas/ahenk-mcp/internal/providers"
+	"github.com/faoztas/ahenk-mcp/internal/store"
 )
 
 const (
@@ -115,7 +116,7 @@ func controllerWindow(rows []providers.Quota, minutes int, now time.Time) provid
 	for _, raw := range rows {
 		// Extra model windows are exposed separately. The controller's active
 		// model is not known, so they cannot stand in for account windows.
-		if raw.WindowMinutes != minutes || strings.HasPrefix(raw.Bucket, "extra:") {
+		if raw.Provider != "" && raw.Provider != "codex" || raw.WindowMinutes != minutes || strings.HasPrefix(raw.Bucket, "extra:") {
 			continue
 		}
 		row := raw.At(now)
@@ -176,14 +177,37 @@ func (e *Engine) loadQuotaHistory() {
 // rememberQuota runs under the scheduler lock. Only a fresh, matched account
 // sample enters private pacing history. Repeated observations add no entries.
 func (e *Engine) rememberQuota(provider string, rows []providers.Quota, now time.Time) {
+	// A failed read contains a single unknown sentinel. Keep the original
+	// observation timestamp so a failed refresh cannot extend its lifetime.
+	if len(rows) == 1 && rows[0].Bucket == "unknown" && rows[0].State == "UNKNOWN" &&
+		slices.ContainsFunc(e.quotas[provider], func(q providers.Quota) bool { return verifiedQuota(q.At(now)) }) {
+		return
+	}
 	e.quotas[provider] = rows
+	// Persist telemetry when it is observed. Read-only previews can then
+	// evaluate the same sample repeatedly without refreshing its timestamp.
+	if e.db != nil {
+		bar, tier, id := providers.BarCodexBurst, "codex_pro", "codex"
+		if provider == "agy" {
+			bar, tier, id = providers.BarAgyGemini, "google_ai_pro", "antigravity"
+		}
+		if provider == "codex" || provider == "agy" {
+			q := e.barQuotaLocked(bar, now)
+			if verifiedQuota(q) {
+				_ = e.db.SaveQuotaState(store.ProviderQuotaState{
+					ProviderID: id, TierName: tier, WindowDurationHours: 5,
+					HealthPct: *q.Remaining / 100, UpdatedAt: q.ObservedAt, CircuitState: string(e.cb.stateAt(provider, now)),
+				})
+			}
+		}
+	}
 	if provider != "agy" {
 		return
 	}
 	changed := false
 	for _, raw := range rows {
 		q := raw.At(now)
-		if !verifiedQuota(q) || q.Family == "" || q.ResetAt == nil {
+		if q.Provider != "" && q.Provider != "agy" || !verifiedQuota(q) || q.Family == "" || q.ResetAt == nil {
 			continue
 		}
 		if slices.ContainsFunc(e.agyHistory, func(p providers.Quota) bool { return p.Bucket == q.Bucket && p.ObservedAt.Equal(q.ObservedAt) }) {
@@ -229,17 +253,17 @@ type reserveAdmission struct {
 	reason                   string
 }
 
-func (e *Engine) agyReserve(j model.Job, family string, now time.Time, budget time.Duration, controller providers.Quota) reserveAdmission {
+func (e *Engine) agyReserve(j model.Job, family string, now time.Time, budget time.Duration, controller providers.Quota, sameAccount bool) reserveAdmission {
+	rows := e.quotas["agy"]
+	if !sameAccount {
+		rows = nil
+	}
 	policy := e.cfg.CapacityPolicy.Defaults()
-	r := reserveAdmission{threshold: policy.AGYWeeklyReserve, weekly: tightestQuota(e.quotas["agy"], family, weeklyMinutes, now)}
-	if r.weekly.Bucket == "" {
+	bucket, minutes := providers.AGYLongWindow(family)
+	r := reserveAdmission{threshold: policy.AGYWeeklyReserve, weekly: scopedQuota(rows, "agy", now, func(q providers.Quota) bool { return q.IsAGYLongWindow(family) })}
+	if !verifiedQuota(r.weekly) {
 		r.weekly = providers.UnknownQuota("agy")
-		r.weekly.Family, r.weekly.WindowMinutes = family, weeklyMinutes
-		for _, bucket := range providers.AGYFamilyBuckets(family) {
-			if strings.HasSuffix(bucket, "weekly") {
-				r.weekly.Bucket = bucket
-			}
-		}
+		r.weekly.Family, r.weekly.Bucket, r.weekly.WindowMinutes = family, bucket, minutes
 	}
 	// An unknown controller signal keeps the reserve in place. Only a
 	// verified empty controller weekly window releases the weekly policy.
@@ -264,11 +288,12 @@ func (e *Engine) agyReserve(j model.Job, family string, now time.Time, budget ti
 			if overlapsSample && !a.StartedAt.After(now) && (a.AGY == nil || a.AGY.PromptSent) {
 				r.floor += a.AGYWeeklyBuffer
 			}
-			if a.AGY != nil && a.AGY.WeeklyReserve != nil {
+			if sameAccount && a.AGY != nil && a.AGY.WeeklyReserve != nil && a.AGY.ReserveAccountSHA256 != "" &&
+				strings.EqualFold(a.AGY.ReserveAccountSHA256, e.cfg.CodexBarAccountSHA256["agy"]) {
 				ev := a.AGY.WeeklyReserve
-				if ev.ObservedAt.After(r.weekly.ObservedAt) && !ev.ObservedAt.After(now) &&
+				if bucket != "" && observerBucket(ev.Bucket) == bucket && ev.ObservedAt.After(r.weekly.ObservedAt) && !ev.ObservedAt.After(now) &&
 					ev.ResetAt != nil && ev.ResetAt.After(now) && now.Sub(ev.ObservedAt) <= 5*time.Minute {
-					r.weekly = providers.Quota{Provider: "agy", Family: family, Bucket: ev.Bucket, WindowMinutes: weeklyMinutes,
+					r.weekly = providers.Quota{Provider: "agy", Family: family, Bucket: ev.Bucket, WindowMinutes: minutes,
 						Unit: "percent", State: "KNOWN", Remaining: &ev.Remaining, ObservedAt: ev.ObservedAt,
 						ResetAt: ev.ResetAt, Source: "agy_usage", AccountMatch: "SAME_NATIVE_CLI_CONTEXT"}
 				}
@@ -285,7 +310,7 @@ func (e *Engine) agyReserve(j model.Job, family string, now time.Time, budget ti
 	// Discretionary work yields when either same-family window suggests a
 	// trajectory beyond the weekly reserve. Important work still passes
 	// the absolute reserve check above.
-	session := tightestQuota(e.quotas["agy"], family, 300, now)
+	session := tightestQuota(rows, family, 300, now)
 	rate = max(rate, e.burn(session))
 	if verifiedQuota(controller) && j.Task.Priority != "high" &&
 		(j.Task.Priority == "background" || j.Task.TaskClass == "utility") &&

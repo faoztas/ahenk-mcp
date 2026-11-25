@@ -6,6 +6,7 @@ package providers
 import (
 	"bytes"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"io"
 	"math"
@@ -81,6 +82,24 @@ func agyBucket(id string) (bar, family string, minutes int) {
 	}
 }
 
+// AGYLongWindow returns the canonical long bucket and its duration for a family.
+func AGYLongWindow(family string) (string, int) {
+	for _, id := range AGYFamilyBuckets(family) {
+		bar, _, minutes := agyBucket(id)
+		if minutes > 300 {
+			return bar, minutes
+		}
+	}
+	return "", 0
+}
+
+func (q Quota) IsAGYLongWindow(family string) bool {
+	bar, minutes := AGYLongWindow(family)
+	name, _, _ := agyBucket(q.Bucket)
+	// Older CodexBar observers reported the named 3p window as seven days.
+	return bar != "" && q.Family == family && name == bar && (q.WindowMinutes == 0 || q.WindowMinutes == minutes || family == "claude_gpt" && q.WindowMinutes == 10080)
+}
+
 func AGYModelFamily(id string) string {
 	switch {
 	case strings.HasPrefix(id, "gemini-4-argon-") || id == "gemini-4-argon":
@@ -114,11 +133,16 @@ func decodeCodexBar(r io.Reader, requested, requestedSource, expectedAccount str
 	}
 	data = bytes.TrimSpace(data)
 	var records []codexBarRecord
+	var target any = &records
 	if len(data) > 0 && data[0] == '{' {
 		records = make([]codexBarRecord, 1)
-		err = json.Unmarshal(data, &records[0])
+		target = &records[0]
+	}
+	if requested == "claude" {
+		// Require exact field names and reject duplicate JSON members.
+		err = jsonv2.Unmarshal(data, target)
 	} else {
-		err = json.Unmarshal(data, &records)
+		err = json.Unmarshal(data, target)
 	}
 	if err != nil {
 		return nil, errors.New("invalid CodexBar export")
@@ -145,6 +169,16 @@ func decodeCodexBar(r io.Reader, requested, requestedSource, expectedAccount str
 			accountMatch = "MATCHED"
 		}
 	}
+	if id == "claude" && (accountMatch != "MATCHED" || row.Usage.Confidence != "exact" ||
+		now.Sub(row.Usage.UpdatedAt) > quotaMaxAge || row.Usage.Tertiary != nil || len(row.Usage.Extra) != 0) {
+		// The fixture establishes only positional account windows. Additional
+		// windows may alias them or carry a narrower scope.
+		q := UnknownQuota(id)
+		if accountMatch == "MISMATCH" {
+			q.AccountMatch = accountMatch
+		}
+		return []Quota{q}, nil
+	}
 	var out []Quota
 	add := func(bucket, family string, w *codexBarWindow, namedKnown *bool) {
 		if w == nil {
@@ -168,8 +202,19 @@ func decodeCodexBar(r io.Reader, requested, requestedSource, expectedAccount str
 		known := requestedSource != "" || namedKnown != nil || w.UsageKnown != nil ||
 			row.Source == "cli" || (requested == "codex" && row.Source == "oauth")
 		known = known && (namedKnown == nil || *namedKnown) && (w.UsageKnown == nil || *w.UsageKnown)
+		if id == "claude" {
+			minutes := 300
+			if bucket == "secondary" {
+				minutes = 10080
+			}
+			known = known && w.Minutes == minutes && w.ResetsAt != nil && w.ResetsAt.After(now) &&
+				!w.ResetsAt.After(q.ObservedAt.Add(time.Duration(minutes)*time.Minute))
+		}
 		if known && !w.Placeholder && q.Source != "offline" && w.UsedPercent != nil && *w.UsedPercent >= 0 && *w.UsedPercent <= 100 {
-			left := math.Round((100-*w.UsedPercent)*10) / 10
+			left := 100 - *w.UsedPercent
+			if rounded := math.Round(left*10) / 10; rounded > 0 {
+				left = rounded
+			}
 			q.Unit, q.State, q.Remaining = "percent", "KNOWN", &left
 			if left == 0 {
 				q.State = "EXHAUSTED"
@@ -191,7 +236,7 @@ func decodeCodexBar(r io.Reader, requested, requestedSource, expectedAccount str
 			seen[bucket] = true
 			bar, family, minutes := agyBucket(bucket)
 			if minutes > 0 && extra.Window.Minutes > 0 && minutes != extra.Window.Minutes &&
-				(bucket != "3p-weekly" && bucket != "3p-5h") {
+				!(Quota{Bucket: bar, Family: family, WindowMinutes: extra.Window.Minutes}).IsAGYLongWindow(family) {
 				family = ""
 			}
 			add(bar, family, extra.Window, extra.UsageKnown)

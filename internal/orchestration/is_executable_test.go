@@ -93,4 +93,3 @@ func TestIsExecutable(t *testing.T) {
 		t.Error("expected IsExecutable('codex') to be false when Registry candidate is not available, even if binary exists on disk")
 	}
 }
-

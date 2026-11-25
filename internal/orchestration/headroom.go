@@ -46,6 +46,10 @@ type HeadroomResult struct {
 // Unknown windows default to full headroom so unverified quota never blocks
 // a route by itself; the separate CAPACITY_UNVERIFIED gate covers that case.
 func ComputeHeadroom(sessionWindow, weeklyWindow *providers.Quota) HeadroomResult {
+	return computeHeadroomAt(sessionWindow, weeklyWindow, time.Now().UTC())
+}
+
+func computeHeadroomAt(sessionWindow, weeklyWindow *providers.Quota, now time.Time) HeadroomResult {
 	hSession, hWeekly := 1.0, 1.0
 	hasSession, hasWeekly := false, false
 	var reset *time.Time
@@ -58,11 +62,11 @@ func ComputeHeadroom(sessionWindow, weeklyWindow *providers.Quota) HeadroomResul
 	}
 	if v, ok := margin(sessionWindow); ok {
 		hSession, hasSession = v, true
-		reset = earlierReset(reset, sessionWindow.ResetAt, time.Now().UTC())
+		reset = earlierReset(reset, sessionWindow.ResetAt, now)
 	}
 	if v, ok := margin(weeklyWindow); ok {
 		hWeekly, hasWeekly = v, true
-		reset = earlierReset(reset, weeklyWindow.ResetAt, time.Now().UTC())
+		reset = earlierReset(reset, weeklyWindow.ResetAt, now)
 	}
 	hProvider := 1.0
 	switch {
@@ -163,11 +167,11 @@ func (e *Engine) familyHeadroom(family string, now time.Time) (HeadroomResult, b
 	}
 	session, weekly := providers.Quota{}, providers.Quota{}
 	for _, q := range e.quotas["agy"] {
-		if q.Family != family || q.AccountMatch != "MATCHED" {
+		if q.Provider != "" && q.Provider != "agy" || q.Family != family {
 			continue
 		}
 		q = q.At(now)
-		if q.Unit != "percent" || q.State != "KNOWN" && q.State != "EXHAUSTED" || q.Remaining == nil {
+		if !verifiedQuota(q) {
 			continue
 		}
 		tighter := func(current providers.Quota) bool {
@@ -178,7 +182,7 @@ func (e *Engine) familyHeadroom(family string, now time.Time) (HeadroomResult, b
 			if tighter(session) {
 				session = q
 			}
-		case q.WindowMinutes == weeklyMinutes || strings.HasSuffix(q.Bucket, "weekly"):
+		case q.IsAGYLongWindow(family):
 			if tighter(weekly) {
 				weekly = q
 			}
@@ -187,7 +191,7 @@ func (e *Engine) familyHeadroom(family string, now time.Time) (HeadroomResult, b
 	if session.Remaining == nil && weekly.Remaining == nil {
 		return HeadroomResult{}, false
 	}
-	h := ComputeHeadroom(&session, &weekly)
+	h := computeHeadroomAt(&session, &weekly, now)
 	h.Family = family
 	return h, true
 }

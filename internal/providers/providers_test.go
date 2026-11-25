@@ -5,6 +5,7 @@ package providers
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,29 @@ func TestBudgetKeepsHardDeadline(t *testing.T) {
 	}
 	if b, ok := Budget(now, now.Add(600*time.Second), task, estimate); !ok || b <= 120*time.Second || b > 580*time.Second {
 		t.Fatal(b, ok)
+	}
+}
+
+func TestFixtureImplementationBudget(t *testing.T) {
+	now := time.Now()
+	c := model.Capability{Speed: "fixture"}
+	for _, tc := range []struct {
+		name               string
+		task               model.Task
+		deadline, estimate time.Duration
+	}{
+		{"plain patch", model.Task{Mode: "patch"}, 30 * time.Second, 5 * time.Second},
+		{"worktree patch", model.Task{Mode: "patch", ExecutionProfile: "implementation"}, 60 * time.Second, 25 * time.Second},
+		{"checked worktree patch", model.Task{Mode: "patch", ExecutionProfile: "implementation",
+			Acceptance: []model.Check{{CheckID: "go-check"}}}, 120 * time.Second, 90 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			estimate := Estimate(c, tc.task)
+			budget, fits := Budget(now, now.Add(tc.deadline), tc.task, estimate)
+			if estimate != tc.estimate || !fits || budget < tc.estimate || budget > tc.deadline-20*time.Second {
+				t.Fatalf("estimate %v, budget %v, fits %v", estimate, budget, fits)
+			}
+		})
 	}
 }
 
@@ -431,5 +455,113 @@ exit 0
 	}
 	if !strings.Contains(claudeLogged, "--effort max") {
 		t.Errorf("expected '--effort max' in claude RunTrustedLocal args, got: %s", claudeLogged)
+	}
+}
+
+// A CLI can accept custom models even when their effort settings are unknown.
+func TestProfileCustomModelDoesNotReceiveEffortFlag(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "mock")
+	log := path + ".args"
+	body := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + log + "'\nprintf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"t\"}' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n"
+	if err := os.WriteFile(path, []byte(body), 0700); err != nil {
+		t.Fatal(err)
+	}
+	reg := New(model.Config{Providers: []model.ProviderConfig{{ID: "codex", Model: "custom", Path: path}, {ID: "claude", Path: path}}})
+	c := model.Capability{Provider: "codex", Model: "custom", Mode: "cli", Status: "available"}
+	_, err = reg.Run(context.Background(), dir, c, model.Task{Mode: "read_only", RoutingProfile: "quality", TargetEffort: "max", Objective: "test"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, err := os.ReadFile(log)
+	if err != nil || strings.Contains(string(args), "model_reasoning_effort") {
+		t.Fatalf("custom model arguments %q error %v", args, err)
+	}
+}
+
+func TestProfileQuotaBindsConfiguredCLIWorker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.Config{Providers: []model.ProviderConfig{
+		{ID: "codex", Path: path, Model: "gpt-6.1-sol", AttestedAccountSHA256: model.Hash([]byte("model-specific"))},
+		{ID: "codex", Path: path, AttestedAccount: "default"},
+		{ID: "codex", Path: path, Model: "custom", AttestedAccount: "other", ExpectedBinarySHA256: model.Hash([]byte("different binary"))},
+	}}
+	seen := map[string]bool{}
+	for _, c := range New(cfg).Candidates {
+		if c.Provider != "codex" {
+			continue
+		}
+		seen[c.Model] = true
+		switch c.Model {
+		case "custom":
+			if c.AttestedAccount != "" || c.AttestedAccountSHA256 != "" {
+				t.Fatal("mismatched binary retained attestation")
+			}
+		case "gpt-6.1-sol":
+			if c.AttestedAccount != "" || c.AttestedAccountSHA256 != cfg.Providers[0].AttestedAccountSHA256 {
+				t.Fatal("model-specific worker lost attestation")
+			}
+		default:
+			if c.AttestedAccount != "default" || c.AttestedAccountSHA256 != "" {
+				t.Fatal("default worker lost attestation", c.Model)
+			}
+		}
+	}
+	if !seen["custom"] || !seen["gpt-6.1-sol"] || !seen["gpt-6-astra"] {
+		t.Fatal(seen)
+	}
+}
+
+func TestAGYFiveDayNativePreflightReserve(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	marker := filepath.Join(dir, "worker-started")
+	binary := filepath.Join(dir, "fixture-worker")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\ntouch '"+marker+"'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	reset := now.Add(time.Hour)
+	for _, left := range []float64{12, 80, 0} {
+		rows := []Quota{{Provider: "agy", Bucket: "3p-weekly", Family: "claude_gpt", WindowMinutes: 7200, Source: "agy_usage", AccountMatch: "SAME_NATIVE_CLI_CONTEXT", State: "KNOWN", Remaining: &left, ObservedAt: now, ResetAt: &reset}}
+		short := rows[0]
+		short.Bucket = "3p-5h"
+		short.WindowMinutes = 300
+		full := 100.
+		short.Remaining = &full
+		rows = append(rows, short)
+		if fault := checkAGYFamilyQuota(rows, "claude_gpt", 0, now); left == 0 {
+			if fault == nil || fault.Code != "QUOTA_EXHAUSTED" {
+				t.Fatal("zero admitted")
+			}
+			continue
+		} else if fault != nil {
+			t.Fatal(fault)
+		}
+		if got := agyWeeklyReserve(rows, "claude_gpt", 17); (got != nil) != (left == 12) {
+			t.Errorf("native %g reserve %+v", left, got)
+		}
+		if left == 12 {
+			req := agyRequest{WeeklyFloor: 17, Audited: true, Task: model.Task{Mode: "read_only", DataClass: "synthetic"}, Config: model.ProviderConfig{ID: "agy", AttestedAccount: "fixture-account", Model: "claude-fixture", EnableSynthetic: true, Path: binary, ExpectedBinarySHA256: agy153Fingerprint}}
+			out, err := runAGYAttemptWithUsage(t.Context(), req, func(context.Context, model.ProviderConfig, string, bool) (AGYProbe, error) {
+				return AGYProbe{Admission: agySmokeAllowed, Quotas: rows}, nil
+			})
+			var fault *model.Fault
+			if !errors.As(err, &fault) || fault.Code != "AGY_WEEKLY_RESERVE_PROTECTED" || out.AGY.WeeklyReserve == nil || out.AGY.PromptSent {
+				t.Fatal("missing pre-dispatch reserve rejection", err)
+			}
+			if out.AGY.ReserveAccountSHA256 != "" {
+				t.Fatal("unidentified usage sample acquired the configured account")
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatal("blocked worker was started", err)
+			}
+		}
 	}
 }

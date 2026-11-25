@@ -5,6 +5,7 @@ package providers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -203,4 +204,139 @@ func TestCodexBarSecurityInvariants(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "CODEXBAR_BINARY_UNVERIFIED") {
 		t.Errorf("expected CODEXBAR_BINARY_UNVERIFIED, got %v", err)
 	}
+}
+
+func TestClaudeQuotaAffectsRoutingOnlyAfterBoundSource(t *testing.T) {
+	now := time.Date(2026, 11, 12, 9, 45, 0, 0, time.UTC)
+	fixture := codexBar084Fixture(t, "codexbar_084_claude.json")
+	const email = "fixture@example.invalid"
+	account := model.Hash([]byte(email))
+	other := model.Hash([]byte("other@example.invalid"))
+	decode := func(raw, source, digest string) ([]Quota, error) {
+		return decodeCodexBar(strings.NewReader(raw), "claude", source, digest, now)
+	}
+
+	t.Run("exact OAuth binding", func(t *testing.T) {
+		rows, err := decode(strings.Replace(fixture, email, " Fixture@EXAMPLE.INVALID ", 1), "oauth", strings.ToUpper(account))
+		if err != nil || len(rows) != 2 {
+			t.Fatalf("expected two Claude quota windows, got %d: %v", len(rows), err)
+		}
+		windows := []struct {
+			bucket    string
+			minutes   int
+			remaining float64
+			reset     time.Time
+		}{
+			{"primary", 300, 77.5, time.Date(2026, 11, 12, 14, 0, 0, 0, time.UTC)},
+			{"secondary", 10080, 91.7, time.Date(2026, 11, 16, 0, 0, 0, 0, time.UTC)},
+		}
+		for i, want := range windows {
+			q := rows[i]
+			if q.Provider != "claude" || q.Family != "" || q.Source != "oauth" || q.RequestedSource != "oauth" ||
+				q.AccountMatch != "MATCHED" || q.Confidence != "exact" || q.Unit != "percent" ||
+				q.Bucket != want.bucket || q.WindowMinutes != want.minutes || q.State != "KNOWN" ||
+				q.Remaining == nil || *q.Remaining != want.remaining || q.ResetAt == nil || !q.ResetAt.Equal(want.reset) ||
+				!q.ObservedAt.Equal(now.Add(-5*time.Minute)) {
+				t.Fatalf("unexpected normalized quota metadata for %s: %+v", want.bucket, q)
+			}
+			encoded, err := json.Marshal(q)
+			if err != nil || strings.Contains(strings.ToLower(string(encoded)), email) ||
+				strings.Contains(strings.ToLower(string(encoded)), account) {
+				t.Fatal("quota serialization failed or exposed account identity")
+			}
+		}
+
+		// Consumers must recheck freshness on cached rows.
+		if q := rows[0].At(now.Add(10*time.Minute + time.Nanosecond)); q.Remaining != nil || q.State != "STALE" {
+			t.Fatal("cached Claude quota survived its maximum age")
+		}
+		nearReset := strings.Replace(fixture, "2026-11-12T14:00:00Z", "2026-11-12T09:46:00Z", 1)
+		rows, err = decode(nearReset, "oauth", account)
+		if err != nil || len(rows) != 2 || rows[0].Remaining == nil {
+			t.Fatal("expected usable quota before reset")
+		}
+		if q := rows[0].At(now.Add(time.Minute)); q.Remaining != nil || q.State != "STALE" {
+			t.Fatal("cached Claude quota survived its reset")
+		}
+	})
+
+	t.Run("verified near exhaustion", func(t *testing.T) {
+		for _, tc := range []struct{ used, state string }{{"99.99", "KNOWN"}, {"100", "EXHAUSTED"}} {
+			raw := strings.Replace(fixture, `"usedPercent":22.5`, `"usedPercent":`+tc.used, 1)
+			rows, err := decode(raw, "oauth", account)
+			if err != nil || len(rows) != 2 || rows[0].State != tc.state || rows[0].Remaining == nil {
+				t.Fatalf("used %s: want %s with measured balance, got %+v %v", tc.used, tc.state, rows, err)
+			}
+			if left := *rows[0].Remaining; tc.used == "99.99" && (left <= 0 || left > 0.011) || tc.used == "100" && left != 0 {
+				t.Fatalf("used %s: unexpected remaining balance %v", tc.used, left)
+			}
+		}
+	})
+
+	t.Run("unproved export", func(t *testing.T) {
+		for _, tc := range []struct{ name, old, replacement, source, digest string }{
+			{"unmapped config", "", "", "oauth", ""},
+			{"unattested export", "", "", "", account},
+			{"mismatch", "", "", "oauth", other},
+			{"missing identity", email, "", "oauth", account},
+			{"identity provider mismatch", `"providerID":"claude"`, `"providerID":"codex"`, "oauth", account},
+			{"source fallback", `"source":"oauth"`, `"source":"web"`, "oauth", account},
+			{"source alias", `"source":"oauth"`, `"source":"OAuth"`, "oauth", account},
+			{"untrusted requested source", `"source":"oauth"`, `"source":"cli"`, "cli", account},
+			{"inexact evidence", `"dataConfidence":"exact"`, `"dataConfidence":"estimated"`, "oauth", account},
+			{"stale", "2026-11-12T09:40:00Z", "2026-11-12T09:29:59Z", "oauth", account},
+			{"future", "2026-11-12T09:40:00Z", "2026-11-12T09:45:01Z", "oauth", account},
+			{"alias collision", `"secondary":`, `"extraRateWindows":[{"id":"primary","window":{"usedPercent":99,"windowMinutes":300}}],"secondary":`, "oauth", account},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				raw := strings.Replace(fixture, tc.old, tc.replacement, 1)
+				rows, err := decode(raw, tc.source, tc.digest)
+				if err != nil || len(rows) == 0 {
+					t.Fatalf("expected UNKNOWN quota: %v", err)
+				}
+				for _, q := range rows {
+					if q.Provider != "claude" || q.State != "UNKNOWN" || q.Remaining != nil {
+						t.Fatalf("unproved Claude quota was admitted: %+v", q)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("unproved primary window", func(t *testing.T) {
+		for _, tc := range []struct{ name, old, replacement string }{
+			{"expired reset", "2026-11-12T14:00:00Z", "2026-11-12T09:45:00Z"},
+			{"absent reset", `,"resetsAt":"2026-11-12T14:00:00Z"`, ""},
+			{"implausible reset", "2026-11-12T14:00:00Z", "2026-11-12T15:00:00Z"},
+			{"wrong duration", `"windowMinutes":300`, `"windowMinutes":10080`},
+			{"missing percentage", `"usedPercent":22.5`, `"usedPercent":null`},
+			{"out of range percentage", `"usedPercent":22.5`, `"usedPercent":101`},
+			{"placeholder", `"usedPercent":22.5`, `"usedPercent":22.5,"isSyntheticPlaceholder":true`},
+			{"unknown usage", `"usedPercent":22.5`, `"usedPercent":22.5,"usageKnown":false`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				rows, err := decode(strings.Replace(fixture, tc.old, tc.replacement, 1), "oauth", account)
+				if err != nil || len(rows) != 2 || rows[0].State != "UNKNOWN" || rows[0].Remaining != nil ||
+					rows[1].Bucket != "secondary" || rows[1].State != "KNOWN" || rows[1].Remaining == nil {
+					t.Fatalf("expected UNKNOWN primary and intact secondary: %+v %v", rows, err)
+				}
+			})
+		}
+	})
+
+	t.Run("malformed export", func(t *testing.T) {
+		for _, tc := range []struct{ name, raw string }{
+			{"broken JSON", "["},
+			{"invalid reset", strings.Replace(fixture, "2026-11-12T14:00:00Z", "invalid", 1)},
+			{"duplicate source", strings.Replace(fixture, `"source":"oauth"`, `"source":"web","source":"oauth"`, 1)},
+			{"duplicate primary", strings.Replace(fixture, `"primary":`, `"primary":null,"primary":`, 1)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				rows, err := decode(tc.raw, "oauth", account)
+				if len(rows) != 0 || err == nil || err.Error() != "invalid CodexBar export" {
+					t.Fatal("expected a sanitized decoder error and no quota")
+				}
+			})
+		}
+	})
 }

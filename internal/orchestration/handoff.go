@@ -52,6 +52,9 @@ func (e *Engine) resolveHandoffs(j model.Job) ([]model.Handoff, error) {
 			source.Result == nil || len(source.Result.Verification) == 0 || len(source.Attempts) == 0 {
 			return nil, invalid
 		}
+		if source.Task.DataClass == model.PrivateSourceData && source.Task.Mode == "patch" && e.privateWriter == nil {
+			return nil, invalid
+		}
 		attempt := source.Attempts[len(source.Attempts)-1]
 		if attempt.FinishedAt == nil || attempt.Code != "" {
 			return nil, invalid

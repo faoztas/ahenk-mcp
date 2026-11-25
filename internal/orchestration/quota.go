@@ -21,17 +21,13 @@ const quotaRefreshTTL = 60 * time.Second
 func (e *Engine) refreshQuotas() {
 	ticker := time.NewTicker(quotaRefreshTTL)
 	defer ticker.Stop()
-	if e.readQuotas != nil {
-		e.readQuotas()
-	} else {
-		e.readQuotasOnce()
-	}
+	e.refreshQuotasAsync()
 	for {
 		select {
 		case <-e.ctx.Done():
 			return
 		case <-ticker.C:
-			e.readQuotasOnce()
+			e.refreshQuotasAsync()
 		}
 	}
 }
@@ -39,7 +35,7 @@ func (e *Engine) refreshQuotas() {
 // readQuotasOnce refreshes every configured CodexBar provider synchronously
 // and stamps the cache. Providers without an account binding are not read.
 func (e *Engine) readQuotasOnce() {
-	if e.ctx.Err() != nil {
+	if !e.cfg.EnableCodexBar || e.ctx.Err() != nil {
 		return
 	}
 	var agy model.ProviderConfig
@@ -78,15 +74,14 @@ func (e *Engine) refreshQuotasAsync() {
 		return
 	}
 	e.mu.Lock()
-	stale := time.Since(e.quotaRefreshedAt) >= quotaRefreshTTL
-	e.mu.Unlock()
-	if !stale || !e.quotaRefreshing.CompareAndSwap(false, true) {
+	defer e.mu.Unlock()
+	if e.closed || time.Since(e.quotaRefreshedAt) < quotaRefreshTTL || !e.quotaRefreshing.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
+	e.wg.Go(func() {
 		defer e.quotaRefreshing.Store(false)
 		e.readQuotas()
-	}()
+	})
 }
 
 func (e *Engine) Quota(provider string) []providers.Quota {
@@ -107,7 +102,14 @@ func (e *Engine) Quota(provider string) []providers.Quota {
 			rows = []providers.Quota{providers.UnknownQuota(id)}
 		}
 		for _, q := range rows {
-			out = append(out, q.At(now))
+			q = q.At(now)
+			if id != "opencode" && (q.Provider != "" && q.Provider != id || !verifiedQuota(q)) {
+				q.Remaining, q.ResetAt = nil, nil
+				if q.AccountMatch != "MATCHED" || q.State != "STALE" {
+					q.State = "UNKNOWN"
+				}
+			}
+			out = append(out, q)
 		}
 	}
 	return out
@@ -123,83 +125,90 @@ func (e *Engine) HealthPercent(bar string) float64 {
 	return e.healthPercentLocked(bar, now)
 }
 
-func (e *Engine) hasFreshQuotaLocked(bar string, now time.Time) bool {
-	for _, rows := range e.quotas {
-		for _, raw := range rows {
-			q := raw.At(now)
-			if q.Bucket == bar && q.Remaining != nil {
-				return true
+// scopedQuota selects verified evidence within one provider and window scope.
+func scopedQuota(rows []providers.Quota, provider string, now time.Time, matches func(providers.Quota) bool) providers.Quota {
+	result := providers.UnknownQuota(provider)
+	for _, raw := range rows {
+		if raw.Provider != "" && raw.Provider != provider || raw.AccountMatch != "MATCHED" || !matches(raw) {
+			continue
+		}
+		q := raw.At(now)
+		if verifiedQuota(q) {
+			if result.Remaining == nil || *q.Remaining < *result.Remaining ||
+				*q.Remaining == 0 && *result.Remaining == 0 && q.ResetAt != nil && result.ResetAt != nil && q.ResetAt.After(*result.ResetAt) {
+				result = q
 			}
+		} else if q.State == "STALE" && result.Remaining == nil {
+			result = q
+			result.Remaining, result.ResetAt = nil, nil
 		}
 	}
-	return false
+	return result
+}
+
+// The parser binds MATCHED rows to the configured observer account. If a
+// worker attests a different identity, its remaining quota is unknown.
+func (e *Engine) quotaAccountMatches(c model.Capability) bool {
+	binding := e.cfg.CodexBarAccountSHA256[normalizeProvider(c.Provider)]
+	if binding == "" || (c.AttestedAccount == "" && c.AttestedAccountSHA256 == "") {
+		return false
+	}
+	ok, _ := (model.PrivateRoute{ExpectedAccountSHA256: binding}).AccountMatches(c)
+	return ok
+}
+
+func workerQuota(rows []providers.Quota, provider string, now time.Time) providers.Quota {
+	return scopedQuota(rows, provider, now, func(q providers.Quota) bool {
+		switch provider {
+		case "codex":
+			return q.Bucket == providers.BarCodexBurst || q.Bucket == providers.BarCodexWeekly
+		case "claude":
+			return q.Bucket == "primary" || q.Bucket == "secondary" || q.Bucket == "tertiary"
+		}
+		return false
+	})
+}
+
+func observerBucket(bucket string) string {
+	switch bucket {
+	case "gemini-5h":
+		return providers.BarAgyGemini
+	case "3p-5h":
+		return providers.BarAgyOpus5h
+	case "3p-weekly":
+		return providers.BarAgyOpus
+	default:
+		return bucket
+	}
+}
+
+func (e *Engine) barQuotaLocked(bar string, now time.Time) providers.Quota {
+	provider := "agy"
+	switch bar {
+	case providers.BarCodexBurst, providers.BarCodexWeekly:
+		provider = "codex"
+	case providers.BarOpenCodeFree:
+		provider = "opencode"
+	}
+	return scopedQuota(e.quotas[provider], provider, now, func(q providers.Quota) bool {
+		return observerBucket(q.Bucket) == observerBucket(bar)
+	})
+}
+
+func (e *Engine) opusAdmissionHealth(now time.Time) float64 {
+	return min(e.healthPercentLocked(providers.BarAgyOpus5h, now), e.healthPercentLocked(providers.BarAgyOpus, now))
+}
+
+func (e *Engine) hasFreshQuotaLocked(bar string, now time.Time) bool {
+	return verifiedQuota(e.barQuotaLocked(bar, now))
 }
 
 func (e *Engine) healthPercentLocked(bar string, now time.Time) float64 {
-	if bar == providers.BarAgyOpus || bar == providers.BarAgyOpus5h {
-		minHealth := 1.0
-		found := false
-		for _, rows := range e.quotas {
-			for _, raw := range rows {
-				q := raw.At(now)
-				if (q.Bucket == providers.BarAgyOpus || q.Bucket == providers.BarAgyOpus5h) && q.Remaining != nil {
-					pct := *q.Remaining / 100.0
-					if pct < 0 {
-						pct = 0.0
-					} else if pct > 1.0 {
-						pct = 1.0
-					}
-					if !found || pct < minHealth {
-						minHealth = pct
-						found = true
-					}
-				}
-			}
-		}
-		if found {
-			return minHealth
-		}
-		return 1.0
-	}
-
-	minHealth := 1.0
-	found := false
-	for _, rows := range e.quotas {
-		for _, raw := range rows {
-			q := raw.At(now)
-			if q.Bucket == bar && q.Remaining != nil {
-				pct := *q.Remaining / 100.0
-				if pct < 0 {
-					pct = 0.0
-				} else if pct > 1.0 {
-					pct = 1.0
-				}
-				if !found || pct < minHealth {
-					minHealth = pct
-					found = true
-				}
-			}
-		}
-	}
-	if found {
-		return minHealth
+	if q := e.barQuotaLocked(bar, now); verifiedQuota(q) {
+		return *q.Remaining / 100
 	}
 
 	if bar == providers.BarOpenCodeFree {
-		rows := e.openCodeQuota(now)
-		for _, raw := range rows {
-			q := raw.At(now)
-			if q.Bucket == bar && q.Remaining != nil {
-				pct := *q.Remaining / 100.0
-				if pct < 0 {
-					return 0.0
-				}
-				if pct > 1.0 {
-					return 1.0
-				}
-				return pct
-			}
-		}
 		hasGate := false
 		for _, gate := range e.openCodeHealth {
 			if e.openCodeGateCurrent(gate, now) {
@@ -230,7 +239,10 @@ func (e *Engine) healthPercentLocked(bar string, now time.Time) float64 {
 }
 
 func (e *Engine) BarState(bar string) string {
-	health := e.HealthPercent(bar)
+	return healthState(e.HealthPercent(bar))
+}
+
+func healthState(health float64) string {
 	if health <= 0.0 {
 		return "EXHAUSTED"
 	}
@@ -374,16 +386,54 @@ func (e *Engine) ActiveCircuitBreakers() []map[string]any {
 }
 
 func tightestQuota(rows []providers.Quota, family string, minutes int, now time.Time) providers.Quota {
-	var result providers.Quota
-	for _, q := range rows {
-		q = q.At(now)
-		if q.AccountMatch == "MATCHED" && q.Family == family && (minutes == 0 || q.WindowMinutes == minutes) &&
-			q.Unit == "percent" && (q.State == "KNOWN" || q.State == "EXHAUSTED") && q.Remaining != nil &&
-			(result.Remaining == nil || *q.Remaining < *result.Remaining) {
-			result = q
+	q := scopedQuota(rows, "agy", now, func(q providers.Quota) bool {
+		return q.Family == family && (minutes == 0 || q.WindowMinutes == minutes)
+	})
+	if q.State == "UNKNOWN" {
+		return providers.Quota{}
+	}
+	return q
+}
+
+type QuotaBar struct {
+	Bucket    string       `json:"bucket"`
+	Provider  string       `json:"provider"`
+	Remaining *float64     `json:"remaining_percent"`
+	Health    *float64     `json:"health_pct"`
+	State     string       `json:"state"`
+	Circuit   CircuitState `json:"circuit_state"`
+}
+
+// QuotaBars reports observed windows at one instant. An unobserved bar has
+// no numeric balance even when routing policy still permits an attempt.
+func (e *Engine) QuotaBars(now time.Time) []QuotaBar {
+	bars := []QuotaBar{
+		{Bucket: providers.BarCodexBurst, Provider: "codex"},
+		{Bucket: providers.BarCodexWeekly, Provider: "codex"},
+		{Bucket: providers.BarAgyGemini, Provider: "antigravity"},
+		{Bucket: providers.BarAgyOpus5h, Provider: "antigravity"},
+		{Bucket: providers.BarAgyOpus, Provider: "antigravity"},
+		{Bucket: providers.BarAgyArgon, Provider: "antigravity"},
+		{Bucket: providers.BarOpenCodeFree, Provider: "opencode"},
+	}
+	if e != nil {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+	}
+	for i := range bars {
+		b := &bars[i]
+		if e == nil {
+			b.State, b.Circuit = "UNKNOWN", "UNKNOWN"
+			continue
+		}
+		q := e.barQuotaLocked(b.Bucket, now)
+		b.State, b.Circuit = q.State, e.cb.stateAt(b.Provider, now)
+		if verifiedQuota(q) {
+			h := *q.Remaining / 100
+			b.Remaining, b.Health, b.State = q.Remaining, &h, healthState(h)
 		}
 	}
-	return result
+	return bars
 }
 
 // route holds the scheduler lock across selection and attempt reservation.
